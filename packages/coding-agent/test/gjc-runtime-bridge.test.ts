@@ -14,18 +14,18 @@ afterEach(async () => {
 });
 
 describe("gjc runtime bridge", () => {
-	it("delegates private endpoints to the configured omx-compatible runtime", async () => {
+	it("delegates private endpoints to the configured gjc-compatible runtime", async () => {
 		cleanupRoot = await mkdtemp(join(tmpdir(), "gjc-runtime-bridge-"));
 		const logPath = join(cleanupRoot, "argv.log");
-		const runtimePath = join(cleanupRoot, "omx-runtime.sh");
+		const runtimePath = join(cleanupRoot, "gjc-runtime.sh");
 		await writeFile(
 			runtimePath,
-			`#!/bin/sh\nprintf '%s\\n' "$GJC_OMX_RUNTIME_BRIDGE_ACTIVE|$1|$2|$3" > ${JSON.stringify(logPath)}\n`,
+			`#!/bin/sh\nprintf '%s\\n' "$GJC_RUNTIME_BRIDGE_ACTIVE|$1|$2|$3" > ${JSON.stringify(logPath)}\n`,
 			{ mode: 0o755 },
 		);
 
 		const result = runGjcRuntimeBridge("ultragoal", ["status", "--json"], {
-			GJC_OMX_RUNTIME_BINARY: runtimePath,
+			GJC_RUNTIME_BINARY: runtimePath,
 			PATH: "",
 		});
 
@@ -34,10 +34,10 @@ describe("gjc runtime bridge", () => {
 	});
 
 	it("returns an actionable error when no runtime is available", () => {
-		const result = runGjcRuntimeBridge("ralplan", ["status"], { PATH: "" });
+		const result = runGjcRuntimeBridge("team", ["api"], { PATH: "" });
 
 		expect(result.status).toBe(1);
-		expect(result.error).toContain("gjc ralplan requires the private OMX runtime endpoint implementation");
-		expect(result.error).toContain("GJC_OMX_RUNTIME_BINARY");
+		expect(result.error).toContain("gjc team requires the private GJC runtime endpoint implementation");
+		expect(result.error).toContain("GJC_RUNTIME_BINARY");
 	});
 });

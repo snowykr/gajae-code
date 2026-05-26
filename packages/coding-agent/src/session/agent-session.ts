@@ -526,7 +526,7 @@ function buildSessionMetadata(
 			// is derived solely from the OAuth UUID the user already consented to
 			// share with Anthropic. Omitted when no OAuth credential is available
 			// (API-key callers) to avoid sending a hash of an empty string.
-			userId.device_id = crypto.createHash("sha256").update(`omp-device-id-v1:${accountUuid}`).digest("hex");
+			userId.device_id = crypto.createHash("sha256").update(`gjc-device-id-v1:${accountUuid}`).digest("hex");
 		}
 	}
 	return { user_id: JSON.stringify(userId) };
@@ -1257,7 +1257,7 @@ export class AgentSession {
 	 *  Does NOT push to the agent's steering/followUp queue — that happens
 	 *  separately inside `sendCustomMessage`. */
 	enqueueCustomMessageDisplay(text: string, mode: "steer" | "followUp"): string {
-		const tag = `omp-cmd-${Date.now()}-${++this.#customDisplayTagCounter}`;
+		const tag = `gjc-cmd-${Date.now()}-${++this.#customDisplayTagCounter}`;
 		const displayText = text.trim();
 		if (!displayText) return tag;
 		const entry: QueuedDisplayEntry = { text: displayText, tag };

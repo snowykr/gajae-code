@@ -6,7 +6,7 @@ import * as url from "node:url";
 // Canonical scope for in-process pi packages. Plugins published against any of
 // the aliased scopes below (mariozechner's original publish, earendil-works'
 // fork, or the canonical @gajae-code scope itself) are remapped to this scope and
-// resolved against the bundled copy that ships inside the omp binary. This
+// resolved against the bundled copy that ships inside the gjc binary. This
 // keeps plugins running against the exact runtime state of the host (single
 // module registry, single tool registry, etc.) regardless of which historical
 // scope name they happened to declare in their peerDependencies.
@@ -19,7 +19,7 @@ const CANONICAL_PI_SCOPE = "@gajae-code";
 // plugin's own node_modules tree at install time.
 const PI_SCOPE_ALIASES = ["gajae-code", "mariozechner", "earendil-works"] as const;
 
-// Internal pi-* package basenames bundled inside the omp binary.
+// Internal pi-* package basenames bundled inside the gjc binary.
 const PI_PACKAGE_NAMES = ["pi-agent-core", "pi-ai", "gajae-code", "pi-natives", "pi-tui", "pi-utils"] as const;
 
 const PI_SCOPE_ALTERNATION = PI_SCOPE_ALIASES.join("|");
@@ -43,8 +43,8 @@ const LEGACY_PI_IMPORT_SPECIFIER_REGEX = new RegExp(
 	`((?:from\\s+|import\\s*\\(\\s*)["'])(@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/[^"'()\\s]+)?)(["'])`,
 	"g",
 );
-const LEGACY_PI_FILE_PREFIX = "omp-legacy-pi-file:";
-const LEGACY_PI_FILE_NAMESPACE = "omp-legacy-pi-file";
+const LEGACY_PI_FILE_PREFIX = "gjc-legacy-pi-file:";
+const LEGACY_PI_FILE_NAMESPACE = "gjc-legacy-pi-file";
 const resolvedSpecifierFallbacks = new Map<string, string>();
 
 // Extensions that imported `@sinclair/typebox` directly used to resolve against a
@@ -221,7 +221,7 @@ async function mirrorLegacyPiFile(sourcePath: string, state: LegacyPiMirrorState
 }
 
 export async function loadLegacyPiModule(resolvedPath: string): Promise<unknown> {
-	const root = path.join(os.tmpdir(), "omp-legacy-pi-file", `entry-${Bun.hash(resolvedPath).toString(36)}`);
+	const root = path.join(os.tmpdir(), "gjc-legacy-pi-file", `entry-${Bun.hash(resolvedPath).toString(36)}`);
 	await fs.rm(root, { recursive: true, force: true });
 	const state: LegacyPiMirrorState = { root, seen: new Map() };
 	const mirroredEntry = await mirrorLegacyPiFile(resolvedPath, state);
@@ -276,7 +276,7 @@ export function installLegacyPiSpecifierShim(): void {
 	isLegacyPiSpecifierShimInstalled = true;
 
 	Bun.plugin({
-		name: "omp:legacy-pi-shim",
+		name: "gjc:legacy-pi-shim",
 		setup(build) {
 			build.onResolve({ filter: LEGACY_PI_SPECIFIER_FILTER, namespace: "file" }, resolveLegacyPiSpecifier);
 			build.onResolve(
@@ -290,7 +290,7 @@ export function installLegacyPiSpecifierShim(): void {
 				resolveTypeBoxSpecifier,
 			);
 
-			build.onResolve({ filter: /^omp-legacy-pi-file:/, namespace: "file" }, args => ({
+			build.onResolve({ filter: /^gjc-legacy-pi-file:/, namespace: "file" }, args => ({
 				path: args.path.slice(LEGACY_PI_FILE_PREFIX.length),
 				namespace: LEGACY_PI_FILE_NAMESPACE,
 			}));

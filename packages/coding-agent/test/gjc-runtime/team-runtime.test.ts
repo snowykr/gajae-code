@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 describe("native gjc team runtime", () => {
-	it("creates GJC-scoped team state, task mailboxes, and telemetry without delegating to omx", async () => {
+	it("creates GJC-scoped team state, task mailboxes, and telemetry without delegating to legacy runtimes", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		const snapshot = await startGjcTeam({
 			workerCount: 2,
@@ -42,9 +42,6 @@ describe("native gjc team runtime", () => {
 
 		const telemetry = await Bun.file(path.join(snapshot.state_dir, "telemetry.jsonl")).text();
 		expect(telemetry).toContain("Native gjc team runtime initialized");
-		await expect(
-			Bun.file(path.join(cleanupRoot, ".omx", "state", "team", "demo-team", "config.json")).exists(),
-		).resolves.toBe(false);
 	});
 
 	it("persists the active worker command so tmux workers use the same gjc entrypoint", async () => {

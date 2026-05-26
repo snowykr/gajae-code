@@ -38,7 +38,7 @@ function isTaskStatus(value: string): value is GjcTeamTaskStatus {
 }
 
 export default class Team extends Command {
-	static description = "Run native gjc tmux team orchestration commands";
+	static description = "Run native GJC tmux team orchestration commands";
 	static strict = false;
 
 	static args = {

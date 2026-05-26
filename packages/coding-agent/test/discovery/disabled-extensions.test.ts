@@ -14,12 +14,12 @@ describe("disabledExtensions runtime filtering", () => {
 	beforeEach(async () => {
 		resetSettingsForTest();
 		originalHome = process.env.HOME;
-		tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-disabled-ext-home-"));
+		tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-disabled-ext-home-"));
 		process.env.HOME = tempHomeDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-disabled-ext-"));
-		await fs.mkdir(path.join(tempDir, ".omp"), { recursive: true });
-		await fs.writeFile(path.join(tempDir, ".omp", "AGENTS.md"), "# project instructions\n");
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-disabled-ext-"));
+		await fs.mkdir(path.join(tempDir, ".gjc"), { recursive: true });
+		await fs.writeFile(path.join(tempDir, ".gjc", "AGENTS.md"), "# project instructions\n");
 
 		const settings = await Settings.init({
 			inMemory: true,

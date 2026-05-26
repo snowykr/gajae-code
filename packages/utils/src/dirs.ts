@@ -334,7 +334,7 @@ export function getGpuCachePath(): string {
 
 /**
  * Get the GitHub view cache database path (~/.gjc/cache/github-cache.db).
- * Honors the `OMP_GITHUB_CACHE_DB` env var when set so tests can isolate the
+ * Honors the `GJC_GITHUB_CACHE_DB` env var when set so tests can isolate the
  * cache file without touching the rest of the config root.
  */
 export function getGithubCacheDbPath(): string {
