@@ -13,7 +13,7 @@
 #     docker build -f Dockerfile.robogjc -t robogjc:dev .
 #
 # Compose (recommended):
-#     docker compose --project-directory python/robogjc build
+#     docker compose --project-directory python/robomp build
 ###############################################################################
 
 ARG PI_BASE=gajae-code/pi:dev
@@ -27,10 +27,10 @@ WORKDIR /work
 # Root manifests + the web workspace manifest are enough for `bun install
 # --filter robogjc-web` to hydrate just the dashboard's node_modules.
 COPY package.json bun.lock ./
-COPY python/robogjc/web/package.json ./python/robogjc/web/package.json
+COPY python/robomp/web/package.json ./python/robomp/web/package.json
 RUN bun install --filter robogjc-web
-COPY --exclude=node_modules --exclude=dist python/robogjc/web/ ./python/robogjc/web/
-RUN bun --cwd=python/robogjc/web run build
+COPY --exclude=node_modules --exclude=dist python/robomp/web/ ./python/robomp/web/
+RUN bun --cwd=python/robomp/web run build
 
 ############################
 # 2) runtime — pi-base + robogjc src + web bundle + pip install
@@ -45,9 +45,9 @@ WORKDIR /app
 # robogjc itself. Drop the Vite-built dashboard into the package tree before
 # `pip install` so it lands in the installed wheel (`static/**/*` is declared
 # as package-data in pyproject.toml).
-COPY python/robogjc/pyproject.toml ./
-COPY python/robogjc/src/ ./src/
-COPY --from=web-builder /work/python/robogjc/web/dist/ ./src/static/
+COPY python/robomp/pyproject.toml ./
+COPY python/robomp/src/ ./src/
+COPY --from=web-builder /work/python/robomp/web/dist/ ./src/static/
 
 RUN pip install --no-cache-dir \
         "fastapi>=0.112" "uvicorn[standard]>=0.30" "httpx>=0.27" \
@@ -64,7 +64,7 @@ RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent \
     && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent \
     && printf '[install]\nbackend = "copyfile"\n' > /srv/agent-home/.bunfig.toml
 
-COPY python/robogjc/entrypoint.sh /usr/local/bin/robogjc-entrypoint
+COPY python/robomp/entrypoint.sh /usr/local/bin/robogjc-entrypoint
 RUN chmod +x /usr/local/bin/robogjc-entrypoint
 
 VOLUME ["/data"]

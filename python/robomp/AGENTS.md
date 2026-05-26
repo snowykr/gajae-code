@@ -27,10 +27,10 @@ Webhook → durable queue → async dispatcher → per-issue git worktree → om
 
 ## Development Commands
 
-Task runner is `bun` against the **monorepo root** `package.json`. robogjc itself no longer ships a `package.json`; every recipe lives at the root under the `robogjc:*` namespace. Local venv (no docker): `bun run robogjc:install` runs `pip install -e 'python/robogjc[dev]'`. From there:
+Task runner is `bun` against the **monorepo root** `package.json`. robogjc itself no longer ships a `package.json`; every recipe lives at the root under the `robogjc:*` namespace. Local venv (no docker): `bun run robogjc:install` runs `pip install -e 'python/robomp[dev]'`. From there:
 
 ```
-bun run test:py                   # pytest -x python/gjc-rpc/tests python/robogjc/tests
+bun run test:py                   # pytest -x python/omp-rpc/tests python/robomp/tests
 bun run robogjc:test:integration   # ROBGJC_INTEGRATION=1, requires omp on PATH
 bun run robogjc:serve              # python -m robogjc serve on the host
 ```
@@ -52,19 +52,19 @@ Frontend (Vite + SolidJS, in `web/` — still a bun workspace):
 ```
 bun run robogjc:web:dev            # vite dev server with proxy to :8080
 bun run robogjc:web:build          # produce src/static/ bundle
-bun --cwd=python/robogjc/web run typecheck   # tsc --noEmit
+bun --cwd=python/robomp/web run typecheck   # tsc --noEmit
 ```
 
 In-container CLI (`robogjc` console script → `robogjc.cli:main`): no root aliases — invoke directly:
 
 ```
-docker compose --project-directory python/robogjc exec robogjc robogjc triage owner/repo#N
-docker compose --project-directory python/robogjc exec robogjc robogjc replay <delivery_id>
-docker compose --project-directory python/robogjc exec robogjc robogjc status
-docker compose --project-directory python/robogjc exec robogjc robogjc cleanup owner/repo#N
+docker compose --project-directory python/robomp exec robogjc robogjc triage owner/repo#N
+docker compose --project-directory python/robomp exec robogjc robogjc replay <delivery_id>
+docker compose --project-directory python/robomp exec robogjc robogjc status
+docker compose --project-directory python/robomp exec robogjc robogjc cleanup owner/repo#N
 ```
 
-HTTP / sqlite / webhook inspection is unaliased — use `curl http://localhost:${ROBGJC_BIND_PORT:-8080}/{healthz,readyz,events,issues}` and `docker compose --project-directory python/robogjc exec robogjc sqlite3 /data/robogjc.sqlite` directly.
+HTTP / sqlite / webhook inspection is unaliased — use `curl http://localhost:${ROBGJC_BIND_PORT:-8080}/{healthz,readyz,events,issues}` and `docker compose --project-directory python/robomp exec robogjc sqlite3 /data/robogjc.sqlite` directly.
 
 Lint + format: TypeScript via Biome (config in `biome.json`), Python via Ruff (config in `pyproject.toml`). Root recipes cover both languages — `bun run lint` / `bun run fix` apply to the whole monorepo including robogjc. `bun run lint:py` / `bun run fix:py` scope to Python only.
 
@@ -110,7 +110,7 @@ Lint + format: TypeScript via Biome (config in `biome.json`), Python via Ruff (c
 - **Task runner**: `bun` (root `package.json` `scripts`). Always reach for an existing `bun run` recipe before invoking `docker compose` or `pytest` directly.
 - **Container runtime**: Docker Compose v2. The image embeds Bun 1.3.14 + a rustup launcher and exposes `omp` via a `/usr/local/bin/omp` shim; `ROBGJC_GJC_COMMAND=omp` should not need changing.
 - **Required env** (set in `.env`, see `.env.example`): `GITHUB_WEBHOOK_SECRET`, `ROBGJC_BOT_LOGIN`, `ROBGJC_GIT_AUTHOR_NAME`, `ROBGJC_GIT_AUTHOR_EMAIL`, `ROBGJC_REPO_ALLOWLIST`, plus model knobs (`ROBGJC_MODEL`, `ROBGJC_THINKING`, optional `ROBGJC_PROVIDER`) and rate-limit / concurrency / timeout overrides. **GitHub auth is mode-exclusive**: either set `ROBGJC_GH_PROXY_URL` + `ROBGJC_GH_PROXY_HMAC_KEY` (gh-proxy mode; PAT lives only in the sidecar container — the bundled compose default), or set `GITHUB_TOKEN` directly (single-process PAT mode). `Settings._validate_proxy_or_pat` rejects a `.env` that sets both.
-- **PI_ROOT resolution**: robogjc lives inside the gajae-code monorepo at `python/robogjc/`. `bun run pi:image` builds the parent monorepo (`../..`) as its docker build context to produce `gajae-code/pi:dev`; `docker-compose.yml` extends that image via `PI_BASE` and mounts the same parent path read-only at `/work/pi` for the orchestrator to see live source. Override `PI_ROOT` only when pointing the build/mount at a different gajae-code checkout. Inside the container the path is always `/work/pi`. Build invalidation stays bounded: Python-only edits in robogjc never trigger a natives recompile.
+- **PI_ROOT resolution**: robogjc lives inside the gajae-code monorepo at `python/robomp/`. `bun run pi:image` builds the parent monorepo (`../..`) as its docker build context to produce `gajae-code/pi:dev`; `docker-compose.yml` extends that image via `PI_BASE` and mounts the same parent path read-only at `/work/pi` for the orchestrator to see live source. Override `PI_ROOT` only when pointing the build/mount at a different gajae-code checkout. Inside the container the path is always `/work/pi`. Build invalidation stays bounded: Python-only edits in robogjc never trigger a natives recompile.
 - **Forbidden**: no docker-in-docker, no extra service containers, no new background workers outside `WorkerPool`. The container itself is the isolation boundary; per-issue isolation is the git worktree.
 
 ## Testing & QA

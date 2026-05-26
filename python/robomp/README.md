@@ -48,7 +48,7 @@ into the `tool_calls` table with credential-redacted args and results.
 
 Requires Docker Compose v2 and a LiteLLM-style proxy on the host that your
 `~/.omp/agent/models.container.yml` points at (mounted into the container as `models.yml`; kept under a separate filename on the host so the host omp doesn't route through the gateway). robogjc lives inside the gajae-code
-monorepo at `python/robogjc/`; both the docker build context and the
+monorepo at `python/robomp/`; both the docker build context and the
 `/work/pi` bind mount default to the parent monorepo (`../..`). Override
 `PI_ROOT` only if you want a different gajae-code checkout backing the build
 and runtime.
@@ -181,7 +181,7 @@ The integration test spawns a real `omp --mode rpc` against an
 | Symptom | Check |
 |---|---|
 | `401 invalid signature` | `GITHUB_WEBHOOK_SECRET` mismatch with the repo webhook config. |
-| Container exits with `PI_ROOT … missing` | `/work/pi` mount empty inside the container; on the host either run `docker compose` from `python/robogjc/` so `PI_ROOT` defaults to `../..`, or export `PI_ROOT` to a valid gajae-code checkout. |
+| Container exits with `PI_ROOT … missing` | `/work/pi` mount empty inside the container; on the host either run `docker compose` from `python/robomp/` so `PI_ROOT` defaults to `../..`, or export `PI_ROOT` to a valid gajae-code checkout. |
 | `git push: Authentication required` | Bot PAT lacks push, or `ROBGJC_BOT_LOGIN` ≠ PAT's account. |
 | `refusing to push: commit author identity mismatch` | Some commit not authored as `ROBGJC_GIT_AUTHOR_*`. The error lists the offending shas; `git commit --amend --reset-author --no-edit`. |
 | `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `gh_open_pr`, which auto-commits `bun run fix` output. |

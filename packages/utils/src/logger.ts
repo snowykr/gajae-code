@@ -1,12 +1,12 @@
 /**
  * Centralized logger for gajae-code.
  *
- * Default: rotating `~/.omp/logs/omp.<DATE>.log`, no console output (writing
+ * Default: rotating `~/.gjc/logs/gjc.<DATE>.log`, no console output (writing
  * to stdout/stderr would corrupt the TUI). Long-running headless services
  * (the auth broker, etc.) call {@link setTransports} to swap in a console
  * transport so a process supervisor (pm2, journald, k8s) captures the logs.
  *
- * Each entry includes `process.pid` so concurrent omp instances stay
+ * Each entry includes `process.pid` so concurrent gjc instances stay
  * traceable.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
