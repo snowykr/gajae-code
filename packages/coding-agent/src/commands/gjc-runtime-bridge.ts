@@ -62,11 +62,12 @@ export function runGjcRuntimeBridge(
 	return {
 		status: 1,
 		error: [
-			`gjc ${endpoint} requires the private GJC runtime endpoint implementation.`,
-			`Set ${BRIDGE_ENV} to a GJC-compatible runtime binary.`,
+			`gjc ${endpoint} is a private runtime bridge command, not the in-session workflow skill loader.`,
+			`Inside a GJC agent session, invoke /skill:${endpoint} instead so the bundled skill is loaded directly.`,
+			`Only private runtime deployments should call gjc ${endpoint}; configure them with ${BRIDGE_ENV}.`,
 			configured
 				? `Configured runtime candidates failed: ${configured}.`
-				: "No gjc runtime binary was found on PATH.",
+				: "No private GJC runtime binary was configured.",
 			attempted.length > 0 ? `Attempted: ${attempted.join(", ")}.` : undefined,
 		]
 			.filter(Boolean)

@@ -37,7 +37,8 @@ describe("gjc runtime bridge", () => {
 		const result = runGjcRuntimeBridge("team", ["api"], { PATH: "" });
 
 		expect(result.status).toBe(1);
-		expect(result.error).toContain("gjc team requires the private GJC runtime endpoint implementation");
+		expect(result.error).toContain("gjc team is a private runtime bridge command");
+		expect(result.error).toContain("Inside a GJC agent session, invoke /skill:team instead");
 		expect(result.error).toContain("GJC_RUNTIME_BINARY");
 	});
 });

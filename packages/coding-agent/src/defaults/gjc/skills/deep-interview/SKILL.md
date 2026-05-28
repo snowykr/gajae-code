@@ -493,26 +493,26 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 1. **Refine with ralplan consensus (Recommended)**
    - Description: "Consensus-refine this spec with Planner/Architect/Critic, then stop for explicit execution approval. Maximum quality."
-   - Action: Only after the user selects this option, invoke `/skill:ralplan` or `gjc ralplan --consensus --direct` with the spec file path as context. The `--direct` flag skips the ralplan skill's interview phase (the deep interview already gathered requirements), while `--consensus` triggers the Planner/Architect/Critic loop. When consensus completes and produces a plan in `.gjc/plans/`, stop with that plan marked `pending approval`; do not automatically invoke execution or any other execution skill.
+   - Action: Only after the user selects this option, invoke `/skill:ralplan --consensus --direct` with the spec file path as context. The `--direct` flag skips the ralplan skill's interview phase (the deep interview already gathered requirements), while `--consensus` triggers the Planner/Architect/Critic loop. When consensus completes and produces a plan in `.gjc/plans/`, stop with that plan marked `pending approval`; do not automatically invoke execution or any other execution skill.
    - Pipeline: `deep-interview spec → explicit approval to refine → ralplan --consensus --direct → pending approval → separate execution approval`
 
 2. **Execute with team**
    - Description: "Full autonomous pipeline — planning, parallel implementation, QA, validation. Faster but without consensus refinement."
-   - Action: Invoke `/skill:team` or `gjc team` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces team planning input.
+   - Action: Invoke `/skill:team` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces team planning input.
 
 3. **Execute with team**
    - Description: "Persistence loop with architect verification — keeps working until all acceptance criteria pass"
-   - Action: Invoke `/skill:team` or `gjc team` with the spec file path as the task definition.
+   - Action: Invoke `/skill:team` with the spec file path as the task definition.
 
 4. **Execute with team**
    - Description: "N coordinated parallel agents — fastest execution for large specs"
-   - Action: Invoke `/skill:team` or `gjc team` with the spec file path as the shared plan.
+   - Action: Invoke `/skill:team` with the spec file path as the shared plan.
 
 5. **Refine further**
    - Description: "Continue interviewing to improve clarity (current: {score}%)"
    - Action: Return to Phase 2 interview loop.
 
-**IMPORTANT:** On explicit execution selection, **MUST** use the chosen public GJC workflow entrypoint (`/skill:ralplan`, `/skill:team`, `gjc ralplan`, or `gjc team`). Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
+**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:team`) inside the agent session. Do NOT use `gjc ralplan` / `gjc team` unless a private runtime bridge is explicitly configured; those CLI commands are bridge-only compatibility endpoints. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
 
 ### Approval-Gated Refinement Path (Recommended)
 

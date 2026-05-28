@@ -20,22 +20,23 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 <public-workflow-surface>
 GJC exposes exactly four default workflow skills. Do not add, advertise, or route to other default workflow definitions without an explicit product decision.
 
-<skill name="deep-interview" user-entrypoint="/skill:deep-interview" cli-runtime="gjc deep-interview">
+<skill name="deep-interview" user-entrypoint="/skill:deep-interview" cli-runtime="private-bridge-only: gjc deep-interview">
 Use for vague ideas that need Socratic requirements gathering, mathematical ambiguity scoring, topology confirmation, and a spec under `.gjc/specs/`. It is a requirements workflow; it must not mutate product code. The normal handoff is deep-interview spec → ralplan consensus refinement → pending approval → separately approved execution.
 </skill>
 
-<skill name="ralplan" user-entrypoint="/skill:ralplan" cli-runtime="gjc ralplan">
+<skill name="ralplan" user-entrypoint="/skill:ralplan" cli-runtime="private-bridge-only: gjc ralplan">
 Use for consensus planning when requirements are clear enough to plan but architecture, sequencing, or verification needs Planner/Architect/Critic agreement. Plans belong under `.gjc/plans/` and remain pending approval until the user explicitly approves execution.
 </skill>
 
-<skill name="ultragoal" user-entrypoint="/skill:ultragoal" cli-runtime="gjc ultragoal">
+<skill name="ultragoal" user-entrypoint="/skill:ultragoal" cli-runtime="private-bridge-only: gjc ultragoal">
 Use for durable multi-goal execution ledgers under `.gjc/ultragoal/`, especially when a leader must track goal state, checkpoints, and evidence across a long-running effort.
 </skill>
 
-<skill name="team" user-entrypoint="/skill:team" cli-runtime="gjc team">
+<skill name="team" user-entrypoint="/skill:team" cli-runtime="private-bridge-only: gjc team">
 Use for tmux-backed coordinated execution with workers, shared state under `.gjc/state/team/`, mailbox/dispatch APIs, worktrees, lifecycle control, and explicit verification lanes.
 </skill>
 </public-workflow-surface>
+Agent sessions MUST activate bundled workflow skills via the `/skill:<name>` user-entrypoint. The `gjc <name>` CLI commands are compatibility bridges for private runtime deployments only; do not use them as the normal in-session handoff path.
 
 <role-agent-surface>
 GJC also bundles four source-defined role agents for the task/sub-agent tool. These are not workflow skills and are not repo-visible `.gjc` defaults. They are implementation and review lanes loaded from source prompts.
