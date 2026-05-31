@@ -250,22 +250,25 @@ describe("github tool", () => {
 			return "https://github.com/owner/repo/pull/77\n";
 		});
 		const jsonCalls: string[][] = [];
-		const jsonSpy = vi.spyOn(git.github, "json").mockImplementation(async (_cwd, args) => {
-			jsonCalls.push([...args]);
-			return {
-				number: 77,
-				title: "Add gizmo",
-				state: "OPEN",
-				isDraft: true,
-				baseRefName: "main",
-				headRefName: "feature/gizmo",
-				author: { login: "octocat" },
-				createdAt: "2026-05-01T09:00:00Z",
-				labels: [{ name: "enhancement" }],
-				body: "Adds a gizmo.",
-				url: "https://github.com/owner/repo/pull/77",
-			} as never;
-		});
+		const jsonSpy = vi
+			.spyOn(git.github, "json")
+			.mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+				if (args[0] === "pr" && args[1] === "list") return [] as T;
+				jsonCalls.push([...args]);
+				return {
+					number: 77,
+					title: "Add gizmo",
+					state: "OPEN",
+					isDraft: true,
+					baseRefName: "main",
+					headRefName: "feature/gizmo",
+					author: { login: "octocat" },
+					createdAt: "2026-05-01T09:00:00Z",
+					labels: [{ name: "enhancement" }],
+					body: "Adds a gizmo.",
+					url: "https://github.com/owner/repo/pull/77",
+				} as T;
+			});
 
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("pr-create", {
@@ -301,7 +304,7 @@ describe("github tool", () => {
 		expect(createArgs).not.toContain("--body");
 
 		// Follow-up summary fetch must target the parsed PR number/repo.
-		expect(jsonSpy).toHaveBeenCalledTimes(1);
+		expect(jsonSpy).toHaveBeenCalledTimes(2);
 		const viewArgs = jsonCalls[0];
 		expect(viewArgs.slice(0, 3)).toEqual(["pr", "view", "77"]);
 		expect(viewArgs).toEqual(expect.arrayContaining(["--repo", "owner/repo"]));
@@ -314,6 +317,332 @@ describe("github tool", () => {
 		expect(text).toContain("Head: feature/gizmo");
 		expect(text).toContain("Labels: enhancement");
 		expect(text).toContain("Adds a gizmo.");
+	});
+
+	it("returns an existing same head/base pull request instead of creating a duplicate", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") {
+				return [
+					{
+						number: 101,
+						title: "Existing fix",
+						state: "OPEN",
+						isDraft: false,
+						baseRefName: "dev",
+						headRefName: "fix/issue-102",
+						url: "https://github.com/owner/repo/pull/101",
+					},
+				] as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Existing fix",
+			body: "Fixes #102",
+			base: "dev",
+			head: "fix/issue-102",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(text).toContain("# Pull Request Already Exists #101: Existing fix");
+		expect(text).toContain("URL: https://github.com/owner/repo/pull/101");
+		expect(text).toContain("Base: dev");
+		expect(text).toContain("Head: fix/issue-102");
+	});
+
+	it("does not create a pull request when the closing issue is already closed", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "issue" && args[1] === "view") {
+				return {
+					number: 98,
+					title: "Already done",
+					state: "CLOSED",
+					stateReason: "COMPLETED",
+					url: "https://github.com/owner/repo/issues/98",
+				} as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Duplicate issue work",
+			body: "Closes #98",
+			base: "dev",
+			head: "duplicate/issue-98",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(text).toContain("# Pull Request Not Created");
+		expect(text).toContain("Issue #98 is closed.");
+		expect(text).toContain("Issue: https://github.com/owner/repo/issues/98");
+	});
+
+	it("keeps an explicit pr_create base and checks duplicates against it", async () => {
+		const textCalls: string[][] = [];
+		vi.spyOn(git.github, "text").mockImplementation(async (_cwd, args) => {
+			textCalls.push([...args]);
+			return "https://github.com/owner/repo/pull/88\n";
+		});
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "pr" && args[1] === "view") {
+				return {
+					number: 88,
+					title: "Explicit base",
+					state: "OPEN",
+					baseRefName: "release",
+					headRefName: "feature/explicit-base",
+					url: "https://github.com/owner/repo/pull/88",
+				} as never;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Explicit base",
+			base: "release",
+			head: "feature/explicit-base",
+		});
+
+		const createArgs = textCalls[0];
+		expect(textCalls).toHaveLength(1);
+		expect(createArgs).toEqual(expect.arrayContaining(["--base", "release"]));
+	});
+
+	it("uses explicit repo metadata when pr_create base is omitted", async () => {
+		const textCalls: string[][] = [];
+		const jsonCalls: string[][] = [];
+		vi.spyOn(git.github, "text").mockImplementation(async (_cwd, args) => {
+			textCalls.push([...args]);
+			return "https://github.com/other/repo/pull/90\n";
+		});
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			jsonCalls.push([...args]);
+			if (args[0] === "repo" && args[1] === "view") return { defaultBranchRef: { name: "trunk" } } as T;
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "pr" && args[1] === "view")
+				return { number: 90, url: "https://github.com/other/repo/pull/90" } as T;
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "other/repo",
+			title: "Explicit repo default",
+			head: "feature/default-base",
+		});
+
+		expect(jsonCalls[0]).toEqual(["repo", "view", "other/repo", "--json", "defaultBranchRef"]);
+		expect(jsonCalls.find(args => args[0] === "pr" && args[1] === "list")).toEqual(
+			expect.arrayContaining(["--repo", "other/repo", "--base", "trunk"]),
+		);
+		expect(textCalls[0]).toEqual(expect.arrayContaining(["--repo", "other/repo", "--base", "trunk"]));
+	});
+
+	it("uses current branch for omitted pr_create head duplicate preflight", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		vi.spyOn(git.branch, "current").mockResolvedValue("feature/current");
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") {
+				expect(args).toEqual(expect.arrayContaining(["--head", "feature/current"]));
+				return [
+					{
+						number: 91,
+						title: "Existing current branch",
+						state: "OPEN",
+						baseRefName: "dev",
+						headRefName: "feature/current",
+						url: "https://github.com/owner/repo/pull/91",
+					},
+				] as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Existing current branch",
+			base: "dev",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(text).toContain("# Pull Request Already Exists #91: Existing current branch");
+	});
+
+	it("uses current branch for omitted pr_create head closed issue preflight", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		vi.spyOn(git.branch, "current").mockResolvedValue("feature/closed-issue");
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "issue" && args[1] === "view")
+				return { number: 92, state: "CLOSED", url: "https://github.com/owner/repo/issues/92" } as T;
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Closed issue",
+			body: "Fixes #92",
+			base: "dev",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(text).toContain("Issue #92 is closed.");
+	});
+
+	it("skips cross-repo closing refs and checks later same-repo refs", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		const issueNumbers: string[] = [];
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "issue" && args[1] === "view") {
+				issueNumbers.push(args[2] ?? "");
+				return {
+					number: Number(args[2]),
+					state: "CLOSED",
+					url: `https://github.com/owner/repo/issues/${args[2]}`,
+				} as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Later same repo",
+			body: "Fixes https://github.com/other/repo/issues/#1 and closes #93",
+			base: "dev",
+			head: "feature/later-ref",
+		});
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(issueNumbers).toEqual(["93"]);
+	});
+
+	it("checks multiple same-repo closing refs until one blocks creation", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		const issueNumbers: string[] = [];
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "issue" && args[1] === "view") {
+				issueNumbers.push(args[2] ?? "");
+				return (
+					args[2] === "95"
+						? { number: 95, state: "CLOSED", url: "https://github.com/owner/repo/issues/95" }
+						: { number: 94, state: "OPEN", url: "https://github.com/owner/repo/issues/94" }
+				) as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Multiple refs",
+			body: "Fixes #94 and resolves #95",
+			base: "dev",
+			head: "feature/multiple-refs",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(issueNumbers).toEqual(["94", "95"]);
+		expect(text).toContain("Issue #95 is closed.");
+	});
+
+	it("returns an existing linked pull request for an open closing issue", async () => {
+		const textSpy = vi.spyOn(git.github, "text");
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "pr" && args[1] === "list" && args.includes("--head")) return [] as T;
+			if (args[0] === "issue" && args[1] === "view")
+				return { number: 96, state: "OPEN", url: "https://github.com/owner/repo/issues/96" } as T;
+			if (args[0] === "pr" && args[1] === "list" && args.includes("--search")) {
+				return [
+					{
+						number: 97,
+						title: "Linked issue work",
+						state: "OPEN",
+						baseRefName: "dev",
+						headRefName: "feature/other-branch",
+						url: "https://github.com/owner/repo/pull/97",
+					},
+				] as T;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("pr-create", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Linked issue duplicate",
+			body: "Closes #96",
+			base: "dev",
+			head: "feature/new-branch",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(textSpy).not.toHaveBeenCalled();
+		expect(text).toContain("# Pull Request Already Linked #97: Linked issue work");
+		expect(text).toContain("URL: https://github.com/owner/repo/pull/97");
+	});
+
+	it("defaults pr_create base from repository metadata instead of hard-coding main", async () => {
+		const textCalls: string[][] = [];
+		vi.spyOn(git.github, "text").mockImplementation(async (_cwd, args) => {
+			textCalls.push([...args]);
+			if (args[0] === "repo" && args[1] === "view") return "owner/repo";
+			return "https://github.com/owner/repo/pull/89\n";
+		});
+		vi.spyOn(git.github, "json").mockImplementation(async <T>(_cwd: string, args: string[]): Promise<T> => {
+			if (args[0] === "repo" && args[1] === "view") return { defaultBranchRef: { name: "dev" } } as T;
+			if (args[0] === "pr" && args[1] === "list") return [] as T;
+			if (args[0] === "pr" && args[1] === "view") {
+				return {
+					number: 89,
+					title: "Default base",
+					state: "OPEN",
+					baseRefName: "dev",
+					headRefName: "feature/default-base",
+					url: "https://github.com/owner/repo/pull/89",
+				} as never;
+			}
+			throw new Error(`unexpected gh json args: ${args.join(" ")}`);
+		});
+
+		const tool = new GithubTool(createSession());
+		await tool.execute("pr-create", {
+			op: "pr_create",
+			title: "Default base",
+			head: "feature/default-base",
+		});
+
+		const createArgs = textCalls.find(args => args[0] === "pr" && args[1] === "create");
+		expect(createArgs).toEqual(expect.arrayContaining(["--base", "dev"]));
 	});
 
 	it("rejects pr_create when neither title nor fill is supplied", async () => {
