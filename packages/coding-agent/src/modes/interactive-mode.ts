@@ -30,6 +30,7 @@ import { APP_NAME, adjustHsv, getProjectDir, hsvToRgb, isEnoent, logger, postmor
 import chalk from "chalk";
 import { KeybindingsManager } from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
+import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -87,15 +88,6 @@ import { InputController } from "./controllers/input-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
-import {
-	consumeLoopLimitIteration,
-	createLoopLimitRuntime,
-	describeLoopLimit,
-	describeLoopLimitRuntime,
-	isLoopDurationExpired,
-	type LoopLimitRuntime,
-	parseLoopLimitArgs,
-} from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
@@ -251,10 +243,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	goalModeEnabled = false;
 	goalModePaused = false;
 	planModePlanFilePath: string | undefined = undefined;
-	loopModeEnabled = false;
-	loopPrompt: string | undefined = undefined;
-	loopLimit: LoopLimitRuntime | undefined = undefined;
-	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
 	pendingImages: ImageContent[] = [];
@@ -623,7 +611,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		for (const command of resolvedCommands) {
 			this.skillCommands.set(command.name, command.skill);
 		}
-		return resolvedCommands.map(command => ({ name: command.name, description: command.description }));
+		const defaultGjcNames = new Set<string>(DEFAULT_GJC_DEFINITION_NAMES);
+		return resolvedCommands.map(command => ({
+			name: command.name,
+			description: command.description,
+			// Pin the bundled GJC workflow skills above generic commands in autocomplete.
+			...(defaultGjcNames.has(command.skill.name) ? { priority: 100 } : {}),
+		}));
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
@@ -635,40 +629,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
-		this.#scheduleLoopAutoSubmit();
 		this.#scheduleGoalContinuation();
 		return promise;
 	}
 
-	#scheduleLoopAutoSubmit(): void {
-		this.#cancelLoopAutoSubmit();
-		if (!this.loopModeEnabled || !this.loopPrompt) return;
-		const prompt = this.loopPrompt;
-		const loopAction = settings.get("loop.mode");
-		this.#deferLoopAutoSubmit(() => {
-			void this.#runLoopIteration(loopAction, prompt);
-		});
-	}
-
-	#deferLoopAutoSubmit(callback: () => void): void {
-		// Brief delay so the user has a chance to press Esc between iterations.
-		this.#loopAutoSubmitTimer = setTimeout(() => {
-			this.#loopAutoSubmitTimer = undefined;
-			if (!this.loopModeEnabled || !this.onInputCallback) return;
-			callback();
-		}, 800);
-	}
-
-	#cancelLoopAutoSubmit(): void {
-		if (this.#loopAutoSubmitTimer) {
-			clearTimeout(this.#loopAutoSubmitTimer);
-			this.#loopAutoSubmitTimer = undefined;
-		}
-	}
-
 	#scheduleGoalContinuation(): void {
 		this.#cancelGoalContinuation();
-		if (this.loopModeEnabled) return;
 		if (!this.onInputCallback) return;
 		if (!this.session.settings.get("goal.continuationModes").includes("interactive")) return;
 		if (this.planModeEnabled || this.planModePaused) return;
@@ -706,92 +672,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
 		}
-	}
-
-	#isLoopAutoSubmitBlocked(): boolean {
-		return this.session.isStreaming || this.session.isCompacting || this.session.hasPostPromptWork;
-	}
-
-	#submitLoopPromptWhenReady(prompt: string): void {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (isLoopDurationExpired(this.loopLimit)) {
-			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
-			return;
-		}
-		if (this.#isLoopAutoSubmitBlocked()) {
-			this.#deferLoopAutoSubmit(() => this.#submitLoopPromptWhenReady(prompt));
-			return;
-		}
-		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
-	}
-
-	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (this.#isLoopAutoSubmitBlocked()) {
-			this.#deferLoopAutoSubmit(() => {
-				void this.#runLoopIteration(action, prompt);
-			});
-			return;
-		}
-
-		if (!consumeLoopLimitIteration(this.loopLimit)) {
-			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
-			return;
-		}
-
-		if (action === "compact") {
-			await this.handleCompactCommand();
-		} else if (action === "reset") {
-			await this.handleClearCommand();
-		}
-		this.#submitLoopPromptWhenReady(prompt);
-	}
-
-	disableLoopMode(message = "Loop mode disabled."): void {
-		const wasEnabled = this.loopModeEnabled;
-		this.loopModeEnabled = false;
-		this.loopPrompt = undefined;
-		this.loopLimit = undefined;
-		this.#cancelLoopAutoSubmit();
-		this.statusLine.setLoopModeStatus(undefined);
-		this.updateEditorChrome();
-		this.ui.requestRender();
-		if (wasEnabled) {
-			this.showStatus(message);
-		}
-	}
-
-	/**
-	 * Pause the loop without exiting it: drops the captured prompt and any
-	 * pending auto-resubmit. Loop mode stays enabled — the next prompt the
-	 * user submits becomes the new loop prompt and resumes iteration.
-	 */
-	pauseLoop(): void {
-		this.loopPrompt = undefined;
-		this.#cancelLoopAutoSubmit();
-	}
-
-	async handleLoopCommand(args = ""): Promise<void> {
-		if (this.loopModeEnabled) {
-			this.disableLoopMode();
-			return;
-		}
-		const parsedLimit = parseLoopLimitArgs(args);
-		if (typeof parsedLimit === "string") {
-			this.showError(parsedLimit);
-			return;
-		}
-		this.loopModeEnabled = true;
-		this.loopPrompt = undefined;
-		this.loopLimit = createLoopLimitRuntime(parsedLimit);
-		this.statusLine.setLoopModeStatus({ enabled: true });
-		this.updateEditorChrome();
-		this.ui.requestRender();
-		const limitSuffix = parsedLimit ? ` Limited to ${describeLoopLimit(parsedLimit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
-		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix} Your next prompt will repeat after each turn. Esc cancels the current iteration; /loop again to disable.`,
-		);
 	}
 
 	recordLocalSubmission(text: string, imageCount = 0): () => void {

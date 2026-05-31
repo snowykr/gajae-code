@@ -164,12 +164,6 @@ const modeSegment: StatusLineSegment = {
 			return renderGoalMode(ctx, goal);
 		}
 
-		const loop = ctx.loopMode;
-		if (loop?.enabled) {
-			const content = withIcon(theme.icon.loop, "Loop");
-			return { content: theme.fg("customMessageLabel", content), visible: true };
-		}
-
 		return { content: "", visible: false };
 	},
 };

@@ -24,9 +24,6 @@ export interface SegmentContext {
 		enabled: boolean;
 		paused: boolean;
 	} | null;
-	loopMode: {
-		enabled: boolean;
-	} | null;
 	goalMode: {
 		enabled: boolean;
 		paused: boolean;

@@ -18,7 +18,6 @@ function createCtx(usage: Partial<SegmentContext["usageStats"]>): SegmentContext
 		width: 120,
 		options: {},
 		planMode: null,
-		loopMode: null,
 		goalMode: null,
 		usageStats: {
 			input: 0,

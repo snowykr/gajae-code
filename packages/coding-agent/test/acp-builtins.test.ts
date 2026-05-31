@@ -475,7 +475,6 @@ describe("ACP builtin slash commands", () => {
 			"/changelog",
 			"/context",
 			"/plan",
-			"/loop",
 			"/share",
 			"/hotkeys",
 			"/extensions",

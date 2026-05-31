@@ -155,7 +155,6 @@ export class StatusLineComponent implements Component {
 	#subagentCount: number = 0;
 	#sessionStartTime: number = Date.now();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
-	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#skillHudEntries: SkillActiveEntry[] = [];
 	#skillHudLastFetch = 0;
@@ -227,10 +226,6 @@ export class StatusLineComponent implements Component {
 
 	setPlanModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.#planModeStatus = status ?? null;
-	}
-
-	setLoopModeStatus(status: { enabled: boolean } | undefined): void {
-		this.#loopModeStatus = status ?? null;
 	}
 
 	setGoalModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
@@ -611,7 +606,6 @@ export class StatusLineComponent implements Component {
 			width,
 			options: this.#resolveSettings().segmentOptions ?? {},
 			planMode: this.#planModeStatus,
-			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
 			usageStats,
 			contextPercent,

@@ -44,10 +44,10 @@ describe("GJC utility extensibility quarantine", () => {
 			"handoff",
 			"force",
 			"quit",
+			"loop",
 		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
-		expect(registry).toContain(`name: "loop"`);
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);

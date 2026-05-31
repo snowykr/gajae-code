@@ -92,7 +92,6 @@ export type SymbolKey =
 	| "icon.plan"
 	| "icon.goal"
 	| "icon.pause"
-	| "icon.loop"
 	| "icon.folder"
 	| "icon.scratchFolder"
 	| "icon.file"
@@ -256,7 +255,6 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.plan": "🗺",
 	"icon.goal": "🎯",
 	"icon.pause": "⏸",
-	"icon.loop": "↻",
 	"icon.folder": "📁",
 	"icon.scratchFolder": "🗑",
 	"icon.file": "📄",
@@ -473,8 +471,6 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.goal": "\uf140",
 	// pick:  (nf-fa-pause) | alt: ⏸ ||
 	"icon.pause": "\uf04c",
-	// pick: ↻ | alt: ⟳
-	"icon.loop": "\uf021",
 	// pick:  | alt:  
 	"icon.folder": "\uf115",
 	// pick:  | alt:
@@ -679,7 +675,6 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.plan": "plan",
 	"icon.goal": "goal",
 	"icon.pause": "||",
-	"icon.loop": "loop",
 	"icon.folder": "[D]",
 	"icon.scratchFolder": "[T]",
 	"icon.file": "[F]",
@@ -1452,7 +1447,6 @@ export class Theme {
 			plan: this.#symbols["icon.plan"],
 			goal: this.#symbols["icon.goal"],
 			pause: this.#symbols["icon.pause"],
-			loop: this.#symbols["icon.loop"],
 			folder: this.#symbols["icon.folder"],
 			scratchFolder: this.#symbols["icon.scratchFolder"],
 			file: this.#symbols["icon.file"],

@@ -162,6 +162,11 @@ export interface SlashCommand {
 	name: string;
 	description?: string;
 	argumentHint?: string;
+	/**
+	 * Higher values surface first in autocomplete, ahead of fuzzy-score ordering.
+	 * Use this to pin first-class commands (e.g. bundled GJC skills) to the top.
+	 */
+	priority?: number;
 	// Function to get argument completions for this command
 	// Returns null if no argument completion is available
 	getArgumentCompletions?(argumentPrefix: string): Awaitable<AutocompleteItem[] | null>;
@@ -283,15 +288,17 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 						const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 						const desc = cmd.description ?? "";
 						const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+						const priority = "priority" in cmd && typeof cmd.priority === "number" ? cmd.priority : 0;
 						return {
 							value: name,
 							label: "name" in cmd ? cmd.name : cmd.label,
 							score: Math.max(nameScore, descScore),
+							priority,
 							...(fullDesc && { description: fullDesc }),
 						};
 					})
-					.sort((a, b) => b.score - a.score)
-					.map(({ score: _, ...rest }) => rest);
+					.sort((a, b) => b.priority - a.priority || b.score - a.score)
+					.map(({ score: _score, priority: _priority, ...rest }) => rest);
 
 				if (matches.length === 0) return null;
 
@@ -820,15 +827,17 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 				const desc = cmd.description ?? "";
 				const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+				const priority = "priority" in cmd && typeof cmd.priority === "number" ? cmd.priority : 0;
 				return {
 					value: name,
 					label: "name" in cmd ? cmd.name : cmd.label,
 					score: Math.max(nameScore, descScore),
+					priority,
 					...(fullDesc && { description: fullDesc }),
-				} as AutocompleteItem & { score: number };
+				} as AutocompleteItem & { score: number; priority: number };
 			})
-			.sort((a, b) => b.score - a.score)
-			.map(({ score: _, ...rest }) => rest);
+			.sort((a, b) => b.priority - a.priority || b.score - a.score)
+			.map(({ score: _score, priority: _priority, ...rest }) => rest);
 
 		if (matches.length === 0) return null;
 		return { items: matches, prefix: textBeforeCursor };

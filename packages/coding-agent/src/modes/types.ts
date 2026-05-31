@@ -27,7 +27,6 @@ import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
 import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
-import type { LoopLimitRuntime } from "./loop-limit";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
 import type { Theme } from "./theme/theme";
 
@@ -92,9 +91,6 @@ export interface InteractiveModeContext {
 	planModeEnabled: boolean;
 	goalModeEnabled: boolean;
 	goalModePaused: boolean;
-	loopModeEnabled: boolean;
-	loopPrompt?: string;
-	loopLimit?: LoopLimitRuntime;
 	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	pendingImages: ImageContent[];
@@ -271,9 +267,6 @@ export interface InteractiveModeContext {
 	registerExtensionShortcuts(): void;
 	handlePlanModeCommand(initialPrompt?: string): Promise<void>;
 	handleGoalModeCommand(rest?: string): Promise<void>;
-	handleLoopCommand(args?: string): Promise<void>;
-	disableLoopMode(): void;
-	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
 
 	// Hook UI methods

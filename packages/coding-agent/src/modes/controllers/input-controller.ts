@@ -51,15 +51,6 @@ export class InputController {
 					this.ctx.retryEscapeHandler,
 			);
 		this.ctx.editor.onEscape = () => {
-			if (this.ctx.loopModeEnabled) {
-				this.ctx.pauseLoop();
-				if (this.ctx.session.isStreaming) {
-					void this.#abortInteractive();
-				} else {
-					this.ctx.cancelPendingSubmission();
-				}
-				return;
-			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				return;
 			}
@@ -290,12 +281,6 @@ export class InputController {
 					this.ctx.updateEditorBorderColor();
 					return;
 				}
-			}
-
-			// While loop mode is on, every user-typed prompt becomes the new loop
-			// prompt that auto-resubmits after each yield.
-			if (this.ctx.loopModeEnabled) {
-				this.ctx.loopPrompt = text;
 			}
 
 			// Queue input during compaction

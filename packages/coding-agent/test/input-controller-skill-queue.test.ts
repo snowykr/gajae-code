@@ -101,7 +101,6 @@ function createStubInputControllerContext(opts: { skillCommands: Map<string, Ski
 		isPythonMode: false,
 		pendingImages: [],
 		isBackgrounded: false,
-		loopModeEnabled: false,
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
