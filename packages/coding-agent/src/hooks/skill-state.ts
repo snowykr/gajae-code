@@ -21,6 +21,7 @@ export interface EffectiveSkillConfigInput {
 }
 
 const SANITIZED_CONFIG_VALUE_LIMIT = 80;
+const DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD = 0.05;
 
 function sanitizeConfigValue(value: string): string {
 	const compact = value.replace(/[\r\n\t]+/g, " ").trim();
@@ -329,6 +330,10 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
 	};
+	if (match.skill === "deep-interview") {
+		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
+		modeState.threshold_source = "default";
+	}
 
 	await writeJsonFile(initializedStatePath, modeState);
 	await writeJsonFile(skillStatePath(resolvedStateDir, input.sessionId), state);

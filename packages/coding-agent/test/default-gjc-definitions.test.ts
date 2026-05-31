@@ -214,6 +214,9 @@ Project executor override body.
 		expect(content).toContain("private runtime bridge");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden");
 		expect(content).toContain("do not edit `.gjc/state` directly without force override");
+		expect(content).toContain("default `0.05`");
+		expect(content).not.toContain("default `0.2`");
+		expect(content).not.toContain("20%");
 
 		for (const forbidden of [
 			"AskUserQuestion",

@@ -71,7 +71,7 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
    - Project settings: `./.gjc/settings.json` (overrides user settings)
 2. **Resolve threshold and source**:
    - Read `gjc.deepInterview.ambiguityThreshold` from both files when present.
-   - Use the project value when valid; otherwise use the user value when valid; otherwise use the default `0.2`.
+   - Use the project value when valid; otherwise use the user value when valid; otherwise use the default `0.05`.
    - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or `default`).
 3. **Emit the required first line to the user before any other interview announcement**:
 

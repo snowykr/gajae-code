@@ -82,7 +82,13 @@ describe("GJC native skill-state hooks", () => {
 			path.join(root, ".gjc", "state", "sessions", "session-1", "deep-interview-state.json"),
 		);
 		const modeState = await Bun.file(state?.initialized_state_path ?? "").json();
-		expect(modeState).toMatchObject({ active: true, current_phase: "interviewing", session_id: "session-1" });
+		expect(modeState).toMatchObject({
+			active: true,
+			current_phase: "interviewing",
+			session_id: "session-1",
+			threshold: 0.05,
+			threshold_source: "default",
+		});
 	});
 
 	it("rich deep-interview prompt activation allows product mutation and blocks direct spec artifacts", async () => {
