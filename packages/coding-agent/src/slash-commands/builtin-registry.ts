@@ -16,10 +16,12 @@ import type { InteractiveModeContext } from "../modes/types";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
+	formatProviderPresetList,
 	formatProviderSetupResult,
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
+import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
@@ -39,6 +41,7 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
 
 function parseProviderSetupSlashArgs(args: string): {
+	preset?: string;
 	compat?: string;
 	provider?: string;
 	baseUrl?: string;
@@ -49,6 +52,7 @@ function parseProviderSetupSlashArgs(args: string): {
 } {
 	const tokens = args.split(/\s+/).filter(Boolean);
 	const result: {
+		preset?: string;
 		compat?: string;
 		provider?: string;
 		baseUrl?: string;
@@ -67,9 +71,16 @@ function parseProviderSetupSlashArgs(args: string): {
 			result.force = true;
 			continue;
 		}
+		if (!token.startsWith("-") && !result.preset) {
+			result.preset = token;
+			continue;
+		}
 		const value = tokens[i + 1];
 		if (!value) continue;
-		if (token === "--compat") {
+		if (token === "--preset") {
+			result.preset = value;
+			i += 1;
+		} else if (token === "--compat") {
 			result.compat = value;
 			i += 1;
 		} else if (token === "--provider") {
@@ -95,7 +106,10 @@ function parseProviderSetupSlashArgs(args: string): {
 function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
+		"Presets: /provider add --preset <minimax|minimax-cn|glm> [--force]",
+		"Aliases: /provider add minimax, /provider add minimax-cn, /provider add glm, /provider add zai (writes glm-proxy)",
 		"API providers: /provider add --compat <openai|anthropic> --provider <id> --base-url <url> --api-key-env <ENV> --model <model> [--force]",
+		`Available presets:\n${formatProviderPresetList()}`,
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
 	].join("\n");
@@ -504,6 +518,19 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "context",
+		description: "Show active context token usage breakdown",
+		acpDescription: "Show active context token usage breakdown",
+		handle: async (_command, runtime) => {
+			await runtime.output(buildContextReportText(runtime));
+			return commandConsumed();
+		},
+		handleTui: (_command, runtime) => {
+			runtime.ctx.handleContextCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "usage",
 		description: "Show provider usage and limits",
 		acpDescription: "Show token usage",
@@ -580,20 +607,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (!args.startsWith("add ")) return usage(providerSetupUsage(), runtime);
 			const parsed = parseProviderSetupSlashArgs(args.slice(4));
 			const missing: string[] = [];
-			if (!parsed.compat) missing.push("--compat");
-			if (!parsed.provider) missing.push("--provider");
-			if (!parsed.baseUrl) missing.push("--base-url");
+			if (!parsed.preset) {
+				if (!parsed.compat) missing.push("--compat");
+				if (!parsed.provider) missing.push("--provider");
+				if (!parsed.baseUrl) missing.push("--base-url");
+			}
 			if (parsed.rejectedRawApiKey) {
 				return usage("Provider setup rejects raw --api-key values; use --api-key-env <ENV> instead.", runtime);
 			}
-			if (!parsed.apiKeyEnv) missing.push("--api-key-env");
-			if (parsed.models.length === 0) missing.push("--model");
-			if (missing.length > 0) return usage(`Missing required option(s): ${missing.join(", ")}`, runtime);
+			if (!parsed.preset) {
+				if (!parsed.apiKeyEnv) missing.push("--api-key-env");
+				if (parsed.models.length === 0) missing.push("--model");
+			}
+			if (missing.length > 0) {
+				return usage(
+					`Missing required option(s): ${missing.join(", ")}. Or use /provider add --preset <preset>.`,
+					runtime,
+				);
+			}
 			try {
 				const result = await addApiCompatibleProvider({
-					compatibility: parseProviderCompatibility(parsed.compat!),
-					providerId: parsed.provider!,
-					baseUrl: parsed.baseUrl!,
+					compatibility: parsed.compat ? parseProviderCompatibility(parsed.compat) : undefined,
+					preset: parsed.preset,
+					providerId: parsed.provider,
+					baseUrl: parsed.baseUrl,
 					apiKeyEnv: parsed.apiKeyEnv,
 					models: parsed.models,
 					force: parsed.force,
@@ -631,9 +668,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						throw new Error("Provider setup rejects raw --api-key values; use --api-key-env <ENV> instead.");
 					}
 					const result = await addApiCompatibleProvider({
-						compatibility: parseProviderCompatibility(parsed.compat ?? ""),
-						providerId: parsed.provider ?? "",
-						baseUrl: parsed.baseUrl ?? "",
+						compatibility: parsed.compat ? parseProviderCompatibility(parsed.compat) : undefined,
+						preset: parsed.preset,
+						providerId: parsed.provider,
+						baseUrl: parsed.baseUrl,
 						apiKeyEnv: parsed.apiKeyEnv,
 						models: parsed.models,
 						force: parsed.force,

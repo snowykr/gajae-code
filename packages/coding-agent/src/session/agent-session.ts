@@ -28,8 +28,10 @@ import {
 	type AgentTool,
 	AppendOnlyContextManager,
 	resolveTelemetry,
+	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import { normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
 import {
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
 	CompactionCancelledError,
@@ -75,6 +77,33 @@ import {
 	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai";
+
+export interface ForkContextSeedMetadata {
+	sourceSessionId: string;
+	parentMessageCount: number;
+	includedMessages: number;
+	skippedMessages: number;
+	approximateTokens: number;
+	maxMessages: number;
+	maxTokens: number;
+	skippedReasons: Record<string, number>;
+}
+
+export interface ForkContextSeed {
+	messages: Message[];
+	agentMessages: AgentMessage[];
+	metadata: ForkContextSeedMetadata;
+	cacheIdentity?: string;
+	appendOnlyPrefixSnapshot?: StablePrefixSnapshot;
+}
+
+export interface ForkContextSeedOptions {
+	maxMessages: number;
+	maxTokens: number;
+	cacheIdentity?: string;
+	signal?: AbortSignal;
+}
+
 import { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
@@ -168,7 +197,7 @@ import {
 } from "../runtime-mcp/discoverable-tool-metadata";
 import { deobfuscateSessionContext, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
-import { isCanonicalGjcWorkflowSkill, syncSkillActiveState } from "../skill-state/active-state";
+import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
 import { assertDeepInterviewMutationAllowed } from "../skill-state/deep-interview-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
@@ -246,6 +275,13 @@ export type AgentSessionEvent =
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
 
+/**
+ * Safe path component pattern used to validate session-id segments before
+ * joining them into `.gjc/state` paths. Mirrors the regex used by the
+ * `gjc state` runtime selector resolver.
+ */
+const SAFE_PATH_COMPONENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
+
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
@@ -283,6 +319,8 @@ export interface AgentSessionConfig {
 	skillsSettings?: SkillsSettings;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
+	/** Task recursion depth for nested sessions. Top-level sessions use 0. */
+	taskDepth?: number;
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
 	/** Current session pre-LLM message transform pipeline */
@@ -331,6 +369,10 @@ export interface AgentSessionConfig {
 	 * **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedAsyncJobManager?: AsyncJobManager;
+	/** Optional fork-context seed used to initialize a child session before its first prompt. */
+	forkContextSeed?: ForkContextSeed;
+	/** Optional provider state override. Fork-context children should omit this by default. */
+	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Agent identity (registry id like "0-Main" or "3-Alice") used for IRC routing. */
 	agentId?: string;
 	/** Shared agent registry (for forwarding IRC observations to the main session UI). */
@@ -342,6 +384,8 @@ export interface AgentSessionConfig {
 	 * so that credential sticky selection is consistent with the session's streaming calls.
 	 */
 	providerSessionId?: string;
+	/** Optional provider-facing cache identity, distinct from logical session identity. */
+	providerCacheSessionId?: string;
 }
 
 /** Options for AgentSession.prompt() */
@@ -749,6 +793,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
+	readonly taskDepth: number;
 	readonly yieldQueue: YieldQueue;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
@@ -836,6 +881,7 @@ export class AgentSession {
 	#agentId: string | undefined;
 	#agentRegistry: AgentRegistry | undefined;
 	#providerSessionId: string | undefined;
+	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
@@ -1007,6 +1053,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.taskDepth = config.taskDepth ?? 0;
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
@@ -1020,6 +1067,9 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		if (config.providerSessionState) {
+			this.#providerSessionState = config.providerSessionState;
+		}
 		this.#validateRetryFallbackChains();
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#requestedToolNames = config.requestedToolNames;
@@ -1099,6 +1149,7 @@ export class AgentSession {
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
+		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.agent.setAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
 			const event: AgentEvent = {
 				type: "message_update",
@@ -1196,6 +1247,46 @@ export class AgentSession {
 		return this.#toolChoiceQueue;
 	}
 
+	/** Current skill prompt executing in this session, if any. */
+	getActiveSkillState(): { skill: string; session_id?: string } | undefined {
+		if (!this.#activeSkillState) return undefined;
+		return {
+			skill: this.#activeSkillState.skill,
+			...(this.#activeSkillState.sessionId ? { session_id: this.#activeSkillState.sessionId } : {}),
+		};
+	}
+
+	/** Best-effort accessor for the active skill's `current_phase` field from
+	 *  its persisted mode-state file. Used by the `skill` tool to enforce the
+	 *  terminal-phase chain guard. Returns undefined when no active skill is
+	 *  recorded or the mode-state file is missing/unreadable; callers should
+	 *  treat undefined as a non-terminal phase (refuses to chain). */
+	getActiveSkillPhase(): string | undefined {
+		const active = this.#activeSkillState;
+		if (!active) return undefined;
+		// Path safety: refuse to read mode-state files when the skill or
+		// session-id are not safe path components. The `skill` tool
+		// interprets undefined as a non-terminal phase, so chaining is
+		// refused — there is no risk of bypassing the guard via a custom
+		// skill name with `..` or a session-id with separators.
+		if (!isCanonicalGjcWorkflowSkill(active.skill)) return undefined;
+		if (active.sessionId !== undefined && !SAFE_PATH_COMPONENT.test(active.sessionId)) {
+			return undefined;
+		}
+		try {
+			const stateDir = path.join(this.sessionManager.getCwd(), ".gjc", "state");
+			const segments = active.sessionId
+				? [stateDir, "sessions", encodeURIComponent(active.sessionId).replaceAll(".", "%2E")]
+				: [stateDir];
+			const filePath = path.join(...segments, `${active.skill}-state.json`);
+			const raw = fs.readFileSync(filePath, "utf-8");
+			const parsed = JSON.parse(raw) as { current_phase?: unknown };
+			return typeof parsed.current_phase === "string" ? parsed.current_phase : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	/** Peek the in-flight directive's invocation handler for use by the resolve tool. */
 	peekQueueInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
 		return this.#toolChoiceQueue.peekInFlightInvoker();
@@ -1217,6 +1308,100 @@ export class AgentSession {
 	/** Provider-scoped mutable state store for transport/session caches. */
 	get providerSessionState(): Map<string, ProviderSessionState> {
 		return this.#providerSessionState;
+	}
+
+	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
+		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
+		const convertedMessages = await this.#convertToLlm(transformedMessages);
+		const providerMessages = this.model
+			? normalizeMessagesForProvider(convertedMessages, this.model)
+			: convertedMessages;
+		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
+		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
+		const selected: Message[] = [];
+		const skippedReasons: Record<string, number> = {};
+		let skippedMessages = 0;
+		let approximateTokens = 0;
+
+		const recordSkip = (reason: string) => {
+			skippedMessages++;
+			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+		};
+
+		const sanitizeMessage = (message: Message): Message | undefined => {
+			if (message.role === "developer") {
+				recordSkip("developer-role");
+				return undefined;
+			}
+			if (message.role === "toolResult") {
+				recordSkip("tool-result-role");
+				return undefined;
+			}
+			if (message.role !== "user" && message.role !== "assistant") {
+				recordSkip("unsupported-role");
+				return undefined;
+			}
+			const cloned = structuredClone(message) as Message;
+			if ("providerPayload" in cloned) {
+				delete (cloned as { providerPayload?: unknown }).providerPayload;
+			}
+			if (Array.isArray(cloned.content)) {
+				const sanitizedContent: TextContent[] = [];
+				for (const block of cloned.content) {
+					if (block.type === "text") {
+						sanitizedContent.push(block);
+					} else if (block.type === "image") {
+						sanitizedContent.push({ type: "text", text: "[Image omitted from fork-context seed]" });
+					} else if (block.type !== "thinking") {
+						recordSkip(`unsupported-content-${block.type}`);
+					}
+				}
+				return { ...cloned, content: sanitizedContent } as Message;
+			}
+			return cloned;
+		};
+
+		for (let i = providerMessages.length - 1; i >= 0; i--) {
+			if (selected.length >= maxMessages) {
+				recordSkip("message-limit");
+				continue;
+			}
+			const sanitized = sanitizeMessage(providerMessages[i]!);
+			if (!sanitized) continue;
+			const messageTokens = estimateTokens(sanitized);
+			if (maxTokens > 0 && approximateTokens + messageTokens > maxTokens) {
+				recordSkip("token-limit");
+				continue;
+			}
+			selected.unshift(sanitized);
+			approximateTokens += messageTokens;
+		}
+
+		const messages = selected;
+		let appendOnlyPrefixSnapshot: StablePrefixSnapshot | undefined;
+		const appendOnly = this.agent.appendOnlyContext;
+		if (appendOnly) {
+			if (!appendOnly.prefix.built) {
+				appendOnly.prefix.build(this.agent.state, { intentTracing: this.agent.intentTracing });
+			}
+			appendOnlyPrefixSnapshot = appendOnly.prefix.exportSnapshot() ?? undefined;
+		}
+		return {
+			messages,
+			agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+			metadata: {
+				sourceSessionId: this.sessionId,
+				parentMessageCount: providerMessages.length,
+				includedMessages: messages.length,
+				skippedMessages,
+				approximateTokens,
+				maxMessages,
+				maxTokens,
+				skippedReasons,
+			},
+			cacheIdentity: options.cacheIdentity ?? this.sessionId,
+			appendOnlyPrefixSnapshot,
+		};
 	}
 
 	getHindsightSessionState(): HindsightSessionState | undefined {
@@ -1555,11 +1740,7 @@ export class AgentSession {
 									}
 
 									const targetAssistantIndex = this.#findTtsrAssistantIndex(targetMessageTimestamp);
-									if (
-										!this.#ttsrAbortPending ||
-										this.#promptGeneration !== generation ||
-										targetAssistantIndex === -1
-									) {
+									if (!this.#ttsrAbortPending || this.#promptGeneration !== generation) {
 										this.#ttsrAbortPending = false;
 										this.#pendingTtsrInjections = [];
 										this.#perToolTtsrInjections.clear();
@@ -1569,8 +1750,8 @@ export class AgentSession {
 									this.#ttsrAbortPending = false;
 									this.#perToolTtsrInjections.clear();
 									const ttsrSettings = this.#ttsrManager?.getSettings();
-									if (ttsrSettings?.contextMode === "discard") {
-										// Remove the partial/aborted assistant turn from agent state
+									if (ttsrSettings?.contextMode === "discard" && targetAssistantIndex !== -1) {
+										// Remove the partial/aborted assistant turn from agent state when it was persisted.
 										this.agent.replaceMessages(this.agent.state.messages.slice(0, targetAssistantIndex));
 									}
 									// Inject TTSR rules as system reminder before retry
@@ -2757,6 +2938,7 @@ export class AgentSession {
 	#syncAgentSessionId(sessionId?: string): void {
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
+		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage),
 		);
@@ -4092,18 +4274,19 @@ export class AgentSession {
 		const details = message.details;
 		if (!details || typeof details !== "object") return;
 		const name = (details as { name?: unknown }).name;
-		if (typeof name !== "string" || !isCanonicalGjcWorkflowSkill(name)) return;
-		const cwd = this.sessionManager.getCwd();
+		if (typeof name !== "string" || !name.trim()) return;
+		const skill = name.trim();
 		const sessionId = this.sessionManager.getSessionId();
-		await syncSkillActiveState({
-			cwd,
-			skill: name,
-			active,
-			phase: active ? "running" : "complete",
-			sessionId,
-			source: "skill-prompt",
-		});
-		this.#activeSkillState = active ? { skill: name, sessionId } : undefined;
+		// Canonical GJC workflow skills (deep-interview, ralplan, ultragoal, team)
+		// own their `.gjc/state/skill-active-state.json` row through the
+		// `gjc state handoff` and `gjc state clear` runtime verbs. The prompt
+		// observer here used to overwrite the row with `phase: running` and
+		// later remove it with `active:false`, which clobbered handoff lineage
+		// (`handoff_from`/`handoff_at`) and made the HUD inconsistent with
+		// mode-state. The observational filesystem write is now skipped for
+		// canonical skills; the in-memory `#activeSkillState` tracking below
+		// keeps `getActiveSkillState` accurate for the chain guard.
+		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 	}
 
 	async #syncSkillPromptActiveStateSafely(
@@ -6147,7 +6330,7 @@ export class AgentSession {
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
 		const currentModel = this.model;
-		if (!currentModel || currentModel.api !== "openai-codex-responses") return;
+		if (currentModel?.api !== "openai-codex-responses") return;
 		this.#closeProviderSessionsForModelSwitch(currentModel, currentModel);
 	}
 
@@ -8228,7 +8411,7 @@ export class AgentSession {
 		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
-		if (!selectedEntry || selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 			throw new Error("Invalid entry ID for branching");
 		}
 

@@ -72,6 +72,17 @@ const toolSession: ToolSession = {
 	activateDiscoveredTools: async names => names,
 	getGoalModeState: () => activeGoalState,
 	getGoalRuntime: () => goalRuntime,
+	skills: [
+		{
+			name: "stub-skill",
+			description: "stub skill for tool metadata coverage",
+			filePath: "/tmp/stub-skill/SKILL.md",
+			baseDir: "/tmp/stub-skill",
+			source: "test",
+			content: "stub",
+		},
+	],
+	sendCustomMessage: async () => {},
 };
 
 async function getToolMetadata(): Promise<Map<string, { loadMode?: string; summary?: string }>> {
@@ -93,6 +104,30 @@ describe("BUILTIN_TOOLS public factory map", () => {
 		const metadata = await getToolMetadata();
 		const missing = Object.keys(BUILTIN_TOOLS).filter(name => metadata.get(name)?.loadMode === undefined);
 		expect(missing).toEqual([]);
+	});
+
+	it("exposes the skill tool by default when skills and custom-message bridge are available", async () => {
+		const tools = await createTools(
+			{
+				...toolSession,
+				settings: Settings.isolated(),
+			},
+			["skill"],
+		);
+
+		expect(tools.some(tool => tool.name === "skill")).toBe(true);
+	});
+
+	it("omits the skill tool when skill.enabled is false", async () => {
+		const tools = await createTools(
+			{
+				...toolSession,
+				settings: Settings.isolated({ "skill.enabled": false }),
+			},
+			["skill"],
+		);
+
+		expect(tools.some(tool => tool.name === "skill")).toBe(false);
 	});
 
 	it("exposes detached subagent controls and keeps generic job controls without async flags", async () => {

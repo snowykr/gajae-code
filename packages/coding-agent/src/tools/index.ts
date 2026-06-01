@@ -1,5 +1,5 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
-import type { ToolChoice } from "@gajae-code/ai";
+import type { Model, ToolChoice } from "@gajae-code/ai";
 import { $env, $flag, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -12,10 +12,12 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
+import type { ForkContextSeed, ForkContextSeedOptions } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
+import type { SkillActiveEntry } from "../skill-state/active-state";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
@@ -47,6 +49,7 @@ import { ResolveTool } from "./resolve";
 import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
+import { SkillTool } from "./skill";
 import { loadSshTool } from "./ssh";
 import { SubagentTool } from "./subagent";
 import { type TodoPhase, TodoWriteTool } from "./todo-write";
@@ -84,6 +87,7 @@ export * from "./resolve";
 export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
+export * from "./skill";
 export * from "./ssh";
 export * from "./subagent";
 export * from "./todo-write";
@@ -122,6 +126,12 @@ export interface ToolSession {
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
 	skills?: Skill[];
+	/** Currently executing skill prompt, when this tool session is inside one. */
+	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
+	/** Get the active skill prompt's current phase so the skill tool can apply
+	 *  its terminal-phase chain guard. Returns the raw phase string or undefined
+	 *  when no active skill (or accessor) is available. */
+	getActiveSkillPhase?: () => string | undefined;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Whether LSP integrations are enabled */
@@ -164,6 +174,8 @@ export interface ToolSession {
 	getSessionSpawns: () => string | null;
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
+	/** Current model, when selected. */
+	model?: Model;
 	/** Get the current session model string, regardless of how it was chosen */
 	getActiveModelString?: () => string | undefined;
 	/** Auth storage for passing to subagents (avoids re-discovery) */
@@ -246,9 +258,17 @@ export interface ToolSession {
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	/** Dispatch a custom message through the active session. Used by the `skill`
+	 *  tool to dispatch another skill prompt same-turn after recording a handoff. */
+	sendCustomMessage?(
+		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void>;
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
+	/** Build a sanitized fork-context seed for task subagents. */
+	buildForkContextSeed?: (options: ForkContextSeedOptions) => Promise<ForkContextSeed>;
 }
 
 export type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;
@@ -308,6 +328,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	retain: HindsightRetainTool.createIf,
 	recall: HindsightRecallTool.createIf,
 	reflect: HindsightReflectTool.createIf,
+	skill: SkillTool.createIf,
 	goal: s => new GoalTool(s),
 };
 
@@ -464,6 +485,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		// search_tool_bm25 is allowed when either legacy mcp.discoveryMode or new tools.discoveryMode is active.
 		if (name === "search_tool_bm25") return discoveryActive;
 		if (name === "calc") return session.settings.get("calc.enabled");
+		if (name === "skill") return session.settings.get("skill.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
 		if (name === "irc") {

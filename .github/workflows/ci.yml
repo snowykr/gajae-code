@@ -25,7 +25,8 @@ jobs:
    # in that case, so the canary's retention window (see build-native action) is the
    # effective TTL of a cache hit before main rebuilds anyway.
    rust-hash:
-      runs-on: ubuntu-22.04
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       outputs:
          hash: ${{ steps.compute.outputs.hash }}
          run-id: ${{ steps.find.outputs.run-id }}
@@ -76,9 +77,13 @@ jobs:
 
    # Fast lint + type check (no Rust, no native build needed)
    check:
-      runs-on: ubuntu-22.04
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+              node-version: "24"
          - uses: oven-sh/setup-bun@v2
            with:
               bun-version: "1.3"
@@ -95,8 +100,9 @@ jobs:
    # unless rust-hash found a cached run. Tags always rebuild for fresh artifacts.
    native_linux:
       needs: [rust-hash]
-      if: ${{ startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '' }}
-      runs-on: ubuntu-22.04
+      if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+         (startsWith(github.ref, 'refs/tags/v') || needs.rust-hash.outputs.run-id == '') }}
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       strategy:
          fail-fast: false
          matrix:
@@ -139,12 +145,16 @@ jobs:
               save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
 
    test:
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       needs: [native_linux, rust-hash]
-      if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
+      if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+         !startsWith(github.ref, 'refs/tags/v') && needs.native_linux.result != 'failure' }}
       timeout-minutes: 30
       steps:
          - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+              node-version: "24"
          - uses: oven-sh/setup-bun@v2
            with:
               bun-version: "1.3"
@@ -155,10 +165,20 @@ jobs:
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
            run: |
-              sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick
-              sudo ln -s $(which fdfind) /usr/local/bin/fd
-              sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              if sudo -n true 2>/dev/null; then
+                 sudo apt-get update
+                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
+                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              else
+                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
+                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
+                 for tool in fd rg convert tmux gh; do
+                    if ! command -v "$tool" >/dev/null 2>&1; then
+                       echo "warning: optional helper not on PATH: $tool"
+                    fi
+                 done
+              fi
          - run: bun install --frozen-lockfile
          - name: Resolve native source run
            id: source
@@ -190,9 +210,13 @@ jobs:
            run: bun run ci:test:smoke
 
    install_methods:
-      runs-on: ubuntu-22.04
+      if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+              node-version: "24"
          - uses: oven-sh/setup-bun@v2
            with:
               bun-version: "1.3"
@@ -213,10 +237,20 @@ jobs:
               key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - name: Install system deps
            run: |
-              sudo apt-get update
-              sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick
-              sudo ln -s $(which fdfind) /usr/local/bin/fd
-              sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              if sudo -n true 2>/dev/null; then
+                 sudo apt-get update
+                 sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+                 sudo ln -sf $(which fdfind) /usr/local/bin/fd
+                 sudo ln -sf /usr/bin/convert /usr/local/bin/magick
+              else
+                 echo "sudo unavailable on this runner; skipping apt-based system dependency install."
+                 echo "The self-hosted runner image is expected to provide optional smoke-test helpers when needed."
+                 for tool in fd rg convert tmux gh; do
+                    if ! command -v "$tool" >/dev/null 2>&1; then
+                       echo "warning: optional helper not on PATH: $tool"
+                    fi
+                 done
+              fi
          - run: bun install --frozen-lockfile
          - name: Install method smoke tests
            run: bun run ci:test:install-methods
@@ -270,6 +304,9 @@ jobs:
          contents: read
       steps:
          - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+              node-version: "24"
          - uses: oven-sh/setup-bun@v2
            with:
               bun-version: "1.3"
@@ -312,10 +349,12 @@ jobs:
               path: ${{ matrix.binary_path }}
 
    release-github:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
+      if: ${{ (github.event_name != 'pull_request' ||
+         github.event.pull_request.head.repo.full_name == github.repository) &&
+         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' }}
       needs: [release_binary]
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       permissions:
          contents: write
       steps:
@@ -353,14 +392,19 @@ jobs:
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" ./gjc-darwin-arm64 --version
 
    release-npm:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
+      if: ${{ (github.event_name != 'pull_request' ||
+         github.event.pull_request.head.repo.full_name == github.repository) &&
+         startsWith(github.ref, 'refs/tags/v') && !cancelled() &&
          needs.release_binary.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_binary, release_github_verify, rust-hash]
-      runs-on: ubuntu-22.04
+      runs-on: [self-hosted, Linux, X64, gajae-layofflabs-2]
       steps:
          - uses: actions/checkout@v4
+         - uses: actions/setup-node@v4
+           with:
+              node-version: "24"
          - uses: oven-sh/setup-bun@v2
            with:
               bun-version: "1.3"

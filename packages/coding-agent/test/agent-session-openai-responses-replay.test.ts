@@ -5,13 +5,21 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { AssistantMessage, Message, ProviderPayload, ProviderSessionState, Usage } from "@gajae-code/ai/types";
 import { createOpenAIResponsesHistoryPayload } from "@gajae-code/ai/utils";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import * as asyncModule from "@gajae-code/coding-agent/async";
+import * as settingsModule from "@gajae-code/coding-agent/config/settings";
+import type { CreateAgentSessionResult } from "@gajae-code/coding-agent/sdk";
+import * as sdkModule from "@gajae-code/coding-agent/sdk";
+import type { AgentSession, ForkContextSeed } from "@gajae-code/coding-agent/session/agent-session";
 import type { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import {
 	type SessionEntry,
 	SessionManager,
 	type SessionMessageEntry,
 } from "@gajae-code/coding-agent/session/session-manager";
+import * as taskModule from "@gajae-code/coding-agent/task";
+import * as agentsModule from "@gajae-code/coding-agent/task/agents";
+import * as discoveryModule from "@gajae-code/coding-agent/task/discovery";
+import * as eventBusModule from "@gajae-code/coding-agent/utils/event-bus";
 import { Snowflake } from "@gajae-code/utils";
 
 function createUsage(): Usage {
@@ -166,7 +174,14 @@ async function createPersistedSession(
 async function createSessionHarness(
 	tempDir: string,
 	sessionManager: SessionManager,
-	options: { provider?: Parameters<typeof getBundledModel>[0]; modelId?: string } = {},
+	options: {
+		provider?: Parameters<typeof getBundledModel>[0];
+		modelId?: string;
+		forkContextSeed?: ForkContextSeed;
+		providerSessionId?: string;
+		providerSessionState?: Map<string, ProviderSessionState>;
+		settings?: Record<string, unknown>;
+	} = {},
 ): Promise<{ session: AgentSession; authStorage: AuthStorage }> {
 	const { provider = "openai", modelId = "gpt-5-mini" } = options;
 	const [{ createAgentSession }, { Settings }, { AuthStorage }] = await Promise.all([
@@ -188,7 +203,7 @@ async function createSessionHarness(
 		authStorage,
 		sessionManager,
 		model,
-		settings: Settings.isolated(),
+		settings: Settings.isolated(options.settings ?? {}),
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],
@@ -196,6 +211,9 @@ async function createSessionHarness(
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
+		forkContextSeed: options.forkContextSeed,
+		providerSessionId: options.providerSessionId,
+		providerSessionState: options.providerSessionState,
 	});
 
 	return { session, authStorage };
@@ -362,6 +380,295 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			throw new Error("Expected reloaded assistant message");
 		}
 		expectAssistantReplayMetadataSanitized(persistedAssistant);
+	});
+
+	it("builds sanitized fork seeds while sharing cache identity without provider transport state", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fork-seed-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+		const { session: parent, authStorage: parentAuthStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+		});
+		sessions.push(parent);
+		authStorages.push(parentAuthStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: "Parent summary",
+			providerPayload: createUserHistoryPayload("openai-codex"),
+			timestamp: Date.now() - 2,
+		});
+		parent.agent.appendMessage(
+			createStaleAssistantMessage("Parent assistant", {
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-5.2-codex",
+			}),
+		);
+		parent.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: "Do not override child" }],
+			timestamp: Date.now() - 1,
+		});
+		parent.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "parent-tool",
+			toolName: "bash",
+			content: [{ type: "text", text: "parent tool output" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+
+		const parentCloseSpy = vi.fn();
+		parent.providerSessionState.set("openai-codex-responses", {
+			close: parentCloseSpy,
+		} satisfies ProviderSessionState);
+
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+		expect(seed.cacheIdentity).toBe(parent.sessionId);
+		expect(seed.messages).toHaveLength(2);
+		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
+		expect(seed.metadata.skippedReasons["tool-result-role"]).toBe(1);
+		expect(seed.agentMessages).toEqual(seed.messages);
+		expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
+		const inheritedAssistant = seed.messages.find(message => message.role === "assistant");
+		if (!inheritedAssistant || typeof inheritedAssistant.content === "string") {
+			throw new Error("Expected sanitized inherited assistant message");
+		}
+		expect(inheritedAssistant.content.every(block => block.type !== "thinking")).toBe(true);
+
+		const childState = new Map<string, ProviderSessionState>();
+		const childManager = SessionManager.create(tempDir, tempDir);
+		const { session: child, authStorage: childAuthStorage } = await createSessionHarness(tempDir, childManager, {
+			provider: "openai-codex",
+			modelId: "gpt-5.2-codex",
+			forkContextSeed: seed,
+			providerSessionState: childState,
+		});
+		sessions.push(child);
+		authStorages.push(childAuthStorage);
+
+		expect(child.sessionId).not.toBe(parent.sessionId);
+		expect(child.agent.providerSessionId).toBe(parent.sessionId);
+		expect(child.providerSessionState).toBe(childState);
+		expect(child.providerSessionState).not.toBe(parent.providerSessionState);
+		const childCodexState = child.providerSessionState.get("openai-codex-responses") as
+			| { webSocketSessions?: Map<string, { lastResponseId?: string; lastResponseItems?: unknown[] }> }
+			| undefined;
+		expect(childCodexState?.webSocketSessions).toBeDefined();
+		for (const sessionState of childCodexState?.webSocketSessions?.values() ?? []) {
+			expect(sessionState.lastResponseId).toBeUndefined();
+			expect(sessionState.lastResponseItems).toBeUndefined();
+		}
+		expect(parent.providerSessionState.size).toBe(1);
+		expect(parentCloseSpy).not.toHaveBeenCalled();
+		expect(child.messages.slice(0, 2)).toEqual(seed.agentMessages);
+
+		parent.agent.appendMessage({ role: "user", content: "oversized ".repeat(5_000), timestamp: Date.now() });
+		const boundedSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 1 });
+		expect(boundedSeed.messages).toHaveLength(0);
+		expect(boundedSeed.metadata.skippedReasons["token-limit"]).toBeGreaterThan(0);
+	});
+
+	it("propagates appendOnlyPrefixSnapshot through buildForkContextSeed when append-only mode is active", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-default-append-only-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+
+		const deepseekModel = getBundledModel("deepseek", "deepseek-chat");
+		const provider: Parameters<typeof getBundledModel>[0] = deepseekModel ? "deepseek" : "openai";
+		const modelId = deepseekModel ? "deepseek-chat" : "gpt-5-mini";
+
+		const { session: parent, authStorage } = await createSessionHarness(tempDir, parentManager, {
+			provider,
+			modelId,
+			settings: { "provider.appendOnlyContext": "on" },
+		});
+		sessions.push(parent);
+		authStorages.push(authStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Refactor auth." }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+
+		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
+
+		if (parent.agent.appendOnlyContext) {
+			expect(seed.appendOnlyPrefixSnapshot).toBeDefined();
+			expect(seed.appendOnlyPrefixSnapshot?.fingerprint).toBe(parent.agent.appendOnlyContext.prefix.fingerprint);
+
+			const parentFingerprintBefore = parent.agent.appendOnlyContext.prefix.fingerprint;
+			(seed.appendOnlyPrefixSnapshot as { fingerprint: string }).fingerprint = "TAMPER";
+			expect(parent.agent.appendOnlyContext.prefix.fingerprint).toBe(parentFingerprintBefore);
+		} else {
+			expect(seed.appendOnlyPrefixSnapshot).toBeUndefined();
+		}
+	});
+
+	it("spawns bundled executor and architect via TaskTool with inheritContext: true through the production path", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-fc-task-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const parentManager = SessionManager.create(tempDir, tempDir);
+
+		const { session: parent, authStorage } = await createSessionHarness(tempDir, parentManager, {
+			settings: { "task.forkContext.enabled": true },
+		});
+		sessions.push(parent);
+		authStorages.push(authStorage);
+
+		parent.agent.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Establishing parent context for fork-context spawn test." }],
+			attribution: "user",
+			timestamp: Date.now() - 10_000,
+		});
+
+		const bundledExecutor = agentsModule.getBundledAgent("executor");
+		const bundledArchitect = agentsModule.getBundledAgent("architect");
+		expect(bundledExecutor?.forkContext).toBe("allowed");
+		expect(bundledArchitect?.forkContext).toBe("allowed");
+
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [bundledExecutor!, bundledArchitect!],
+			projectAgentsDir: null,
+		});
+
+		const childCaptures: Array<{
+			agentDisplayName?: string;
+			forkContextSeed?: ForkContextSeed;
+			providerSessionId?: string;
+		}> = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async (options = {}) => {
+			childCaptures.push({
+				agentDisplayName: options.agentDisplayName,
+				forkContextSeed: options.forkContextSeed,
+				providerSessionId: options.providerSessionId,
+			});
+			const listeners: Array<
+				(event: Parameters<AgentSession["subscribe"]>[0] extends (event: infer E) => void ? E : never) => void
+			> = [];
+			const stubSession: Partial<AgentSession> = {
+				state: { messages: [] } as unknown as AgentSession["state"],
+				agent: { state: { systemPrompt: ["stub"] } } as unknown as AgentSession["agent"],
+				model: undefined,
+				sessionManager: {
+					appendSessionInit: () => {},
+					getSessionFile: () => null,
+					getArtifactsDir: () => null,
+				} as unknown as AgentSession["sessionManager"],
+				getActiveToolNames: () => ["yield"],
+				setActiveToolsByName: async () => {},
+				subscribe: ((listener: (typeof listeners)[number]) => {
+					listeners.push(listener);
+					return () => {
+						const index = listeners.indexOf(listener);
+						if (index >= 0) listeners.splice(index, 1);
+					};
+				}) as AgentSession["subscribe"],
+				prompt: async () => {
+					(stubSession.state as { messages: Message[] }).messages.push({
+						role: "assistant",
+						content: [{ type: "text", text: "(stub-yield)" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "mock",
+						usage: createUsage(),
+						stopReason: "stop",
+						timestamp: Date.now(),
+					});
+					for (const listener of listeners) {
+						listener({
+							type: "tool_execution_end",
+							toolCallId: "yield-call",
+							toolName: "yield",
+							result: {
+								content: [{ type: "text", text: "Result submitted." }],
+								details: { status: "success", data: { ok: true } },
+							},
+							isError: false,
+						});
+					}
+				},
+				waitForIdle: async () => {},
+				getLastAssistantMessage: () => {
+					const messages = (stubSession.state as { messages: Message[] }).messages;
+					for (let i = messages.length - 1; i >= 0; i--) {
+						const message = messages[i];
+						if (message?.role === "assistant") return message as AssistantMessage;
+					}
+					return undefined;
+				},
+				abort: async () => {},
+				dispose: async () => {},
+			};
+			return {
+				session: stubSession as AgentSession,
+				extensionsResult: {} as CreateAgentSessionResult["extensionsResult"],
+				setToolUIContext: () => {},
+				eventBus: new eventBusModule.EventBus(),
+			} satisfies CreateAgentSessionResult;
+		});
+
+		const manager = new asyncModule.AsyncJobManager({ onJobComplete: async () => {} });
+		asyncModule.AsyncJobManager.setInstance(manager);
+
+		const toolSession = {
+			cwd: tempDir,
+			hasUI: false,
+			settings: settingsModule.Settings.isolated({
+				"async.enabled": false,
+				"task.forkContext.enabled": true,
+			}),
+			getSessionFile: () => parent.sessionManager.getSessionFile(),
+			getSessionSpawns: () => "*",
+			model: parent.model,
+			buildForkContextSeed: (opts: Parameters<AgentSession["buildForkContextSeed"]>[0]) =>
+				parent.buildForkContextSeed(opts),
+			modelRegistry: {
+				authStorage: undefined,
+				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => null,
+			},
+		};
+
+		const tool = await taskModule.TaskTool.create(
+			toolSession as unknown as Parameters<typeof taskModule.TaskTool.create>[0],
+		);
+
+		await tool.execute("call-exec", {
+			agent: "executor",
+			tasks: [{ id: "ExecFork", description: "d", assignment: "a", inheritContext: true }],
+		});
+		await tool.execute("call-arch", {
+			agent: "architect",
+			tasks: [{ id: "ArchFork", description: "d", assignment: "a", inheritContext: true }],
+		});
+		try {
+			await manager.waitForAll();
+		} finally {
+			await manager.dispose({ timeoutMs: 100 });
+			asyncModule.AsyncJobManager.resetForTests();
+			vi.restoreAllMocks();
+		}
+
+		expect(childCaptures).toHaveLength(2);
+		const execChild = childCaptures.find(o => o.agentDisplayName === "executor");
+		const archChild = childCaptures.find(o => o.agentDisplayName === "architect");
+		expect(execChild).toBeDefined();
+		expect(archChild).toBeDefined();
+
+		for (const child of [execChild!, archChild!]) {
+			expect(child.forkContextSeed).toBeDefined();
+			// cacheIdentity is the seed-borne identity; it must reuse the parent's sessionId so
+			// the child session's provider-side prefix cache hits when configured via sdk.ts:870
+			// (which uses options.forkContextSeed?.cacheIdentity as the providerSessionId fallback).
+			expect(child.forkContextSeed!.cacheIdentity).toBe(parent.sessionId);
+		}
 	});
 
 	it("keeps provider session state when same-file reload only changes message metadata", async () => {

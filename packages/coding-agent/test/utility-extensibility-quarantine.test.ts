@@ -38,7 +38,6 @@ describe("GJC utility extensibility quarantine", () => {
 			"copy",
 			"todo",
 			"changelog",
-			"context",
 			"branch",
 			"fork",
 			"handoff",

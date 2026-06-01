@@ -9,6 +9,22 @@ afterEach(() => {
 	global.fetch = originalFetch;
 });
 
+async function dispatchLocalCallback(callbackUrl: string): Promise<void> {
+	const url = new URL(callbackUrl);
+	url.hostname = "127.0.0.1";
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 20; attempt++) {
+		try {
+			await originalFetch(url.toString());
+			return;
+		} catch (error) {
+			lastError = error;
+			await Bun.sleep(10);
+		}
+	}
+	throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 function mockProviderTokenEndpoint(onBody: (body: string) => void) {
 	return hookFetch((input, init) => {
 		const url = String(input);
@@ -94,7 +110,7 @@ describe("mcp oauth flow", () => {
 					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
-						void originalFetch(`${observedRedirectUri}?code=test-code&state=${state}`);
+						void dispatchLocalCallback(`${observedRedirectUri}?code=test-code&state=${state}`);
 					});
 				},
 				signal: AbortSignal.timeout(1_000),
@@ -137,7 +153,9 @@ describe("mcp oauth flow", () => {
 					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
-						void originalFetch(`http://localhost:14568/slack/oauth_redirect?code=test-code&state=${state}`);
+						void dispatchLocalCallback(
+							`http://127.0.0.1:14568/slack/oauth_redirect?code=test-code&state=${state}`,
+						);
 					});
 				},
 				signal: AbortSignal.timeout(1_000),
@@ -178,7 +196,7 @@ describe("mcp oauth flow", () => {
 					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
-						void originalFetch(`http://localhost:14571/?code=test-code&state=${state}`);
+						void dispatchLocalCallback(`http://127.0.0.1:14571/?code=test-code&state=${state}`);
 					});
 				},
 				signal: AbortSignal.timeout(1_000),
@@ -217,7 +235,9 @@ describe("mcp oauth flow", () => {
 					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
-						void originalFetch(`http://localhost:14570/slack/oauth_redirect?code=test-code&state=${state}`);
+						void dispatchLocalCallback(
+							`http://127.0.0.1:14570/slack/oauth_redirect?code=test-code&state=${state}`,
+						);
 					});
 				},
 				signal: AbortSignal.timeout(1_000),

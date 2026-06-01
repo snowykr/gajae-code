@@ -1940,6 +1940,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"skill.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "Skill",
+			description: "Enable the skill tool so the agent can chain into another available skill on its next turn",
+		},
+	},
+
 	// Fetching and browser
 	"fetch.enabled": {
 		type: "boolean",
@@ -2341,6 +2351,37 @@ export const SETTINGS_SCHEMA = {
 			label: "LSP in Subagents",
 			description:
 				"Allow subagents spawned via the task tool to use the lsp tool. Off by default to keep subagents cheap; enable when LSP-aware delegation is worth the extra tokens.",
+		},
+	},
+
+	"task.forkContext.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context for Subagents",
+			description:
+				"Allow explicitly opted-in subagents to start from a sanitized snapshot of parent context when both the agent and task item also opt in.",
+		},
+	},
+
+	"task.forkContext.maxMessages": {
+		type: "number",
+		default: 50,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context Max Messages",
+			description: "Maximum parent messages copied into an explicitly opted-in subagent fork-context seed.",
+		},
+	},
+
+	"task.forkContext.maxTokens": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tasks",
+			label: "Fork Context Max Tokens",
+			description: "Approximate token cap for fork-context seeds. 0 uses 25% of the target model context window.",
 		},
 	},
 

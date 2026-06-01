@@ -118,6 +118,8 @@ export interface AgentOptions {
 	 * Used by providers that support session-based caching (e.g., OpenAI code provider).
 	 */
 	sessionId?: string;
+	/** Provider-facing cache/session affinity identifier. */
+	providerSessionId?: string;
 	/**
 	 * Shared provider state map for session-scoped transport/session caches.
 	 */
@@ -269,6 +271,7 @@ export class Agent {
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
 	#sessionId?: string;
+	#providerSessionId?: string;
 	#metadata?: Record<string, unknown>;
 	#metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	#providerSessionState?: Map<string, ProviderSessionState>;
@@ -303,6 +306,10 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
+	get intentTracing(): boolean {
+		return this.#intentTracing;
+	}
+
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
 
@@ -329,6 +336,7 @@ export class Agent {
 		this.#interruptMode = opts.interruptMode || "immediate";
 		this.streamFn = opts.streamFn || streamSimple;
 		this.#sessionId = opts.sessionId;
+		this.#providerSessionId = opts.providerSessionId;
 		this.#providerSessionState = opts.providerSessionState;
 		this.#thinkingBudgets = opts.thinkingBudgets;
 		this.#temperature = opts.temperature;
@@ -374,6 +382,14 @@ export class Agent {
 	 */
 	set sessionId(value: string | undefined) {
 		this.#sessionId = value;
+	}
+
+	get providerSessionId(): string | undefined {
+		return this.#providerSessionId;
+	}
+
+	set providerSessionId(value: string | undefined) {
+		this.#providerSessionId = value;
 	}
 
 	/**
@@ -1070,6 +1086,7 @@ export class Agent {
 			hideThinkingSummary: this.#hideThinkingSummary,
 			interruptMode: this.#interruptMode,
 			sessionId: this.#sessionId,
+			providerSessionId: this.#providerSessionId,
 			metadata: this.#metadataResolver ? undefined : this.#metadata,
 			metadataResolver: this.#metadataResolver,
 			providerSessionState: this.#providerSessionState,

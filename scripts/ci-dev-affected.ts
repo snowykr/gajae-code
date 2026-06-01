@@ -91,11 +91,16 @@ async function resolveBaseRef(): Promise<string> {
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
 	const baseRef = Bun.env.GITHUB_BASE_REF?.trim();
 
+	if (eventName === "pull_request" && baseRef) {
+		const mergeBase = await $`git merge-base HEAD ${`origin/${baseRef}`}`.cwd(repoRoot).quiet().nothrow();
+		if (mergeBase.exitCode === 0) {
+			const value = mergeBase.stdout.toString().trim();
+			if (value !== "") return value;
+		}
+		return `origin/${baseRef}`;
+	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
 		return baseSha;
-	}
-	if (eventName === "pull_request" && baseRef) {
-		return `origin/${baseRef}`;
 	}
 	if (before && !ZERO_SHA.test(before)) {
 		return `${before}..${Bun.env.GITHUB_SHA?.trim() || "HEAD"}`;
@@ -180,6 +185,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 	const wrapperChanged = paths.some(isUnscopedWrapperPath);
 	const toolingScriptChanged = paths.some(isToolingScriptPath);
 	const needsNativeRuntime = paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace;
+	const workflowHarnessOnly = paths.length > 0 && paths.every(isWorkflowHarnessPath);
 	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
 
 	if (needsNativeRuntime) {
@@ -190,7 +196,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 		addNativeBuild(tasks);
 		add(tasks, "root-test", "Root workspace TypeScript tests", ["bun", "run", "test:ts"]);
-	} else if (!ciOnly) {
+	} else if (!ciOnly && !workflowHarnessOnly) {
 		const affectedPackages = expandWithDependents(touchedPackages, packages);
 		if (affectedPackages.some(workspacePackage => workspacePackage.manifest.scripts?.test)) {
 			addNativeBuild(tasks);
@@ -205,7 +211,7 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 		}
 	}
 
-	if (toolingScriptChanged && !fullWorkspace && !ciOnly) {
+	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "check:ts"]);
 	}
 	if (wrapperChanged) {
@@ -236,6 +242,9 @@ function planTasks(paths: readonly string[], packages: readonly WorkspacePackage
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
+		if (paths.some(isWorkflowPath)) {
+			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
+		}
 	}
 
 	return Array.from(tasks.values());
@@ -341,7 +350,15 @@ function isCodingAgentRuntimePath(changedPath: string): boolean {
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {
-	return changedPath.startsWith(".github/workflows/") || changedPath === "scripts/ci-dev-affected.ts";
+	return isWorkflowHarnessPath(changedPath);
+}
+
+function isWorkflowPath(changedPath: string): boolean {
+	return changedPath.startsWith(".github/workflows/");
+}
+
+function isWorkflowHarnessPath(changedPath: string): boolean {
+	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/check-workflow-yaml.ts";
 }
 
 function isToolingScriptPath(changedPath: string): boolean {

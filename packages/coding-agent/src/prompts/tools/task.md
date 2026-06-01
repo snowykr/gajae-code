@@ -23,6 +23,9 @@ Subagents have no conversation history. Every fact, file path, and direction the
  - `.description`: UI label only — subagent never sees it
  - `.assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
 {{#if contextEnabled}}- `context`: shared background prepended to every assignment; session-specific only{{/if}}
+{{#if contextEnabled}}
+- `.inheritContext` (optional): `true` requests a sanitized, bounded forked snapshot of the parent conversation for this task. Works only when the global `task.forkContext.enabled` setting is true and the target agent declares `forkContext: allowed`; otherwise the call is rejected. Bundled agents that support it: `executor`, `architect`. Use it when the subagent's value depends on what the parent has already established (architect reviewing code the parent has been discussing; executor continuing a mid-investigation handoff). Skip it for independent work — passing context the child will not use wastes tokens. The child runs under its own agent-specific system prompt and tool surface, so treat seeded tokens as full re-billing rather than a prefix-cache hit.
+{{/if}}
 {{#if customSchemaEnabled}}- `schema`: JTD schema for expected structured output (do not put format rules in assignments){{/if}}
 {{#if isolationEnabled}}- `isolated`: run in isolated env; use when tasks edit overlapping files{{/if}}
 </parameters>

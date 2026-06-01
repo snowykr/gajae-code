@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
 export const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
-export const SKILL_ACTIVE_STALE_MS = 24 * 60 * 60 * 1000;
 
 export const CANONICAL_GJC_WORKFLOW_SKILLS = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
 
@@ -40,6 +39,9 @@ export interface SkillActiveEntry {
 	hud?: WorkflowHudSummary;
 	stale?: boolean;
 	receipt?: WorkflowStateReceipt;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
 }
 
 export interface SkillActiveState {
@@ -75,6 +77,9 @@ export interface SyncSkillActiveStateOptions {
 	source?: string;
 	hud?: WorkflowHudSummary;
 	receipt?: WorkflowStateReceipt;
+	handoff_from?: string;
+	handoff_to?: string;
+	handoff_at?: string;
 }
 
 const HUD_TEXT_LIMIT = 80;
@@ -185,25 +190,6 @@ function entryKey(entry: Pick<SkillActiveEntry, "skill" | "session_id">): string
 	return `${entry.skill}::${safeString(entry.session_id).trim()}`;
 }
 
-function timestampMs(value: string | undefined): number | null {
-	if (!value) return null;
-	const ms = Date.parse(value);
-	return Number.isFinite(ms) ? ms : null;
-}
-
-function entryTimestampMs(entry: SkillActiveEntry): number | null {
-	return timestampMs(entry.hud?.updated_at) ?? timestampMs(entry.updated_at) ?? timestampMs(entry.activated_at);
-}
-
-function isFreshEntry(entry: SkillActiveEntry, nowMs = Date.now()): boolean {
-	const ms = entryTimestampMs(entry);
-	return ms === null || nowMs - ms <= SKILL_ACTIVE_STALE_MS;
-}
-
-function withDerivedStale(entry: SkillActiveEntry, nowMs = Date.now()): SkillActiveEntry {
-	return { ...entry, stale: !isFreshEntry(entry, nowMs) };
-}
-
 function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 	if (!raw || typeof raw !== "object") return null;
 	const record = raw as Record<string, unknown>;
@@ -221,6 +207,9 @@ function normalizeEntry(raw: unknown): SkillActiveEntry | null {
 		session_id: safeString(record.session_id).trim() || undefined,
 		thread_id: safeString(record.thread_id).trim() || undefined,
 		turn_id: safeString(record.turn_id).trim() || undefined,
+		handoff_from: safeString(record.handoff_from).trim() || undefined,
+		handoff_to: safeString(record.handoff_to).trim() || undefined,
+		handoff_at: safeString(record.handoff_at).trim() || undefined,
 		...(hud ? { hud } : {}),
 		...(receipt ? { receipt } : {}),
 		stale: undefined,
@@ -305,6 +294,48 @@ async function readStateFile(filePath: string): Promise<SkillActiveState | null>
 	}
 }
 
+/**
+ * Raw read for handoff mutations. Returns the *unnormalized* parsed object so
+ * inactive entries remain visible to `rawActiveEntries` — `normalizeSkillActiveState`
+ * delegates to `listActiveSkills`, which filters out `active:false` rows for HUD
+ * purposes. Handoff history (e.g. previously demoted callers carrying
+ * `handoff_to`/`handoff_at` lineage) must survive across successive handoffs,
+ * so the on-disk `active_skills` array is preserved verbatim and the next
+ * write recomputes the per-skill row from there.
+ *
+ * Strict semantics: tolerates ENOENT only. Corrupt JSON / non-ENOENT I/O
+ * errors propagate so callers can surface a non-zero CLI status.
+ */
+async function readRawActiveStateForHandoff(filePath: string, strict: boolean): Promise<SkillActiveState | null> {
+	let raw: string;
+	try {
+		raw = await Bun.file(filePath).text();
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return null;
+		if (!strict) return null;
+		throw err;
+	}
+	try {
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object") return null;
+		return parsed as SkillActiveState;
+	} catch (err) {
+		if (!strict) return null;
+		throw err;
+	}
+}
+
+function rawActiveEntries(state: SkillActiveState | null): SkillActiveEntry[] {
+	if (!state || !Array.isArray(state.active_skills)) return [];
+	const out: SkillActiveEntry[] = [];
+	for (const candidate of state.active_skills) {
+		const normalized = normalizeEntry(candidate);
+		if (normalized) out.push(normalized);
+	}
+	return out;
+}
+
 function filterRootEntriesForSession(entries: SkillActiveEntry[], sessionId?: string): SkillActiveEntry[] {
 	const normalizedSessionId = safeString(sessionId).trim();
 	if (!normalizedSessionId) return entries;
@@ -319,12 +350,9 @@ function mergeVisibleEntries(
 	rootState: SkillActiveState | null,
 	sessionId?: string,
 ): SkillActiveEntry[] {
-	const nowMs = Date.now();
-	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId).map(entry =>
-		withDerivedStale(entry, nowMs),
-	);
+	const rootEntries = filterRootEntriesForSession(listActiveSkills(rootState), sessionId);
 	const merged = new Map(rootEntries.map(entry => [entryKey(entry), entry]));
-	for (const entry of listActiveSkills(sessionState).map(candidate => withDerivedStale(candidate, nowMs))) {
+	for (const entry of listActiveSkills(sessionState)) {
 		merged.set(entryKey(entry), entry);
 	}
 	return [...merged.values()];
@@ -374,6 +402,9 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		session_id: options.sessionId,
 		thread_id: options.threadId,
 		turn_id: options.turnId,
+		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
+		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
+		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
 	};
@@ -407,4 +438,98 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 		active_skills: sessionEntries,
 	};
 	await writeStateFile(sessionPath, nextSession);
+}
+
+export interface ApplyHandoffOptions {
+	cwd: string;
+	caller: SyncSkillActiveStateOptions;
+	callee: SyncSkillActiveStateOptions;
+	/** Shared timestamp; falls back to new Date().toISOString(). */
+	nowIso?: string;
+	/** When true, read errors other than ENOENT propagate. */
+	strict?: boolean;
+}
+
+/**
+ * Atomically apply a workflow-skill handoff to both the session-scoped and
+ * root `skill-active-state.json` files in a single write per file.
+ *
+ * Write order: **session first, root last**. The session file is the
+ * source of truth for HUD; the root aggregate must never lead the session
+ * during a handoff window. Each file is rewritten once with caller demoted
+ * to `active:false` (preserving `handoff_to`/`handoff_at` lineage) and
+ * callee promoted to `active:true` (with `handoff_from`/`handoff_at`).
+ */
+export async function applyHandoffToActiveState(options: ApplyHandoffOptions): Promise<void> {
+	const nowIso = options.nowIso ?? new Date().toISOString();
+	const callerEntry = buildSyncEntry(options.caller, nowIso);
+	const calleeEntry = buildSyncEntry(options.callee, nowIso);
+	const sessionId = options.callee.sessionId ?? options.caller.sessionId;
+	const { rootPath, sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId);
+	const readState = (filePath: string) => readRawActiveStateForHandoff(filePath, options.strict === true);
+
+	const applyEntries = (entries: SkillActiveEntry[]): SkillActiveEntry[] => {
+		const callerKey = entryKey(callerEntry);
+		const calleeKey = entryKey(calleeEntry);
+		const priorCaller = entries.find(e => entryKey(e) === callerKey);
+		const kept = entries.filter(e => entryKey(e) !== callerKey && entryKey(e) !== calleeKey);
+		// Merge prior lineage into the demoted caller so multi-step handoff
+		// chains preserve `handoff_from` from the previous transition while
+		// the new `handoff_to`/`handoff_at` describe this one.
+		const mergedCaller: SkillActiveEntry = priorCaller
+			? {
+					...callerEntry,
+					...(priorCaller.handoff_from && !callerEntry.handoff_from
+						? { handoff_from: priorCaller.handoff_from }
+						: {}),
+				}
+			: callerEntry;
+		return [...kept, mergedCaller, calleeEntry];
+	};
+	const buildNextState = (
+		prior: SkillActiveState | null,
+		entries: SkillActiveEntry[],
+		scope: "session" | "root",
+	): SkillActiveState => {
+		const visible = entries.filter(e => e.active !== false);
+		return {
+			...(prior ?? {}),
+			version: 1,
+			active: visible.length > 0,
+			skill: visible[0]?.skill ?? "",
+			phase: visible[0]?.phase ?? "",
+			...(scope === "session" ? { session_id: sessionId } : {}),
+			updated_at: nowIso,
+			source: options.callee.source ?? options.caller.source,
+			active_skills: entries,
+		};
+	};
+
+	if (sessionPath) {
+		const prior = await readState(sessionPath);
+		const next = buildNextState(prior, applyEntries(rawActiveEntries(prior)), "session");
+		await writeStateFile(sessionPath, next);
+	}
+	const priorRoot = await readState(rootPath);
+	const nextRoot = buildNextState(priorRoot, applyEntries(rawActiveEntries(priorRoot)), "root");
+	await writeStateFile(rootPath, nextRoot);
+}
+
+function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): SkillActiveEntry {
+	const hud = normalizeWorkflowHudSummary(options.hud);
+	return {
+		skill: options.skill,
+		phase: options.phase,
+		active: options.active,
+		activated_at: nowIso,
+		updated_at: nowIso,
+		session_id: options.sessionId,
+		thread_id: options.threadId,
+		turn_id: options.turnId,
+		...(options.handoff_from ? { handoff_from: options.handoff_from } : {}),
+		...(options.handoff_to ? { handoff_to: options.handoff_to } : {}),
+		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
+		...(hud ? { hud } : {}),
+		...(options.receipt ? { receipt: options.receipt } : {}),
+	};
 }
