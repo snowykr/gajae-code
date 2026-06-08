@@ -473,6 +473,7 @@ describe("bundled skills CLI", () => {
 					HOME: await makeTempRoot(),
 					PI_NO_TITLE: "1",
 					NO_COLOR: "1",
+					FORCE_COLOR: undefined,
 				},
 			},
 		);
@@ -508,6 +509,7 @@ describe("bundled skills CLI", () => {
 					HOME: await makeTempRoot(),
 					PI_NO_TITLE: "1",
 					NO_COLOR: "1",
+					FORCE_COLOR: undefined,
 				},
 			},
 		);
@@ -546,6 +548,7 @@ describe("bundled skills CLI", () => {
 						HOME: await makeTempRoot(),
 						PI_NO_TITLE: "1",
 						NO_COLOR: "1",
+						FORCE_COLOR: undefined,
 					},
 				},
 			);

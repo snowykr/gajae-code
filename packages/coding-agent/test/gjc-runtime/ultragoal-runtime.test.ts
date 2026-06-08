@@ -7,11 +7,13 @@ import {
 	validateCompletionReceipt,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
+	addUltragoalSubgoal,
 	buildUltragoalHudSummary,
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
 	getUltragoalStatus,
 	readUltragoalLedger,
+	readUltragoalPlan,
 	runNativeUltragoalCommand,
 	startNextUltragoalGoal,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
@@ -528,6 +530,87 @@ describe("native GJC ultragoal runtime", () => {
 
 		expect(plan.goals[0]?.status).toBe("complete");
 		expect(plan.goals[0]?.completionVerification?.receiptKind).toBe("per-goal");
+	});
+	it("continues to next ultragoal goal after checkpointing G001 complete", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Second stage",
+			objective: "Complete the second stage.",
+			evidence: "The regression requires a second required goal.",
+			rationale: "Cover continuation after the first checkpoint.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+			],
+			root,
+		);
+		const status = await getUltragoalStatus(root);
+		const ledger = await readUltragoalLedger(root);
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("Next ultragoal goal: G002");
+		expect(status.goals[0]).toMatchObject({ id: "G001", status: "complete" });
+		expect(status.goals[1]).toMatchObject({ id: "G002", status: "active" });
+		expect(status.status).toBe("active");
+		expect(ledger.filter(event => event.event === "goal_started" && event.goalId === "G002")).toHaveLength(1);
+	});
+
+	it("keeps per-goal receipt fresh after unrelated next goal starts", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await addUltragoalSubgoal({
+			cwd: root,
+			title: "Second stage",
+			objective: "Complete the second stage.",
+			evidence: "The regression requires a second required goal.",
+			rationale: "Cover receipt freshness after continuation.",
+		});
+		await startNextUltragoalGoal({ cwd: root });
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--gjc-goal-json",
+				goalSnapshot(created.gjcObjective),
+				"--quality-gate-json",
+				passingQualityGate(),
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const plan = await readUltragoalPlan(root);
+		if (!plan) throw new Error("missing ultragoal plan");
+		const diagnostic = validateCompletionReceipt({
+			plan,
+			ledger: await readUltragoalLedger(root),
+			goal: plan.goals[0]!,
+			receiptKind: "per-goal",
+		});
+
+		expect(plan.goals[1]).toMatchObject({ id: "G002", status: "active" });
+		expect(diagnostic.state).toBe("active_verified_complete");
 	});
 
 	it("treats receipts as stale after target goal mutation", async () => {

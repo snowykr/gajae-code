@@ -228,18 +228,35 @@ function planSnapshotForReceipt(input: {
 	goal: UltragoalGoal;
 	beforeStatus: UltragoalGoalStatus;
 	targetGoalUpdatedAt: string;
+	receiptKind: UltragoalReceiptKind;
 }): unknown {
+	const targetGoalSnapshot = {
+		...input.goal,
+		status: input.beforeStatus,
+		updatedAt: input.targetGoalUpdatedAt,
+		evidence: undefined,
+		completedAt: undefined,
+		completionVerification: undefined,
+	};
+	const goals =
+		input.receiptKind === "final-aggregate"
+			? input.plan.goals.map(goal => ({
+					...goal,
+					status: goal.id === input.goal.id ? input.beforeStatus : goal.status,
+					updatedAt: goal.id === input.goal.id ? input.targetGoalUpdatedAt : goal.updatedAt,
+					evidence: goal.id === input.goal.id ? undefined : goal.evidence,
+					completedAt: goal.id === input.goal.id ? undefined : goal.completedAt,
+					completionVerification: undefined,
+				}))
+			: [targetGoalSnapshot];
 	return {
-		...input.plan,
-		updatedAt: undefined,
-		goals: input.plan.goals.map(goal => ({
-			...goal,
-			status: goal.id === input.goal.id ? input.beforeStatus : goal.status,
-			updatedAt: goal.id === input.goal.id ? input.targetGoalUpdatedAt : goal.updatedAt,
-			evidence: goal.id === input.goal.id ? undefined : goal.evidence,
-			completedAt: goal.id === input.goal.id ? undefined : goal.completedAt,
-			completionVerification: undefined,
-		})),
+		version: input.plan.version,
+		brief: input.plan.brief,
+		gjcGoalMode: input.plan.gjcGoalMode,
+		gjcObjective: input.plan.gjcObjective,
+		gjcObjectiveAliases: input.plan.gjcObjectiveAliases,
+		createdAt: input.plan.createdAt,
+		goals,
 	};
 }
 
@@ -264,6 +281,7 @@ export function computeUltragoalPlanGeneration(input: {
 			goal: input.goal,
 			beforeStatus: input.beforeStatus,
 			targetGoalUpdatedAt,
+			receiptKind: input.receiptKind,
 		}),
 	);
 	const requiredGoalSetHashBeforeCheckpoint = hashStructuredValue(
@@ -569,6 +587,31 @@ function chooseNextGoal(plan: UltragoalPlan, retryFailed: boolean): UltragoalGoa
 		(retryFailed ? plan.goals.find(goal => goal.status === "failed") : undefined)
 	);
 }
+export interface UltragoalRunCompletionState {
+	requiredGoals: UltragoalGoal[];
+	incompleteGoals: UltragoalGoal[];
+	nextGoal?: UltragoalGoal;
+	allComplete: boolean;
+	hasBlockers: boolean;
+	needsFinalAggregateReceipt: boolean;
+}
+
+export function getUltragoalRunCompletionState(
+	plan: UltragoalPlan,
+	options: { retryFailed?: boolean } = {},
+): UltragoalRunCompletionState {
+	const requiredGoals = requiredUltragoalGoals(plan);
+	const incompleteGoals = requiredGoals.filter(goal => !TERMINAL_OR_SKIPPED_STATUSES.has(goal.status));
+	const nextGoal = chooseNextGoal(plan, options.retryFailed === true);
+	return {
+		requiredGoals,
+		incompleteGoals,
+		nextGoal,
+		allComplete: requiredGoals.length > 0 && incompleteGoals.length === 0,
+		hasBlockers: incompleteGoals.some(goal => goal.status === "blocked" || goal.status === "review_blocked"),
+		needsFinalAggregateReceipt: plan.gjcGoalMode === "aggregate" && incompleteGoals.length === 0,
+	};
+}
 
 export async function startNextUltragoalGoal(input: { cwd: string; retryFailed?: boolean }): Promise<{
 	plan: UltragoalPlan;
@@ -578,7 +621,7 @@ export async function startNextUltragoalGoal(input: { cwd: string; retryFailed?:
 	const plan = await readUltragoalPlan(input.cwd);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
 	const goal = chooseNextGoal(plan, input.retryFailed === true);
-	if (!goal) return { plan, allComplete: plan.goals.every(item => TERMINAL_OR_SKIPPED_STATUSES.has(item.status)) };
+	if (!goal) return { plan, allComplete: getUltragoalRunCompletionState(plan).allComplete };
 	if (goal.status !== "active") {
 		const now = new Date().toISOString();
 		goal.status = "active";
@@ -1171,6 +1214,54 @@ export async function checkpointUltragoalGoal(input: {
 	});
 	return plan;
 }
+export interface UltragoalCheckpointContinuation {
+	plan: UltragoalPlan;
+	checkpointedGoal: UltragoalGoal;
+	nextGoal?: UltragoalGoal;
+	startedNext: boolean;
+	allComplete: boolean;
+	incompleteGoals: UltragoalGoal[];
+}
+
+export async function checkpointAndContinueUltragoalGoal(input: {
+	cwd: string;
+	goalId: string;
+	status: UltragoalGoalStatus;
+	evidence: string;
+	gjcGoalJson?: string;
+	qualityGateJson?: string;
+	advanceNext?: boolean;
+	retryFailed?: boolean;
+}): Promise<UltragoalCheckpointContinuation> {
+	let plan = await checkpointUltragoalGoal(input);
+	const checkpointedGoal = plan.goals.find(goal => goal.id === input.goalId);
+	if (!checkpointedGoal) throw new Error(`No ultragoal goal found for ${input.goalId}.`);
+	if (input.status === "complete" && input.advanceNext === true) {
+		const beforeAdvance = getUltragoalRunCompletionState(plan, { retryFailed: input.retryFailed });
+		if (beforeAdvance.nextGoal && beforeAdvance.nextGoal.status !== "active") {
+			const started = await startNextUltragoalGoal({ cwd: input.cwd, retryFailed: input.retryFailed });
+			plan = started.plan;
+			const afterAdvance = getUltragoalRunCompletionState(plan, { retryFailed: input.retryFailed });
+			return {
+				plan,
+				checkpointedGoal,
+				nextGoal: started.goal,
+				startedNext: Boolean(started.goal),
+				allComplete: afterAdvance.allComplete,
+				incompleteGoals: afterAdvance.incompleteGoals,
+			};
+		}
+	}
+	const state = getUltragoalRunCompletionState(plan, { retryFailed: input.retryFailed });
+	return {
+		plan,
+		checkpointedGoal,
+		nextGoal: state.nextGoal,
+		startedNext: false,
+		allComplete: state.allComplete,
+		incompleteGoals: state.incompleteGoals,
+	};
+}
 
 export async function addUltragoalSubgoal(input: {
 	cwd: string;
@@ -1387,6 +1478,43 @@ function renderCompleteHandoff(
 		"",
 	].join("\n");
 }
+function renderCheckpointContinuation(result: UltragoalCheckpointContinuation, status: UltragoalGoalStatus, json: boolean, cwd: string): string {
+	if (json)
+		return renderCliWriteReceipt({
+			ok: true,
+			goal_id: result.checkpointedGoal.id,
+			status,
+			goals_path: getUltragoalPaths(cwd).goalsPath,
+			completion_receipt_kind: result.checkpointedGoal.completionVerification?.receiptKind,
+			quality_gate_hash: result.checkpointedGoal.completionVerification?.qualityGateHash,
+			all_complete: result.allComplete,
+			next_goal_id: result.nextGoal?.id,
+			next_goal_status: result.nextGoal?.status,
+			started_next: result.startedNext,
+			incomplete_goal_ids: result.incompleteGoals.map(goal => goal.id),
+		});
+	const lines = [`Checkpointed ${result.checkpointedGoal.id} as ${status}.`];
+	if (status === "complete") {
+		if (result.allComplete) {
+			lines.push("All ultragoal goals are complete.");
+		} else if (result.nextGoal) {
+			lines.push(`Next ultragoal goal: ${result.nextGoal.id} — ${result.nextGoal.title}`);
+			lines.push(`Objective: ${result.nextGoal.objective}`);
+			lines.push(`GJC objective: ${result.plan.gjcObjective}`);
+			lines.push(
+				result.startedNext
+					? "The next ultragoal goal is active; continue the current aggregate GJC goal and checkpoint this story when verified."
+					: "Run `gjc ultragoal complete-goals` to activate the next ultragoal story.",
+			);
+		}
+	} else if (status === "failed") {
+		lines.push("Resume failed goals with `gjc ultragoal complete-goals --retry-failed` after the blocker is fixed.");
+	} else if (status === "blocked" || status === "review_blocked") {
+		lines.push("Blocked ultragoal work must be resolved with explicit blocker work or steering before final completion.");
+	}
+	lines.push("");
+	return lines.join("\n");
+}
 
 async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<UltragoalCommandResult> {
 	const help = renderUltragoalHelp(args);
@@ -1427,27 +1555,18 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				const goalId = flagValue(args, "--goal-id") ?? "";
 				const status = parseGoalStatus(flagValue(args, "--status"));
 				const evidence = flagValue(args, "--evidence") ?? "";
-				const plan = await checkpointUltragoalGoal({
+				const result = await checkpointAndContinueUltragoalGoal({
 					cwd,
 					goalId,
 					status,
 					evidence,
 					gjcGoalJson: flagValue(args, "--gjc-goal-json"),
 					qualityGateJson: flagValue(args, "--quality-gate-json"),
+					advanceNext: status === "complete",
 				});
-				const goal = plan.goals.find(item => item.id === goalId);
 				return {
 					status: 0,
-					stdout: json
-						? renderCliWriteReceipt({
-								ok: true,
-								goal_id: goalId,
-								status,
-								goals_path: getUltragoalPaths(cwd).goalsPath,
-								completion_receipt_kind: goal?.completionVerification?.receiptKind,
-								quality_gate_hash: goal?.completionVerification?.qualityGateHash,
-							})
-						: `ultragoal checkpoint goal-id=${goalId} status=${status}\n`,
+					stdout: renderCheckpointContinuation(result, status, json, cwd),
 				};
 			}
 			case "steer": {

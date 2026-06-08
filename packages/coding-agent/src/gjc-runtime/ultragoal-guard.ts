@@ -3,6 +3,7 @@ import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
 	computeUltragoalPlanGeneration,
 	getUltragoalPaths,
+	getUltragoalRunCompletionState,
 	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
@@ -246,7 +247,8 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has recorded review blockers; complete blocker work and rerun verification.",
 		};
 	}
-	if (plan.goals.some(goal => goal.status === "blocked" || goal.status === "failed")) {
+	const runState = getUltragoalRunCompletionState(plan);
+	if (runState.incompleteGoals.some(goal => goal.status === "blocked" || goal.status === "failed")) {
 		return {
 			state: "active_dirty_quality_gate",
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
@@ -259,7 +261,21 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal aggregate completion requires a fresh final aggregate receipt.",
 		};
 	}
-	return validateCompletionReceipt({ plan, ledger, goal: receiptTarget.goal, receiptKind: receiptTarget.receiptKind });
+	const receiptDiagnostic = validateCompletionReceipt({
+		plan,
+		ledger,
+		goal: receiptTarget.goal,
+		receiptKind: receiptTarget.receiptKind,
+	});
+	if (receiptDiagnostic.state !== "active_verified_complete") return receiptDiagnostic;
+	if (runState.incompleteGoals.length > 0) {
+		return {
+			state: "active_missing_final_receipt",
+			message: `Ultragoal still has incomplete required goals: ${runState.incompleteGoals.map(goal => goal.id).join(", ")}. Run \`gjc ultragoal complete-goals\` to continue.`,
+			goalId: receiptTarget.goal.id,
+		};
+	}
+	return receiptDiagnostic;
 }
 
 export async function assertCanCompleteCurrentGoal(input: {

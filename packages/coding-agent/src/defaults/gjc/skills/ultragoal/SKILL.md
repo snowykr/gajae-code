@@ -96,11 +96,12 @@ Loop until `gjc ultragoal status` reports all goals complete:
 7. Before any `--status complete` checkpoint, run the mandatory final cleanup/review gate below. In aggregate mode, do **not** call `goal({"op":"complete"})` for intermediate stories; checkpoint each story with a fresh `goal({"op":"get"})` snapshot whose aggregate objective is still `active`. On the final story, use the same fresh active snapshot to create the final aggregate receipt first; only after that receipt exists may `goal({"op":"complete"})` run.
 8. Checkpoint the durable ledger with that fresh active snapshot. Complete checkpoints require `--quality-gate-json`; the runtime hook rejects closure without a clean architect review:
    `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --gjc-goal-json <goal-get-json-or-path> --quality-gate-json <quality-gate-json-or-path>`
+   A successful complete checkpoint is story completion, not automatic run completion. Read the checkpoint output: when it prints `Next ultragoal goal: <id>`, continue that active story under the same aggregate GJC goal; when it prints `All ultragoal goals are complete`, the durable run is terminal. `gjc ultragoal complete-goals` remains the supported manual next-story command if continuation output was missed.
 9. If blocked or failed, checkpoint failure:
    `gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
-11. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
+10. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
    `gjc ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy GJC goal blocks goal create in this thread>" --gjc-goal-json <goal-get-json-or-path>`
-12. Resume failed goals with `gjc ultragoal complete-goals --retry-failed`.
+11. Resume failed goals with `gjc ultragoal complete-goals --retry-failed`.
 
 ## Dynamic steering
 
