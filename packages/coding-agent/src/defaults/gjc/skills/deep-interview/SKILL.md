@@ -123,7 +123,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
    - Final specs MUST resolve to `.gjc/specs/deep-interview-{slug}.md` exactly.
    - Write final specs and all ephemeral interview artifacts through the active GJC workflow/state CLI when available.
    - Direct `.gjc/` file edits are forbidden unless an explicit force override is active; do not use `write`, `edit`, or `ast_edit` against `.gjc/specs`, `.gjc/plans`, `.gjc/state`, or other `.gjc/` paths during normal workflow operation.
-   - Preferred: pass the spec markdown **inline** to `gjc deep-interview --write … --spec "<markdown>"` — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/specs`.
+   - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
 4. **Initialize state** via `gjc state write`:
