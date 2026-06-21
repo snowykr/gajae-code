@@ -57,6 +57,7 @@ packages/ai/test/.temp-images/
 .gjc/logs/
 .gjc/rlm/
 .gjc/state/
+.gjc/_session-*/
 .gjc/metrics.json
 .pi_config/
 .opencode/
