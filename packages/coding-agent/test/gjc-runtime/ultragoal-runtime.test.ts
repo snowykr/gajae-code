@@ -35,10 +35,13 @@ const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 
 let savedSessionId: string | undefined;
+let savedSessionFile: string | undefined;
 
 beforeEach(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
+	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GJC_SESSION_FILE;
 });
 
 async function tempDir(): Promise<string> {
@@ -50,6 +53,8 @@ async function tempDir(): Promise<string> {
 afterEach(async () => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
+	if (savedSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+	else process.env.GJC_SESSION_FILE = savedSessionFile;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -409,6 +414,80 @@ function goalSnapshot(objective: string, status = "active", updatedAt: number | 
 			updatedAt,
 		},
 	});
+}
+
+async function seedGoalModeSessionFile(root: string, objective: string, status = "active"): Promise<string> {
+	const sessionFile = path.join(root, "session.jsonl");
+	const now = Date.now();
+	await Bun.write(
+		sessionFile,
+		`${JSON.stringify({ version: 3, type: "session", id: TEST_SESSION_ID, createdAt: new Date(now).toISOString() })}\n${JSON.stringify(
+			{
+				type: "mode_change",
+				id: "goal-mode",
+				parentId: null,
+				timestamp: new Date(now).toISOString(),
+				mode: "goal",
+				data: {
+					goal: {
+						id: "goal-1",
+						objective,
+						status,
+						tokensUsed: 0,
+						timeUsedSeconds: 0,
+						createdAt: now,
+						updatedAt: now,
+					},
+				},
+			},
+		)}\n`,
+	);
+	process.env.GJC_SESSION_FILE = sessionFile;
+	return sessionFile;
+}
+
+async function seedAmbiguousGoalModeSessionFile(root: string, objective: string): Promise<string> {
+	const sessionFile = path.join(root, "ambiguous-session.jsonl");
+	const now = Date.now();
+	const staleMatchingGoal = {
+		id: "stale-goal",
+		objective,
+		status: "active",
+		tokensUsed: 0,
+		timeUsedSeconds: 0,
+		createdAt: now,
+		updatedAt: now,
+	};
+	const intendedBranchGoal = { ...staleMatchingGoal, id: "intended-goal", objective: "different active branch goal" };
+	const entries = [
+		{ version: 3, type: "session", id: TEST_SESSION_ID, timestamp: new Date(now).toISOString(), cwd: root },
+		{
+			type: "mode_change",
+			id: "root-goal",
+			parentId: null,
+			timestamp: new Date(now).toISOString(),
+			mode: "goal",
+			data: { goal: intendedBranchGoal },
+		},
+		{
+			type: "mode_change",
+			id: "intended-branch",
+			parentId: "root-goal",
+			timestamp: new Date(now).toISOString(),
+			mode: "none",
+		},
+		{
+			type: "mode_change",
+			id: "stale-matching-branch",
+			parentId: "root-goal",
+			timestamp: new Date(now).toISOString(),
+			mode: "goal",
+			data: { goal: staleMatchingGoal },
+		},
+	];
+	await Bun.write(sessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+	process.env.GJC_SESSION_FILE = sessionFile;
+	return sessionFile;
 }
 
 async function readJsonFile(filePath: string): Promise<Record<string, unknown>> {
@@ -915,7 +994,7 @@ describe("native GJC ultragoal runtime", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("gjc ultragoal checkpoint --goal-id");
 		expect(result.stdout).toContain("--quality-gate-json");
-		expect(result.stdout).toContain('goal({"op":"get"})');
+		expect(result.stdout).toContain("current session goal state");
 		expect(result.stdout).toContain("obligation");
 	});
 
@@ -2264,7 +2343,39 @@ describe("native GJC ultragoal runtime", () => {
 		).rejects.toThrow(/kill-switch-bypass/);
 	});
 
-	it("requires a fresh goal get snapshot for complete checkpoints", async () => {
+	it("sources complete checkpoint goal snapshots from current session state when omitted", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await seedGoalModeSessionFile(root, created.gjcObjective);
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--quality-gate-json",
+				await passingLiveQualityGate(root),
+				"--json",
+			],
+			root,
+		);
+		const receipt = JSON.parse(result.stdout ?? "{}");
+		const plan = await readUltragoalPlan(root);
+		const ledger = await readUltragoalLedger(root);
+		const checkpoint = ledger.find(event => event.event === "goal_checkpointed");
+
+		expect(result.status).toBe(0);
+		expect(receipt.quality_gate_hash).toEqual(expect.any(String));
+		expect(plan?.goals[0]?.completionVerification?.gjcGoalSnapshotHash).toEqual(expect.any(String));
+		expect(checkpoint?.gjcGoalJson).toMatchObject({ goal: { objective: created.gjcObjective, status: "active" } });
+	});
+
+	it("requires supplied or current-session goal snapshots for complete checkpoints", async () => {
 		const root = await tempDir();
 		await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
 		await startNextUltragoalGoal({ cwd: root });
@@ -2286,9 +2397,42 @@ describe("native GJC ultragoal runtime", () => {
 		);
 
 		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("complete checkpoints require --gjc-goal-json");
+		expect(result.stderr).toContain("complete checkpoints require an active GJC goal-mode snapshot");
 		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text()).toBe(
 			beforeGoals,
+		);
+	});
+
+	it("fails closed instead of using stale last-entry goal snapshots from ambiguous session branches", async () => {
+		const root = await tempDir();
+		const created = await createUltragoalPlan({ cwd: root, brief: "Ship the fix" });
+		await startNextUltragoalGoal({ cwd: root });
+		await seedAmbiguousGoalModeSessionFile(root, created.gjcObjective);
+		const beforeGoals = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text();
+		const beforeLedger = await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")).text();
+
+		const result = await runNativeUltragoalCommand(
+			[
+				"checkpoint",
+				"--goal-id",
+				"G001",
+				"--status",
+				"complete",
+				"--evidence",
+				"tests passed",
+				"--quality-gate-json",
+				await passingLiveQualityGate(root),
+			],
+			root,
+		);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("complete checkpoints require an active GJC goal-mode snapshot");
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")).text()).toBe(
+			beforeGoals,
+		);
+		expect(await Bun.file(path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")).text()).toBe(
+			beforeLedger,
 		);
 	});
 

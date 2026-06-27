@@ -7,6 +7,7 @@
 import { APP_NAME, getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
+import { installGjcPluginBundle, isGjcPluginBundleSource, readRegistry } from "../extensibility/gjc-plugins";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
 import {
 	getInstalledPluginsRegistryPath,
@@ -48,6 +49,8 @@ export interface PluginCommandArgs {
 		disable?: string;
 		set?: string;
 		scope?: "user" | "project";
+		user?: boolean;
+		project?: boolean;
 	};
 }
 
@@ -109,6 +112,10 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 			result.flags.dryRun = true;
 		} else if (arg === "-l" || arg === "--local") {
 			result.flags.local = true;
+		} else if (arg === "--user") {
+			result.flags.user = true;
+		} else if (arg === "--project") {
+			result.flags.project = true;
 		} else if (arg === "--enable" && i + 1 < args.length) {
 			result.flags.enable = args[++i];
 		} else if (arg === "--disable" && i + 1 < args.length) {
@@ -345,7 +352,14 @@ async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]):
 async function handleInstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; force?: boolean; dryRun?: boolean; scope?: "user" | "project" },
+	flags: {
+		json?: boolean;
+		force?: boolean;
+		dryRun?: boolean;
+		scope?: "user" | "project";
+		user?: boolean;
+		project?: boolean;
+	},
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin install <package[@version]>[features] ...`));
@@ -360,6 +374,32 @@ async function handleInstall(
 	const knownMarketplaces = new Set((await mktMgr.listMarketplaces()).map(m => m.name));
 
 	for (const spec of packages) {
+		// GJC plugin bundle classifier: a source containing gajae-plugin.json (or a
+		// git/tarball source) routes to the bundle installer BEFORE marketplace/npm.
+		if (await isGjcPluginBundleSource(spec)) {
+			if (flags.user === flags.project) {
+				console.error(
+					chalk.red(`GJC plugin bundle install requires exactly one of --user or --project for "${spec}".`),
+				);
+				process.exit(1);
+			}
+			const scope: "user" | "project" = flags.user ? "user" : "project";
+			try {
+				const res = await installGjcPluginBundle(spec, { scope, cwd: process.cwd(), force: flags.force });
+				if (flags.json) {
+					console.log(JSON.stringify({ name: res.entry.name, status: res.status, scope }, null, 2));
+				} else {
+					console.log(
+						chalk.green(`${theme.status.success} ${res.status} GJC plugin ${res.entry.name} (${scope})`),
+					);
+				}
+			} catch (err) {
+				console.error(chalk.red(`${theme.status.error} Failed to install GJC plugin ${spec}: ${err}`));
+				process.exit(1);
+			}
+			continue;
+		}
+
 		const target = classifyInstallTarget(spec, knownMarketplaces);
 
 		if (target.type === "marketplace") {
@@ -462,13 +502,16 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 	const npmPlugins = await manager.list();
 	const mktMgr = await makeMarketplaceManager();
 	const mktPlugins = await mktMgr.listInstalledPlugins();
+	const cwd = getProjectDir();
+	const [gjcUser, gjcProject] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
+	const gjcBundles = [...gjcUser.plugins, ...gjcProject.plugins];
 
 	if (flags.json) {
-		console.log(JSON.stringify({ npm: npmPlugins, marketplace: mktPlugins }, null, 2));
+		console.log(JSON.stringify({ npm: npmPlugins, marketplace: mktPlugins, gjc: gjcBundles }, null, 2));
 		return;
 	}
 
-	if (npmPlugins.length === 0 && mktPlugins.length === 0) {
+	if (npmPlugins.length === 0 && mktPlugins.length === 0 && gjcBundles.length === 0) {
 		console.log(chalk.dim("No plugins installed"));
 		console.log(chalk.dim(`\nInstall plugins with: ${APP_NAME} plugin install <package>`));
 		return;
@@ -508,6 +551,26 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 			const shadowLabel = plugin.shadowedBy ? chalk.dim(" [shadowed]") : "";
 			const scopeLabel = chalk.dim(` (${plugin.scope})`);
 			console.log(`  ${plugin.id} (${version})${scopeLabel}${shadowLabel}`);
+		}
+	}
+
+	if (gjcBundles.length > 0) {
+		if (npmPlugins.length > 0 || mktPlugins.length > 0) console.log();
+		console.log(chalk.bold("GJC Plugin Bundles:\n"));
+		for (const plugin of gjcBundles) {
+			const status = plugin.enabled ? chalk.green(theme.status.enabled) : chalk.dim(theme.status.disabled);
+			const scopeLabel = chalk.dim(` (${plugin.scope})`);
+			const disabledCount = plugin.disabledSurfaceIds.length;
+			const quarantineCount = plugin.quarantine?.length ?? 0;
+			const detail = [
+				disabledCount > 0 ? `${disabledCount} disabled` : null,
+				quarantineCount > 0 ? `${quarantineCount} quarantined` : null,
+			]
+				.filter((v): v is string => Boolean(v))
+				.join(", ");
+			console.log(
+				`${status} ${plugin.name}@${plugin.version}${scopeLabel}${detail ? chalk.dim(` — ${detail}`) : ""}`,
+			);
 		}
 	}
 }

@@ -131,7 +131,7 @@ import {
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
-import { MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
+import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -425,6 +425,13 @@ export interface AgentSessionConfig {
 	 * **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedAsyncJobManager?: AsyncJobManager;
+	/**
+	 * MCPManager whose lifecycle this session owns (top-level sessions that
+	 * connected plugin-bundle MCP servers). Only the owned manager is
+	 * disconnected on dispose; subagents and callers that merely observe the
+	 * process-global manager **MUST NOT** dispose it on their own teardown.
+	 */
+	ownedMcpManager?: MCPManager;
 	/** Optional fork-context seed used to initialize a child session before its first prompt. */
 	forkContextSeed?: ForkContextSeed;
 	/** Optional provider state override. Fork-context children should omit this by default. */
@@ -962,6 +969,7 @@ export class AgentSession {
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
+	readonly #ownedMcpManager: MCPManager | undefined;
 	#pendingPythonMessages: PythonExecutionMessage[] = [];
 	#activeEvalExecutions = new Set<Promise<unknown>>();
 	#evalExecutionDisposing = false;
@@ -1091,6 +1099,16 @@ export class AgentSession {
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	/**
+	 * Provider keys for which the Anthropic fast-mode auto-fallback fired this
+	 * session (the provider rejected `speed:"fast"` and we retried without it).
+	 * Provider/API-session scoped — matching the provider's own per-session
+	 * `fastModeDisabled` flag — NOT model-keyed. Transient (never persisted): it
+	 * suppresses the current-model fast indicator and dedups the one-time warning
+	 * WITHOUT mutating the user's intended `serviceTier`, so task subagents still
+	 * inherit the intended tier and a different provider still shows fast.
+	 */
+	#fastModeAutoDisabledProviderKeys = new Set<string>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
@@ -1165,6 +1183,7 @@ export class AgentSession {
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
+		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -1980,12 +1999,18 @@ export class AgentSession {
 				const currentGrantsAnthropicPriority =
 					this.serviceTier === "priority" || this.serviceTier === "claude-only";
 				if (assistantMsg.disabledFeatures?.includes("priority") && currentGrantsAnthropicPriority) {
-					this.setServiceTier(undefined);
-					this.emitNotice(
-						"warning",
-						"Priority/fast mode rejected for this model; retried without it. Fast mode is now off.",
-						"priority",
-					);
+					// The provider auto-dropped `speed:"fast"` for the current model's
+					// provider this turn. Record a transient, provider-scoped marker
+					// instead of clearing the user's intended tier, so task subagents
+					// still inherit it and a different provider still gets fast mode.
+					// Warn once per provider until the user re-arms with `/fast on`.
+					if (this.#markFastModeAutoDisabledForCurrentModel()) {
+						this.emitNotice(
+							"warning",
+							"Priority/fast mode rejected for this model; retried without it. Fast mode is off for this model until you re-enable it with /fast on.",
+							"priority",
+						);
+					}
 				}
 				// Resolve TTSR resume gate before checking for new deferred injections.
 				// Gate on #ttsrAbortPending, not stopReason: a non-TTSR abort (e.g. streaming
@@ -3244,10 +3269,14 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
-		const mcpManager = MCPManager.instance();
-		if (mcpManager) {
-			await mcpManager.disconnectAll();
-			if (MCPManager.instance() === mcpManager) {
+		// Only disconnect the MCP manager THIS session owns (top-level sessions that
+		// connected plugin-bundle MCP servers). Subagents and callers that merely
+		// observe the process-global manager must never tear down a manager they do
+		// not own. Mirrors the ownedAsyncJobManager rule above.
+		const ownedMcpManager = this.#ownedMcpManager;
+		if (ownedMcpManager) {
+			await ownedMcpManager.disconnectAll();
+			if (MCPManager.instance() === ownedMcpManager) {
 				MCPManager.setInstance(undefined);
 			}
 		}
@@ -6283,32 +6312,80 @@ export class AgentSession {
 	}
 
 	/**
+	 * Provider/API-session key used to scope the fast-mode auto-disable marker.
+	 * Mirrors the provider's own per-session `fastModeDisabled` scope (the key in
+	 * {@link #providerSessionState} cleared by `clearAnthropicFastModeFallback`),
+	 * so the marker is provider-scoped, never model-keyed. Returns `undefined`
+	 * when no model/provider is selected.
+	 */
+	#fastModeProviderKey(provider: string | undefined = this.model?.provider): string | undefined {
+		return provider;
+	}
+
+	/**
+	 * Record that the current model's provider had fast mode auto-dropped this
+	 * session. Returns `true` only when the provider key is newly marked, so the
+	 * caller emits the one-time warning exactly once per provider until re-arm.
+	 */
+	#markFastModeAutoDisabledForCurrentModel(): boolean {
+		const key = this.#fastModeProviderKey();
+		if (key === undefined) return false;
+		if (this.#fastModeAutoDisabledProviderKeys.has(key)) return false;
+		this.#fastModeAutoDisabledProviderKeys.add(key);
+		return true;
+	}
+
+	/** True when `provider`'s fast mode was auto-disabled this session. */
+	#isFastModeAutoDisabledForProvider(provider?: string): boolean {
+		const key = this.#fastModeProviderKey(provider);
+		return key !== undefined && this.#fastModeAutoDisabledProviderKeys.has(key);
+	}
+
+	/**
+	 * Re-arm fast mode after an auto-disable: clear the provider's sticky
+	 * `fastModeDisabled` fallback flag and the session auto-disable markers so the
+	 * next request carries `speed:"fast"` again and a future rejection can warn
+	 * once more. Called on explicit re-enable (`/fast on`, re-arming tier change),
+	 * never by the transient Q1 auto-disable path.
+	 */
+	#rearmFastMode(): void {
+		clearAnthropicFastModeFallback(this.#providerSessionState);
+		this.#fastModeAutoDisabledProviderKeys.clear();
+	}
+
+	/**
 	 * True when the configured `serviceTier` resolves to `"priority"` for the
-	 * *currently selected model's provider*. Returns false for scoped tiers
-	 * that don't match (e.g. `"openai-only"` on an anthropic model) and when
-	 * no model is selected.
+	 * *currently selected model's provider* AND fast mode was not auto-disabled
+	 * for that provider this session. This is the current-model EFFECTIVE
+	 * predicate (what the next request actually does); use {@link isFastForProvider}
+	 * for pure configured intent (e.g. subagent/`modelRoles` display rows).
 	 */
 	isFastModeActive(): boolean {
-		return this.isFastForProvider(this.model?.provider);
+		const provider = this.model?.provider;
+		return this.isFastForProvider(provider) && !this.#isFastModeAutoDisabledForProvider(provider);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
-		if (this.serviceTier === serviceTier) return;
-		// Re-arming priority on Anthropic? Clear the per-session auto-fallback
-		// sticky disable so the next request actually carries `speed: "fast"`
-		// again. Without this, `/fast on` (or user switching to a tier that
-		// grants anthropic priority) after an auto-disable is a silent no-op
-		// and the warning notice fires every turn.
+		// Re-arming a priority-granting tier always clears the per-session
+		// auto-fallback sticky disable AND the auto-disable markers so the next
+		// request carries `speed: "fast"` again — even when the tier is unchanged
+		// (re-selecting the same tier is a deliberate re-arm), and before the
+		// no-op early-return below.
 		if (serviceTier === "priority" || serviceTier === "claude-only") {
-			clearAnthropicFastModeFallback(this.#providerSessionState);
+			this.#rearmFastMode();
 		}
+		if (this.serviceTier === serviceTier) return;
 		this.agent.serviceTier = serviceTier;
 		this.sessionManager.appendServiceTierChange(serviceTier ?? null);
 	}
 
 	setFastMode(enabled: boolean): void {
 		if (enabled && this.isFastModeEnabled()) {
-			// Already on under any scope — keep the user's scoped value.
+			// Intent already grants fast mode under some scope — keep the user's
+			// scoped value but still re-arm, so an explicit `/fast on` after a
+			// provider auto-disable actually clears the sticky fallback + markers
+			// (otherwise it is a silent no-op). No history append: intent is unchanged.
+			this.#rearmFastMode();
 			return;
 		}
 		this.setServiceTier(enabled ? "priority" : undefined);
@@ -7507,11 +7584,14 @@ export class AgentSession {
 		availableModels: Model[],
 		currentModel: Model | undefined,
 	): ResolvedModelRoleValue {
+		const target = GJC_MODEL_ASSIGNMENT_TARGETS[role as keyof typeof GJC_MODEL_ASSIGNMENT_TARGETS];
 		const roleModelStr =
-			role === "default"
-				? (this.settings.getModelRole("default") ??
-					(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
-				: this.settings.getModelRole(role);
+			target?.settingsPath === "task.agentModelOverrides"
+				? this.settings.get("task.agentModelOverrides")[role]
+				: role === "default"
+					? (this.settings.getModelRole("default") ??
+						(currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined))
+					: this.settings.getModelRole(role);
 
 		if (!roleModelStr) {
 			return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined };
