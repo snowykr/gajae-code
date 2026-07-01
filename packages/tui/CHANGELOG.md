@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-07-01
+
 ### Fixed
 
 - Reverted the composer Enter/Shift+Enter handling to the 0.7.8 behavior. A recent restructure (#1298 and follow-ups) changed how plain Enter, Ctrl+Enter, and bare-LF Enter were routed and regressed prompt submission for some terminals; the submit/newline branches are now restored to their 0.7.8 form so Enter submits and Shift+Enter inserts a newline.
