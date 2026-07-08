@@ -2227,6 +2227,7 @@ export class TelegramNotificationDaemon {
 								token: session.token,
 							}),
 						);
+						await this.rememberSeenUpdateId(inbound.updateId);
 						await this.botApi
 							.call("sendMessage", {
 								chat_id: this.opts.chatId,
@@ -2236,7 +2237,6 @@ export class TelegramNotificationDaemon {
 							.catch(error => {
 								logger.warn(`telegram: failed to acknowledge pending ask reply: ${String(error)}`);
 							});
-						await this.rememberSeenUpdateId(inbound.updateId);
 						if (inbound.messageId !== undefined) await this.setReaction(inbound.messageId, QUEUED_REACTION);
 						return;
 					}
