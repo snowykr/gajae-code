@@ -855,9 +855,9 @@ describe("telegram daemon", () => {
 		await ackStarted;
 		const duplicate = daemon.handleTelegramUpdate(update);
 		await Promise.resolve();
-		const repliesBeforeAck = FakeWs.instances[0]!.sent
-			.map(frame => JSON.parse(frame))
-			.filter(frame => frame.type === "reply" && frame.id === "ask1");
+		const repliesBeforeAck = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).filter(
+			frame => frame.type === "reply" && frame.id === "ask1",
+		);
 		expect(repliesBeforeAck).toHaveLength(1);
 		releaseAck();
 		await first;
