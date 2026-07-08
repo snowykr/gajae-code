@@ -25,6 +25,7 @@
 - Mac Option+Enter no longer collides with the queue-message binding.
 - Telegram completion notifications suppress dot-only messages, and Telegram-originated input is shown immediately and recorded in prompt history.
 - The computer red-team CI gate avoids false positives from non-computer-control changes.
+- Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.
 
 ## [0.9.0] - 2026-07-07
 ### Added
