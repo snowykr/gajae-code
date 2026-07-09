@@ -64,7 +64,8 @@ export interface RpcClientOptions {
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
 
-export type RpcEventListener = (event: AgentSessionEvent) => void;
+export type RpcEventListener = (event: AgentEvent) => void;
+export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -383,6 +384,7 @@ export class RpcClient {
 	#transport: RpcTransport | null = null;
 	#transportClosed = false;
 	#eventListeners: RpcEventListener[] = [];
+	#sessionEventListeners: RpcSessionEventListener[] = [];
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
@@ -447,7 +449,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Subscribe to all renderer-facing agent session events.
+	 * Subscribe to the legacy core AgentEvent subset.
 	 */
 	onEvent(listener: RpcEventListener): () => void {
 		this.#eventListeners.push(listener);
@@ -460,12 +462,16 @@ export class RpcClient {
 	}
 
 	/**
-	 * Subscribe to the legacy core AgentEvent subset.
+	 * Subscribe to all renderer-facing agent session events.
 	 */
-	onCoreEvent(listener: (event: AgentEvent) => void): () => void {
-		return this.onEvent(event => {
-			if (isCoreAgentEvent(event)) listener(event);
-		});
+	onSessionEvent(listener: RpcSessionEventListener): () => void {
+		this.#sessionEventListeners.push(listener);
+		return () => {
+			const index = this.#sessionEventListeners.indexOf(listener);
+			if (index !== -1) {
+				this.#sessionEventListeners.splice(index, 1);
+			}
+		};
 	}
 
 	/**
@@ -872,7 +878,7 @@ export class RpcClient {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
-		const unsubscribe = this.onCoreEvent(event => {
+		const unsubscribe = this.onEvent(event => {
 			events.push(event);
 			if (event.type === "agent_end") {
 				settled = true;
@@ -944,6 +950,10 @@ export class RpcClient {
 		const event = unwrapAgentWireEventFrame(data);
 		if (!isAgentSessionEvent(event)) return;
 
+		for (const listener of this.#sessionEventListeners) {
+			listener(event);
+		}
+		if (!isCoreAgentEvent(event)) return;
 		for (const listener of this.#eventListeners) {
 			listener(event);
 		}

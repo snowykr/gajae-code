@@ -4,7 +4,11 @@ import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentEvent } from "@gajae-code/agent-core";
-import { defineRpcClientTool, RpcClient, type RpcEventListener } from "@gajae-code/coding-agent/modes/rpc/rpc-client";
+import {
+	defineRpcClientTool,
+	RpcClient,
+	type RpcSessionEventListener,
+} from "@gajae-code/coding-agent/modes/rpc/rpc-client";
 import { AGENT_WIRE_EVENT_TYPES } from "../src/modes/shared/agent-wire/event-contract";
 import { AgentWireFrameSequencer, toAgentWireEventFrame } from "../src/modes/shared/agent-wire/event-envelope";
 import type { AgentSessionEvent } from "../src/session/agent-session";
@@ -236,7 +240,7 @@ describe("RpcClient UDS transport", () => {
 		}
 	}, 30_000);
 
-	test("dispatches every registered agent-wire event type through onEvent", async () => {
+	test("dispatches every registered agent-wire event type through onSessionEvent", async () => {
 		const socketPath = path.join(workspace, "full-event-stream.sock");
 		const sequencer = new AgentWireFrameSequencer("rpc-client-full-events");
 		const requiredRendererEvents = [
@@ -265,7 +269,7 @@ describe("RpcClient UDS transport", () => {
 		try {
 			const client = new RpcClient({ transport: "uds", socketPath });
 			const events: AgentSessionEvent[] = [];
-			client.onEvent((event: AgentSessionEvent) => events.push(event));
+			client.onSessionEvent((event: AgentSessionEvent) => events.push(event));
 			await client.start();
 			await Bun.sleep(50);
 
@@ -279,7 +283,7 @@ describe("RpcClient UDS transport", () => {
 			server.close();
 		}
 	}, 30_000);
-	test("collectEvents keeps legacy core-only event collection while onEvent receives the full stream", async () => {
+	test("collectEvents and onEvent keep legacy core-only event collection while onSessionEvent receives the full stream", async () => {
 		const socketPath = path.join(workspace, "collect-events-core-filter.sock");
 		const sequencer = new AgentWireFrameSequencer("rpc-client-collect-core");
 		let serverSocket: net.Socket | undefined;
@@ -301,12 +305,12 @@ describe("RpcClient UDS transport", () => {
 		try {
 			const client = new RpcClient({ transport: "uds", socketPath });
 			const streamedEvents: AgentSessionEvent[] = [];
-			const reusableFullListener: RpcEventListener = event => streamedEvents.push(event);
-			const unsubscribeFullListener = client.onEvent(reusableFullListener);
+			const reusableFullListener: RpcSessionEventListener = event => streamedEvents.push(event);
+			const unsubscribeFullListener = client.onSessionEvent(reusableFullListener);
 			const coreEvents: AgentEvent[] = [];
-			const unsubscribeCoreListener = client.onCoreEvent(event => coreEvents.push(event));
+			const unsubscribeCoreListener = client.onEvent((event: AgentEvent) => coreEvents.push(event));
 			let inferredNotice = false;
-			const unsubscribeInferredFullListener = client.onEvent(event => {
+			const unsubscribeInferredFullListener = client.onSessionEvent(event => {
 				if (event.type === "notice") inferredNotice = true;
 			});
 			await client.start();
