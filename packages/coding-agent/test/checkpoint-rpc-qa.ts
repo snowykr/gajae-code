@@ -44,7 +44,7 @@ async function main() {
 	});
 
 	const streamedEvents: AgentEvent[] = [];
-	client.onEvent(event => {
+	client.onEvent((event: AgentEvent) => {
 		streamedEvents.push(event);
 	});
 
