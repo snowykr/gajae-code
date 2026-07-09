@@ -301,11 +301,11 @@ describe("RpcClient UDS transport", () => {
 		try {
 			const client = new RpcClient({ transport: "uds", socketPath });
 			const streamedEvents: AgentSessionEvent[] = [];
-			const reusableCoreListener: RpcEventListener = (_event: AgentEvent) => {};
-			const unsubscribeCoreListener = client.onEvent(reusableCoreListener);
-			const unsubscribeDirectCoreListener = client.onEvent((_event: AgentEvent) => {});
+			const reusableFullListener: RpcEventListener = event => streamedEvents.push(event);
+			const unsubscribeFullListener = client.onEvent(reusableFullListener);
+			const coreEvents: AgentEvent[] = [];
+			const unsubscribeCoreListener = client.onCoreEvent(event => coreEvents.push(event));
 			let inferredNotice = false;
-			client.onEvent((event: AgentSessionEvent) => streamedEvents.push(event));
 			const unsubscribeInferredFullListener = client.onEvent(event => {
 				if (event.type === "notice") inferredNotice = true;
 			});
@@ -316,9 +316,10 @@ describe("RpcClient UDS transport", () => {
 			expect(streamedEvents.map(event => event.type)).toEqual(["notice", "tool_execution_start", "agent_end"]);
 			expect(collectedEvents.map(event => event.type)).toEqual(["tool_execution_start", "agent_end"]);
 			expect(inferredNotice).toBe(true);
+			expect(coreEvents.map(event => event.type)).toEqual(["tool_execution_start", "agent_end"]);
 			unsubscribeInferredFullListener();
-			unsubscribeDirectCoreListener();
 			unsubscribeCoreListener();
+			unsubscribeFullListener();
 			client.stop();
 		} finally {
 			serverSocket?.end();

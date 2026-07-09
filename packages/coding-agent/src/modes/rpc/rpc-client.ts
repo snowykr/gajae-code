@@ -64,7 +64,7 @@ export interface RpcClientOptions {
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
 
-export type RpcEventListener = { bivarianceHack(event: AgentSessionEvent): void }["bivarianceHack"];
+export type RpcEventListener = (event: AgentSessionEvent) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -449,19 +449,23 @@ export class RpcClient {
 	/**
 	 * Subscribe to all renderer-facing agent session events.
 	 */
-	onEvent(listener: RpcEventListener): () => void;
-	/**
-	 * Backward-compatible overload for callers that typed listeners to the core AgentEvent subset.
-	 */
-	onEvent(listener: (event: AgentEvent) => void): () => void;
-	onEvent(listener: RpcEventListener | ((event: AgentEvent) => void)): () => void {
-		this.#eventListeners.push(listener as RpcEventListener);
+	onEvent(listener: RpcEventListener): () => void {
+		this.#eventListeners.push(listener);
 		return () => {
-			const index = this.#eventListeners.indexOf(listener as RpcEventListener);
+			const index = this.#eventListeners.indexOf(listener);
 			if (index !== -1) {
 				this.#eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Subscribe to the legacy core AgentEvent subset.
+	 */
+	onCoreEvent(listener: (event: AgentEvent) => void): () => void {
+		return this.onEvent(event => {
+			if (isCoreAgentEvent(event)) listener(event);
+		});
 	}
 
 	/**
@@ -868,8 +872,8 @@ export class RpcClient {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (isCoreAgentEvent(event)) events.push(event);
+		const unsubscribe = this.onCoreEvent(event => {
+			events.push(event);
 			if (event.type === "agent_end") {
 				settled = true;
 				unsubscribe();
