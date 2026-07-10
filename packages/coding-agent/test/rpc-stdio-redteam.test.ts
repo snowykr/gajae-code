@@ -264,6 +264,52 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		expect(result.stderr.trim()).toBe("");
 	}, 30_000);
 
+	it("rejects malformed typed commands with correlation and accepts the next command", async () => {
+		// Given malformed command objects that are valid JSON but violate their command schemas.
+		const malformedCommands = [
+			{
+				id: "bad-inherit",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "inherit",
+			},
+			{
+				id: "bad-provider",
+				type: "set_default_model_selection",
+				provider: 42,
+				modelId: "rpc-test-model",
+				thinkingLevel: "off",
+			},
+			{
+				id: "bad-shape",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				thinkingLevel: "off",
+			},
+			{ id: "bad-capabilities", type: "set_capabilities", capabilities: ["compact_message_update", 42] },
+		] as const;
+
+		// When the real stdio process receives every malformed object followed by a valid health probe.
+		const result = await driveRpcServer([...malformedCommands, { id: "state-after-invalid", type: "get_state" }]);
+
+		// Then every rejection preserves request correlation and the long-lived process remains healthy.
+		expect(result.exitCode, result.stderr).toBe(0);
+		for (const command of malformedCommands) {
+			expect(findResponse(result.frames, command.id)).toMatchObject({
+				id: command.id,
+				command: command.type,
+				success: false,
+				error: "Invalid command",
+			});
+		}
+		expect(findResponse(result.frames, "state-after-invalid")).toMatchObject({
+			command: "get_state",
+			success: true,
+		});
+		expect(result.stderr.trim()).toBe("");
+	}, 30_000);
+
 	it("runs independent child sessions concurrently without state bleed", async () => {
 		const alphaCwd = path.join(workspace, "alpha");
 		const betaCwd = path.join(workspace, "beta");

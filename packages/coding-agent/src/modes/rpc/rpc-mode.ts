@@ -23,6 +23,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
 import { createRpcCommandScheduler as createSharedRpcCommandScheduler } from "../shared/agent-wire/command-scheduler";
+import { isRpcCommand } from "../shared/agent-wire/command-validation";
 import {
 	AgentWireCompactEventEncoder,
 	AgentWireFrameSequencer,
@@ -55,6 +56,19 @@ export type PendingExtensionRequest = {
 	resolve: (response: RpcExtensionUIResponse) => void;
 	reject: (error: Error) => void;
 };
+
+function isRpcExtensionUIResponse(value: unknown): value is RpcExtensionUIResponse {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	if (!("type" in value) || value.type !== "extension_ui_response") return false;
+	if (!("id" in value) || typeof value.id !== "string") return false;
+	if ("value" in value && typeof value.value === "string") return true;
+	if ("confirmed" in value && typeof value.confirmed === "boolean") return true;
+	return (
+		"cancelled" in value &&
+		value.cancelled === true &&
+		(!("timedOut" in value) || typeof value.timedOut === "boolean")
+	);
+}
 
 type RpcOutput = (
 	obj:
@@ -640,9 +654,8 @@ export async function runRpcMode(
 			return;
 		}
 		try {
-			if ((parsed as RpcExtensionUIResponse).type === "extension_ui_response") {
-				const response = parsed as RpcExtensionUIResponse;
-				pendingExtensionRequests.get(response.id)?.resolve(response);
+			if (isRpcExtensionUIResponse(parsed)) {
+				pendingExtensionRequests.get(parsed.id)?.resolve(parsed);
 				return;
 			}
 			if (isRpcHostToolResult(parsed)) {
@@ -657,11 +670,21 @@ export async function runRpcMode(
 				hostUriBridge.handleResult(parsed);
 				return;
 			}
-			if ((parsed as RpcCommand).type === "set_capabilities") {
+			if (!isRpcCommand(parsed)) {
+				let id: string | undefined;
+				let command = "parse";
+				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+					if ("id" in parsed && typeof parsed.id === "string") id = parsed.id;
+					if ("type" in parsed && typeof parsed.type === "string") command = parsed.type;
+				}
+				output(error(id, command, "Invalid command"));
+				return;
+			}
+			if (parsed.type === "set_capabilities") {
 				// RPC has no startup handshake; clients negotiate optional event-shape capabilities
 				// with this explicit command. Defaults remain legacy/full-frame until accepted here.
-				const command = parsed as Extract<RpcCommand, { type: "set_capabilities" }>;
-				const requested = Array.isArray(command.capabilities) ? command.capabilities : [];
+				const command = parsed;
+				const requested = command.capabilities;
 				const acceptedCapabilities = requested.filter(capability => capability === "compact_message_update");
 				rpcCapabilities.compactMessageUpdate = acceptedCapabilities.includes("compact_message_update");
 				output(
@@ -675,7 +698,7 @@ export async function runRpcMode(
 			// Ordered commands run through a serial chain to preserve causal order; the
 			// reader never blocks, so cancellation commands stay responsive even while a
 			// long command is in flight (issue 13).
-			dispatchCommand(parsed as RpcCommand);
+			dispatchCommand(parsed);
 			await checkShutdownRequested();
 		} catch (err) {
 			output(error(undefined, "parse", `Failed to parse command: ${decodeError(err)}`));
