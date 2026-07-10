@@ -35,6 +35,7 @@ pub mod glob_util;
 pub mod grep;
 pub mod hashline;
 pub mod highlight;
+pub mod strict_fs;
 pub mod html;
 pub mod keys;
 pub mod linediff;

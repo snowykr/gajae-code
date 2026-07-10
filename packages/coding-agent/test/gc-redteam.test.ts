@@ -52,6 +52,7 @@ function ctxFor(base: string, registryDir: string, probe: GcPidProbe): GcContext
 			GJC_RECEIPT_SPOOL_DIR: path.join(base, "spool"),
 		},
 		cwd: base,
+		fileLockRoots: [path.join(base, "spool")],
 	};
 }
 

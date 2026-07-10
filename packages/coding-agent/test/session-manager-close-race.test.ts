@@ -30,6 +30,7 @@ import {
 	MemorySessionStorage,
 	type SessionStorage,
 	type SessionStorageWriter,
+	type StrictHeldSessionCapability,
 } from "@gajae-code/coding-agent/session/session-storage";
 
 class CloseHoldingStorage implements SessionStorage {
@@ -120,6 +121,9 @@ class CloseHoldingStorage implements SessionStorage {
 	}
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		return this.#inner.deleteSessionWithArtifacts(sessionPath);
+	}
+	pinStrictSession(_path: string): StrictHeldSessionCapability {
+		throw new Error("Strict held-session pinning is not supported by this test storage");
 	}
 }
 

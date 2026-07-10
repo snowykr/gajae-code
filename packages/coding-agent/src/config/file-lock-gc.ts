@@ -34,9 +34,14 @@ interface WalkState {
 // user config root, the agent dir (honors GJC_CODING_AGENT_DIR), and the
 // configured receipt-spool dir — NOT the invocation cwd's project `.gjc`.
 function knownFileLockRoots(ctx: GcContext): string[] {
-	const roots = [getConfigRootDir(), getAgentDir()];
-	const spoolDir = resolveReceiptSpoolDir(ctx.env);
-	if (spoolDir) roots.push(spoolDir);
+	const roots =
+		ctx.fileLockRoots ??
+		(() => {
+			const defaults = [getConfigRootDir(), getAgentDir()];
+			const spoolDir = resolveReceiptSpoolDir(ctx.env);
+			if (spoolDir) defaults.push(spoolDir);
+			return defaults;
+		})();
 	return Array.from(new Set(roots.map(root => path.resolve(root))));
 }
 

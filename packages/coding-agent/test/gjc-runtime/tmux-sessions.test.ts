@@ -6,6 +6,9 @@ import {
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
+	buildGjcTmuxIdOptionTarget,
+	buildGjcTmuxIdSessionTarget,
+	parseTmuxSessionId,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
 	createGjcTmuxSession,
@@ -23,6 +26,12 @@ function spawnResult(exitCode: number, stdout: string, stderr = ""): SpawnSyncRe
 		stdout: Buffer.from(stdout),
 		stderr: Buffer.from(stderr),
 	} as SpawnSyncResult;
+}
+
+function tmuxId(value: string) {
+	const parsed = parseTmuxSessionId(value);
+	if (!parsed) throw new Error(`expected a valid tmux session ID: ${value}`);
+	return parsed;
 }
 
 describe("GJC tmux session management", () => {
@@ -58,7 +67,7 @@ describe("GJC tmux session management", () => {
 				"tmux-test",
 				"list-sessions",
 				"-F",
-				"#{session_name}	#{session_windows}	#{session_attached}	#{session_created}	#{@gjc-profile}	#{session_key_table}	#{session_panes}	#{pane_pid}	#{@gjc-branch}	#{@gjc-branch-slug}	#{@gjc-project}	#{@gjc-session-id}	#{@gjc-session-state-file}	#{@gjc-version}",
+				"#{session_name}	#{session_windows}	#{session_attached}	#{session_created}	#{@gjc-profile}	#{session_key_table}	#{session_panes}	#{pane_pid}	#{@gjc-branch}	#{@gjc-branch-slug}	#{@gjc-project}	#{@gjc-session-id}	#{@gjc-session-state-file}	#{@gjc-version}	#{session_id}",
 			],
 			expect.any(Object),
 		);
@@ -170,6 +179,55 @@ describe("GJC tmux session management", () => {
 		// target is window-qualified (`=NAME:`); a bare `=NAME` does not (#580).
 		expect(buildGjcTmuxExactOptionTarget("gajae_code_work")).toBe("=gajae_code_work:");
 	});
+	it("builds immutable native ID targets without changing legacy name targets", () => {
+		const id = tmuxId("$0");
+		expect(String(id)).toBe("$0");
+		expect(buildGjcTmuxIdOptionTarget(id)).toBe("$0:");
+		expect(buildGjcTmuxIdSessionTarget(id)).toBe("$0");
+		expect(buildGjcTmuxExactOptionTarget("work")).toBe("=work:");
+		expect(buildGjcTmuxExactSessionTarget("work")).toBe("=work");
+	});
+
+	it("accepts only strict native tmux session IDs", () => {
+		for (const value of ["$1", "$19", "$1234567890123456789"]) {
+			expect(String(tmuxId(value))).toBe(value);
+		}
+		for (const value of ["", "$", "$00", "$01", "$12345678901234567890", "$-1", "1", "$1x"]) {
+			expect(parseTmuxSessionId(value)).toBeUndefined();
+		}
+	});
+
+	it("captures the native session ID while listing managed sessions", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				`${["named", "1", "0", "1770000000", "1", "root", "1", "", "", "", "", "", "", "", "$123"].join("\t")}\n`,
+			),
+		);
+		const session = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux" })[0];
+		expect(session?.nativeSessionId).toBe(tmuxId("$123"));
+	});
+	it("rejects malformed native IDs and leaves legacy rows without an ID", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				`${[
+					["malformed-dollar", "1", "0", "1770000000", "1", "root", "1", "", "", "", "", "", "", "", "$abc"].join(
+						"\t",
+					),
+					["name-like", "1", "0", "1770000000", "1", "root", "1", "", "", "", "", "", "", "", "feature/demo"].join(
+						"\t",
+					),
+					["legacy", "1", "0", "1770000000", "1", "root", "1", "", "", "", "", "", "", ""].join("\t"),
+				].join("\n")}\n`,
+			),
+		);
+
+		const sessions = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux" });
+
+		expect(sessions.map(session => session.name)).toEqual(["legacy", "malformed-dollar", "name-like"]);
+		expect(sessions.every(session => session.nativeSessionId === undefined)).toBe(true);
+	});
 
 	it("queries the profile option with a window-qualified exact target", () => {
 		// Pin the resolved command to tmux so this test is platform-agnostic.
@@ -270,6 +328,7 @@ describe("GJC tmux session management", () => {
 			expect(sessions[0].name).toBe("psmux_session");
 			expect(sessions[0].profile).toBe("1");
 			expect(sessions[0].windows).toBe(1);
+			expect(sessions[0].nativeSessionId).toBeUndefined();
 			// follow-up show-options hit the bare `NAME` target (no `=` prefix).
 			expect(calls).toContainEqual(["psmux", "show-options", "-qv", "-t", "psmux_session", "@gjc-profile"]);
 		} finally {

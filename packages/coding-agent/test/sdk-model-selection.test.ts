@@ -68,6 +68,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 	function buildSessionOptions(modelPattern: string) {
 		return {
+			settings: Settings.isolated(),
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),

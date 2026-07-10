@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 
+const worktreeRoot = path.resolve(import.meta.dir, "../../..");
 function runBunEval(script: string) {
 	const result = Bun.spawnSync({
 		cmd: [process.execPath, "-e", script],
-		cwd: process.cwd(),
+		cwd: worktreeRoot,
 		stdout: "pipe",
 		stderr: "pipe",
 	});

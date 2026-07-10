@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ResolvedTmuxBinary } from "./psmux-detect";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 
@@ -16,6 +18,264 @@ export const GJC_TMUX_SESSION_ID_OPTION = "@gjc-session-id";
 export const GJC_TMUX_SESSION_STATE_FILE_OPTION = "@gjc-session-state-file";
 export const GJC_TMUX_VERSION_OPTION = "@gjc-version";
 export const GJC_PSMUX_PROFILE_FORCE_ENV = "GJC_PSMUX_PROFILE_FORCE";
+export const GJC_TMUX_RESTART_HELD_ENV = "GJC_TMUX_RESTART_HELD";
+export const GJC_TMUX_RESTART_MANIFEST_ENV = "GJC_TMUX_RESTART_MANIFEST";
+export const GJC_TMUX_RESTART_NONCE_ENV = "GJC_TMUX_RESTART_NONCE";
+
+export interface StrictNativeTmuxRuntime {
+	command: string;
+	version: string;
+	restartBinding?: {
+		sessionPath: string;
+		manifestPath: string;
+	};
+}
+
+export type StrictNativeTmuxAdmission =
+	| { state: "available"; runtime: StrictNativeTmuxRuntime }
+	| { state: "unavailable"; reason: string };
+
+export interface StrictNativeTmuxOptions {
+	env?: NodeJS.ProcessEnv;
+	platform?: NodeJS.Platform;
+	resolveBinary?: (candidate: string) => string | null;
+	run?: (command: string, args: string[]) => TmuxCommandResult;
+	isExecutable?: (command: string) => boolean;
+	handshake?: (command: string) => boolean;
+	wslProbe?: () => boolean;
+	sessionPath?: string;
+	manifestPath?: string;
+	classifyFilesystem?: (location: string) => unknown;
+}
+
+const STRICT_TMUX_VERSION = /^tmux\s+(\d+)\.(\d+)(?:\.(\d+))?(?:-[0-9A-Za-z.-]+)?$/;
+
+function strictTmuxVersion(output: string): string | undefined {
+	const match = STRICT_TMUX_VERSION.exec(output.trim());
+	if (!match) return undefined;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	if (major < 3 || (major === 3 && minor < 4)) return undefined;
+	return match[0].slice("tmux ".length);
+}
+
+function defaultStrictBinaryResolver(candidate: string): string | null {
+	const resolved = Bun.which(candidate);
+	return resolved && path.isAbsolute(resolved) ? resolved : null;
+}
+
+function defaultStrictExecutable(command: string): boolean {
+	try {
+		if (!fs.statSync(command).isFile()) return false;
+		fs.accessSync(command, fs.constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function defaultStrictRunner(command: string, args: string[]): TmuxCommandResult {
+	try {
+		const result = Bun.spawnSync({ cmd: [command, ...args], stdout: "pipe", stderr: "pipe", env: process.env });
+		return {
+			exitCode: result.exitCode,
+			stdout: result.stdout.toString(),
+			stderr: result.stderr.toString(),
+		};
+	} catch {
+		return { exitCode: -1 };
+	}
+}
+function defaultWslProbe(platform: NodeJS.Platform): boolean {
+	if (platform !== "linux") return false;
+	try {
+		const release = fs.readFileSync("/proc/sys/kernel/osrelease", "utf8").trim().toLowerCase();
+		const version = fs.readFileSync("/proc/version", "utf8").trim().toLowerCase();
+		if (!release || !version) throw new Error("missing kernel evidence");
+		return (
+			release.includes("microsoft") ||
+			release.includes("wsl") ||
+			version.includes("microsoft") ||
+			version.includes("wsl")
+		);
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Admit only a real, executable native tmux provider for restart operations.
+ * This deliberately does not discover sessions or honor the legacy command
+ * overrides; callers can therefore fail closed before any lifecycle work.
+ */
+export function resolveStrictNativeTmuxRuntime(options: StrictNativeTmuxOptions = {}): StrictNativeTmuxAdmission {
+	const env = options.env ?? process.env;
+	const platform = options.platform ?? process.platform;
+	const wslProbe = options.wslProbe ?? (() => defaultWslProbe(platform));
+	try {
+		if (wslProbe()) return { state: "unavailable", reason: "unsupported-wsl" };
+	} catch {
+		return { state: "unavailable", reason: "wsl-probe-failed" };
+	}
+	if (platform !== "linux" && platform !== "darwin") return { state: "unavailable", reason: "unsupported-platform" };
+	if (env.GJC_TMUX_COMMAND?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim())
+		return { state: "unavailable", reason: "command-override" };
+
+	let command: string | null;
+	try {
+		command = (options.resolveBinary ?? defaultStrictBinaryResolver)("tmux");
+	} catch {
+		return { state: "unavailable", reason: "unresolved-command" };
+	}
+	if (!command || !path.isAbsolute(command)) return { state: "unavailable", reason: "unresolved-command" };
+	const basename = path
+		.basename(command)
+		.toLowerCase()
+		.replace(/\.exe$/, "");
+	if (basename !== "tmux") return { state: "unavailable", reason: "unsupported-provider" };
+	try {
+		if (!(options.isExecutable ?? defaultStrictExecutable)(command))
+			return { state: "unavailable", reason: "non-executable-command" };
+	} catch {
+		return { state: "unavailable", reason: "non-executable-command" };
+	}
+
+	let result: TmuxCommandResult;
+	try {
+		result = (options.run ?? defaultStrictRunner)(command, ["-V"]);
+	} catch {
+		return { state: "unavailable", reason: "version-probe-failed" };
+	}
+	if (result.exitCode !== 0) return { state: "unavailable", reason: "version-probe-failed" };
+	const version = strictTmuxVersion(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+	if (!version) return { state: "unavailable", reason: "unsupported-version" };
+
+	const handshake =
+		options.handshake ??
+		((candidate: string) => {
+			const serverName = `gjc-probe-${randomTmuxSessionSuffix()}`;
+			const run = options.run ?? defaultStrictRunner;
+			let probeId: TmuxSessionId | undefined;
+			let sentinelId: TmuxSessionId | undefined;
+			let probeKilled = false;
+			const createSession = (sessionName: string): TmuxSessionId | undefined => {
+				const create = run(candidate, [
+					"-L",
+					serverName,
+					"new-session",
+					"-d",
+					"-P",
+					"-F",
+					"#{session_id}",
+					"-s",
+					sessionName,
+				]);
+				return create.exitCode === 0 ? parseTmuxSessionId((create.stdout ?? "").trim()) : undefined;
+			};
+			const listIds = (): TmuxSessionId[] | undefined => {
+				const listed = run(candidate, ["-L", serverName, "list-sessions", "-F", "#{session_id}"]);
+				if (listed.exitCode !== 0) return undefined;
+				const ids = (listed.stdout ?? "")
+					.split(/\r?\n/)
+					.map(line => parseTmuxSessionId(line.trim()))
+					.filter((id): id is TmuxSessionId => id !== undefined);
+				return ids.length === (listed.stdout ?? "").split(/\r?\n/).filter(line => line.trim()).length
+					? ids
+					: undefined;
+			};
+			const killSession = (id: TmuxSessionId): boolean =>
+				run(candidate, ["-L", serverName, "kill-session", "-t", buildGjcTmuxIdSessionTarget(id)]).exitCode === 0;
+			try {
+				probeId = createSession(`gjc-probe-${randomTmuxSessionSuffix()}`);
+				sentinelId = createSession(`gjc-sentinel-${randomTmuxSessionSuffix()}`);
+				if (!probeId || !sentinelId || probeId === sentinelId) return false;
+				const created = listIds();
+				if (created?.length !== 2 || !created.includes(probeId) || !created.includes(sentinelId)) return false;
+				if (!killSession(probeId)) return false;
+				probeKilled = true;
+				const remaining = listIds();
+				if (remaining?.length !== 1 || remaining[0] !== sentinelId) return false;
+				if (!killSession(sentinelId)) return false;
+				sentinelId = undefined;
+				return true;
+			} catch {
+				return false;
+			} finally {
+				if (probeId && !probeKilled) {
+					try {
+						killSession(probeId);
+					} catch {
+						// Best-effort cleanup; admission already fails.
+					}
+				}
+				if (sentinelId) {
+					try {
+						killSession(sentinelId);
+					} catch {
+						// Best-effort cleanup; admission already fails.
+					}
+				}
+			}
+		});
+	try {
+		if (!handshake(command)) return { state: "unavailable", reason: "handshake-failed" };
+	} catch {
+		return { state: "unavailable", reason: "handshake-failed" };
+	}
+	if (platform === "darwin") {
+		const sessionPath = options.sessionPath;
+		const restartPath = options.manifestPath;
+		if (!sessionPath || !restartPath) return { state: "unavailable", reason: "missing-restart-paths" };
+		const classify = options.classifyFilesystem;
+		if (!classify) return { state: "unavailable", reason: "filesystem-classification-failed" };
+		const locations = [sessionPath, restartPath];
+		for (const location of locations) {
+			let classification: unknown;
+			try {
+				classification = classify(location);
+			} catch {
+				return { state: "unavailable", reason: "filesystem-classification-failed" };
+			}
+			const filesystem =
+				typeof classification === "string"
+					? classification
+					: classification && typeof classification === "object"
+						? (classification as { filesystem?: unknown }).filesystem
+						: undefined;
+			const exists =
+				typeof classification === "object" &&
+				classification !== null &&
+				"exists" in classification &&
+				(classification as { exists?: unknown }).exists === true;
+			if (!exists || filesystem !== "apfs") return { state: "unavailable", reason: "filesystem-admission-failed" };
+		}
+	}
+	return {
+		state: "available",
+		runtime: {
+			command,
+			version,
+			...(platform === "darwin"
+				? { restartBinding: { sessionPath: options.sessionPath!, manifestPath: options.manifestPath! } }
+				: {}),
+		},
+	};
+}
+/**
+ * Native tmux session IDs are immutable server-assigned identifiers. Keep the
+ * grammar deliberately narrow so a malformed value can never become a target.
+ */
+export type TmuxSessionId = string & { readonly __tmuxSessionId: unique symbol };
+
+const TMUX_SESSION_ID_PATTERN = /^\$(?:0|[1-9]\d{0,18})$/;
+
+export function isTmuxSessionId(value: string): value is TmuxSessionId {
+	return TMUX_SESSION_ID_PATTERN.test(value);
+}
+
+export function parseTmuxSessionId(value: string): TmuxSessionId | undefined {
+	return isTmuxSessionId(value) ? value : undefined;
+}
 
 export interface GjcTmuxProfileCommand {
 	description: string;
@@ -101,6 +361,25 @@ export function buildGjcTmuxExactSessionTarget(
 	const binary = opts.binary ?? resolveGjcTmuxBinary({ env: opts.env, platform: opts.platform });
 	if (binary.isPsmux) return sessionName;
 	return `=${sessionName}`;
+}
+/**
+ * Build a native tmux session-ID target for restart-only option commands.
+ * Unlike name targets this is intentionally not psmux-compatible.
+ */
+export function buildGjcTmuxIdOptionTarget(sessionId: string): string {
+	const parsed = parseTmuxSessionId(sessionId);
+	if (!parsed) throw new Error("invalid tmux session ID");
+	return `${parsed}:`;
+}
+
+/**
+ * Build a native tmux session-ID target for restart-only session commands.
+ * Unlike name targets this is intentionally not psmux-compatible.
+ */
+export function buildGjcTmuxIdSessionTarget(sessionId: string): string {
+	const parsed = parseTmuxSessionId(sessionId);
+	if (!parsed) throw new Error("invalid tmux session ID");
+	return parsed;
 }
 
 export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";

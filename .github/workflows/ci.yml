@@ -175,6 +175,97 @@ jobs:
               variant: ${{ matrix.variant }}
               rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
               save_cache: ${{ github.event_name == 'push' && ((github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') || startsWith(github.ref, 'refs/tags/v')) }}
+   # PR1 proof jobs build and load the native addon on each shipped host. They
+   # install the same checksum-pinned tmux 3.4 source fixture on every host.
+   native_restart_linux:
+      name: native restart (Ubuntu)
+      timeout-minutes: 60
+      needs: [relevance]
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.relevance.result == 'success' &&
+         needs.relevance.outputs.relevant == 'true' &&
+         (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ hashFiles('crates/pi-natives/**', 'Cargo.toml', 'Cargo.lock') }}
+              platform: linux
+              arch: x64
+              variant: baseline
+         - name: Load native addon
+           run: bun packages/coding-agent/src/cli.ts --smoke-test
+         - name: Install fixed tmux 3.4
+           run: |
+              sudo apt-get update
+              sudo apt-get install -y build-essential bison libevent-dev libncurses-dev pkg-config
+              ./scripts/ci-install-tmux-3.4.sh
+         - name: Run strict tmux restart tests
+           env:
+              GJC_TMUX_NATIVE_ID_STRICT: "1"
+           run: bun test packages/coding-agent/test/gjc-runtime/tmux-restart-protocol.test.ts packages/coding-agent/test/gjc-runtime/tmux-update-restart.test.ts packages/coding-agent/test/gjc-runtime/tmux-native-restart.integration.test.ts
+
+   native_restart_macos_arm64:
+      name: native restart (macOS 14 arm64)
+      timeout-minutes: 60
+      needs: [relevance]
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.relevance.result == 'success' &&
+         needs.relevance.outputs.relevant == 'true' &&
+         (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      runs-on: macos-14
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ hashFiles('crates/pi-natives/**', 'Cargo.toml', 'Cargo.lock') }}
+              platform: darwin
+              arch: arm64
+         - name: Load native addon
+           run: bun packages/coding-agent/src/cli.ts --smoke-test
+         - name: Install fixed tmux 3.4
+           run: |
+              brew install autoconf automake bison libevent ncurses pkg-config
+              ./scripts/ci-install-tmux-3.4.sh
+         - name: Run strict tmux restart tests
+           env:
+              GJC_TMUX_NATIVE_ID_STRICT: "1"
+           run: bun test packages/coding-agent/test/gjc-runtime/tmux-restart-protocol.test.ts packages/coding-agent/test/gjc-runtime/tmux-update-restart.test.ts packages/coding-agent/test/gjc-runtime/tmux-native-restart.integration.test.ts
+
+   native_restart_macos_x64:
+      name: native restart (macOS 15 Intel/x64)
+      timeout-minutes: 60
+      needs: [relevance]
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.relevance.result == 'success' &&
+         needs.relevance.outputs.relevant == 'true' &&
+         (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      runs-on: macos-15-intel
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ hashFiles('crates/pi-natives/**', 'Cargo.toml', 'Cargo.lock') }}
+              platform: darwin
+              arch: x64
+              variant: baseline
+         - name: Load native addon
+           run: bun packages/coding-agent/src/cli.ts --smoke-test
+         - name: Install fixed tmux 3.4
+           run: |
+              brew install autoconf automake bison libevent ncurses pkg-config
+              ./scripts/ci-install-tmux-3.4.sh
+         - name: Run strict tmux restart tests
+           env:
+              GJC_TMUX_NATIVE_ID_STRICT: "1"
+           run: bun test packages/coding-agent/test/gjc-runtime/tmux-restart-protocol.test.ts packages/coding-agent/test/gjc-runtime/tmux-update-restart.test.ts packages/coding-agent/test/gjc-runtime/tmux-native-restart.integration.test.ts
 
    # Windows-latest smoke for the `bun install -g gajae-code` runtime path
    # (issue #525): build the win32-x64 native addon, then exercise the bun-run

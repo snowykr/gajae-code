@@ -13,8 +13,16 @@ import {
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
 	readTerminalRuntimeStateMarker,
+	resolveStrictTerminalRuntimeState,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
+
+const strictCandidate = (stateFile: string, sessionFile: string, cwd: string, sessionId = "session-a") => ({
+	stateFile,
+	sessionId,
+	sessionFile,
+	cwd,
+});
 
 const tempDirs: string[] = [];
 
@@ -714,6 +722,98 @@ describe("coordinator runtime state sidecar", () => {
 		await expect(
 			readTerminalRuntimeStateMarker({ stateFile, sessionId: "session-a", cwd: path.join(root, "other") }),
 		).resolves.toEqual({ terminal: false, reason: "cwd_mismatch" });
+	});
+	it("requires an exact terminal identity tuple for strict restart resolution", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		const sessionFile = path.join(root, "session.jsonl");
+		const candidate = strictCandidate(stateFile, sessionFile, root);
+
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "missing_state_file",
+		});
+
+		await Bun.write(stateFile, "{not-json");
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "invalid_json",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({ session_id: "other", cwd: root, session_file: sessionFile, state: "completed" }),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "session_id_mismatch",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				session_id: "session-a",
+				cwd: path.join(root, "other"),
+				session_file: sessionFile,
+				state: "completed",
+			}),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "cwd_mismatch",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				session_id: "session-a",
+				cwd: root,
+				session_file: path.join(root, "other.jsonl"),
+				state: "completed",
+			}),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "session_file_mismatch",
+		});
+		await Bun.write(
+			stateFile,
+			JSON.stringify({ session_id: "session-a", session_file: sessionFile, state: "completed" }),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "cwd_mismatch",
+		});
+
+		await Bun.write(stateFile, JSON.stringify({ session_id: "session-a", cwd: root, state: "completed" }));
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "session_file_mismatch",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({ session_id: "session-a", cwd: root, session_file: sessionFile, state: "running" }),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: false,
+			reason: "non_terminal_state",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({ session_id: "session-a", cwd: root, session_file: sessionFile, state: "completed" }),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({
+			terminal: true,
+			state: "completed",
+		});
+
+		await Bun.write(
+			stateFile,
+			JSON.stringify({ session_id: "session-a", cwd: root, session_file: sessionFile, state: "errored" }),
+		);
+		await expect(resolveStrictTerminalRuntimeState(candidate)).resolves.toEqual({ terminal: true, state: "errored" });
 	});
 
 	it("writes public-safe postmortem exit evidence without transcript payloads", async () => {

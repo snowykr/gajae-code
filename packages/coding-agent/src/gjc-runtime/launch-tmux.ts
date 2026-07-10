@@ -17,13 +17,18 @@ import {
 	GJC_TMUX_COMMAND_ENV,
 	GJC_TMUX_MOUSE_ENV,
 	GJC_TMUX_PROFILE_ENV,
+	GJC_TMUX_RESTART_HELD_ENV,
+	GJC_TMUX_RESTART_MANIFEST_ENV,
+	GJC_TMUX_RESTART_NONCE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	type GjcTmuxProfileCommand,
 	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
+	type StrictNativeTmuxRuntime,
 } from "./tmux-common";
 import { findGjcTmuxSessionByName, findGjcTmuxSessionByScope, type GjcTmuxSessionStatus } from "./tmux-sessions";
 
+export type { StrictNativeTmuxRuntime } from "./tmux-common";
 export {
 	buildGjcTmuxExactSessionTarget,
 	buildGjcTmuxProfileCommands,
@@ -33,6 +38,53 @@ export {
 	GJC_TMUX_PROFILE_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 };
+
+export interface StrictTmuxHeldChildInput {
+	runtime: StrictNativeTmuxRuntime;
+	sessionName: string;
+	cwd: string;
+	manifestPath: string;
+	nonce: string;
+	gjcExecutable: string;
+	sessionPath: string;
+}
+
+/**
+ * Build the argv for a detached native tmux child. Values stay distinct
+ * argv elements, so spaces, quotes, Unicode, and leading dashes are inert.
+ */
+export function buildStrictTmuxHeldChildArgs(input: StrictTmuxHeldChildInput): string[] {
+	const absoluteNormalized = (value: string): boolean => path.isAbsolute(value) && path.normalize(value) === value;
+	if (!input.sessionName.trim()) throw new Error("missing session name");
+	if (!absoluteNormalized(input.cwd)) throw new Error("cwd must be absolute and normalized");
+	if (!absoluteNormalized(input.manifestPath)) throw new Error("manifest path must be absolute and normalized");
+	if (!absoluteNormalized(input.sessionPath)) throw new Error("session path must be absolute and normalized");
+	if (!absoluteNormalized(input.gjcExecutable)) throw new Error("GJC executable must be absolute and normalized");
+	if (!input.runtime || !absoluteNormalized(input.runtime.command))
+		throw new Error("runtime must be an admitted absolute command");
+	if (
+		input.runtime.restartBinding &&
+		(input.runtime.restartBinding.sessionPath !== input.sessionPath ||
+			input.runtime.restartBinding.manifestPath !== input.manifestPath)
+	)
+		throw new Error("restart paths do not match admitted runtime binding");
+	if (!/^[0-9a-f]{64}$/.test(input.nonce)) throw new Error("invalid restart nonce");
+	return [
+		"new-session",
+		"-d",
+		"-s",
+		input.sessionName,
+		"-c",
+		input.cwd,
+		"/usr/bin/env",
+		`${GJC_TMUX_RESTART_HELD_ENV}=1`,
+		`${GJC_TMUX_RESTART_MANIFEST_ENV}=${input.manifestPath}`,
+		`${GJC_TMUX_RESTART_NONCE_ENV}=${input.nonce}`,
+		input.gjcExecutable,
+		"--resume-existing",
+		input.sessionPath,
+	];
+}
 
 export const GJC_TMUX_LAUNCHED_ENV = "GJC_TMUX_LAUNCHED";
 export const GJC_LAUNCH_POLICY_ENV = "GJC_LAUNCH_POLICY";

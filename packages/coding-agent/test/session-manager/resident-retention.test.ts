@@ -132,6 +132,30 @@ class ThrowingWriterStorage extends MemorySessionStorage {
 		};
 	}
 }
+class TrackingWriterStorage extends MemorySessionStorage {
+	writerOpenCount = 0;
+	activeWriterPaths = new Set<string>();
+
+	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
+		this.writerOpenCount++;
+		this.activeWriterPaths.add(path);
+		const writer = super.openWriter(path, options);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			close: async () => {
+				try {
+					await writer.close();
+				} finally {
+					this.activeWriterPaths.delete(path);
+				}
+			},
+			getError: () => writer.getError(),
+		};
+	}
+}
 
 class ThrowingRewriteStorage extends MemorySessionStorage {
 	shouldThrowSyncWrite = false;
@@ -346,7 +370,171 @@ describe("SessionManager resident retention boundaries", () => {
 		session.appendMessage({ role: "user", content: "first", timestamp: 1 });
 		expect(() => session.appendMessage(assistantMessage())).toThrow("sync persist failed");
 	});
+	it("rejects metadata-less shallow restores across session identities without rebinding the existing writer", async () => {
+		const storage = new MemorySessionStorage();
+		const source = SessionManager.create("/cwd", "/sessions", storage);
+		source.appendMessage(assistantMessage([{ type: "text", text: "source-before" }]));
+		await source.flush();
+		const sourceSnapshot = { ...source.captureState(), flushed: false };
+		const target = SessionManager.create("/cwd", "/sessions", storage);
+		const sourceFile = source.getSessionFile()!;
+		const targetFile = target.getSessionFile()!;
 
+		try {
+			expect(source.getSessionId()).not.toBe(target.getSessionId());
+			target.appendMessage(assistantMessage([{ type: "text", text: "target-before" }]));
+			await target.flush();
+
+			expect(() => target.restoreState(sourceSnapshot)).toThrow(
+				"Cannot restore a snapshot from a different session",
+			);
+			expect(target.getSessionId()).not.toBe(source.getSessionId());
+			expect(target.getSessionFile()).toBe(targetFile);
+
+			target.appendMessage(assistantMessage([{ type: "text", text: "target-after" }]));
+			await target.flush();
+			expect(storage.readTextSync(targetFile)).toContain("target-after");
+			expect(storage.readTextSync(sourceFile)).not.toContain("target-after");
+		} finally {
+			await source.close();
+			await target.close();
+		}
+	});
+	it("rejects captured restores whose exposed identity changes without rebinding the retained writer", async () => {
+		const storage = new MemorySessionStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		session.appendMessage(assistantMessage([{ type: "text", text: "before" }]));
+		await session.flush();
+		const sessionId = session.getSessionId();
+		const sessionFile = session.getSessionFile()!;
+		const snapshot = session.captureState();
+		snapshot.sessionId = `${sessionId}-mutated`;
+		snapshot.sessionFile = `${sessionFile}.mutated`;
+		expect(() => session.restoreState(snapshot)).toThrow("Cannot restore a snapshot from a different session");
+		expect(session.getSessionId()).toBe(sessionId);
+		expect(session.getSessionFile()).toBe(sessionFile);
+		session.appendMessage(assistantMessage([{ type: "text", text: "after" }]));
+		await session.flush();
+		expect(storage.readTextSync(sessionFile)).toContain("after");
+		expect(storage.existsSync(`${sessionFile}.mutated`)).toBe(false);
+		await session.close();
+	});
+	it("restores metadata-less accessor-backed shallow snapshots using one authoritative identity read", async () => {
+		const storage = new MemorySessionStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		session.appendMessage(assistantMessage([{ type: "text", text: "before" }]));
+		await session.flush();
+		const sessionId = session.getSessionId();
+		const sessionFile = session.getSessionFile()!;
+		const captured = session.captureState();
+		const snapshot = { ...captured, flushed: false };
+		let sessionIdReads = 0;
+		let sessionFileReads = 0;
+		Object.defineProperty(snapshot, "sessionId", {
+			configurable: true,
+			get: () => (++sessionIdReads === 1 ? sessionId : `${sessionId}-mutated`),
+		});
+		Object.defineProperty(snapshot, "sessionFile", {
+			configurable: true,
+			get: () => (++sessionFileReads === 1 ? sessionFile : `${sessionFile}.mutated`),
+		});
+
+		session.restoreState(snapshot);
+		expect(sessionIdReads).toBe(1);
+		expect(sessionFileReads).toBe(1);
+		expect(session.getSessionId()).toBe(sessionId);
+		expect(session.getSessionFile()).toBe(sessionFile);
+
+		session.appendMessage(assistantMessage([{ type: "text", text: "after" }]));
+		await session.flush();
+		expect(storage.readTextSync(sessionFile)).toContain("after");
+		expect(storage.existsSync(`${sessionFile}.mutated`)).toBe(false);
+		await session.close();
+	});
+	it("rejects an accessor reentrant restore without rebinding the retained writer", async () => {
+		const storage = new TrackingWriterStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		const leafId = session.appendMessage(assistantMessage([{ type: "text", text: "before" }]));
+		await session.flush();
+		session.appendMessage(assistantMessage([{ type: "text", text: "retained" }]));
+		await session.flush();
+		expect(storage.writerOpenCount).toBeGreaterThan(0);
+		const sessionId = session.getSessionId();
+		const sessionFile = session.getSessionFile()!;
+		expect(storage.activeWriterPaths.has(sessionFile)).toBe(true);
+		const captured = session.captureState();
+		const snapshot = { ...captured, flushed: false };
+		let branchedFile: string | undefined;
+		Object.defineProperty(snapshot, "materializedFileEntries", {
+			configurable: true,
+			get: () => {
+				branchedFile = session.createBranchedSession(leafId);
+				return captured.materializedFileEntries;
+			},
+		});
+
+		expect(() => session.restoreState(snapshot)).toThrow("Cannot restore a snapshot from a different session");
+		expect(branchedFile).toBeString();
+		expect(session.getSessionId()).not.toBe(sessionId);
+		expect(session.getSessionFile()).toBe(branchedFile);
+		expect(storage.readTextSync(sessionFile)).not.toContain("after");
+
+		session.appendMessage(assistantMessage([{ type: "text", text: "after" }]));
+		await session.flush();
+		expect(storage.readTextSync(sessionFile)).not.toContain("after");
+		expect(storage.readTextSync(branchedFile!)).toContain("after");
+		await session.close();
+		expect(storage.activeWriterPaths.has(sessionFile)).toBe(false);
+		expect(storage.activeWriterPaths.has(branchedFile!)).toBe(false);
+	});
+	it("rejects a nested materialized-entry accessor reentrant restore before commit", async () => {
+		const storage = new TrackingWriterStorage();
+		const session = SessionManager.create("/cwd", "/sessions", storage);
+		session.appendMessage(assistantMessage([{ type: "text", text: "before" }]));
+		await session.flush();
+		const leafId = session.appendMessage(assistantMessage([{ type: "text", text: "retained" }]));
+		await session.flush();
+		const sessionId = session.getSessionId();
+		const sessionFile = session.getSessionFile()!;
+		const captured = session.captureState();
+		const snapshot = { ...captured, flushed: false };
+		let branchedFile: string | undefined;
+		const nestedEntry = { ...snapshot.materializedFileEntries[1] };
+		const nestedPayload: Record<string, unknown> = {};
+		Object.defineProperty(nestedPayload, "reentrant", {
+			configurable: true,
+			enumerable: true,
+			get: () => {
+				branchedFile = session.createBranchedSession(leafId);
+				return "detached";
+			},
+		});
+		Object.defineProperty(nestedEntry, "nestedPayload", {
+			configurable: true,
+			enumerable: true,
+			value: nestedPayload,
+		});
+		snapshot.materializedFileEntries = [
+			snapshot.materializedFileEntries[0],
+			nestedEntry,
+			...snapshot.materializedFileEntries.slice(2),
+		];
+
+		expect(storage.activeWriterPaths.has(sessionFile)).toBe(true);
+		expect(() => session.restoreState(snapshot)).toThrow("Cannot restore a snapshot from a different session");
+		expect(branchedFile).toBeString();
+		expect(session.getSessionId()).not.toBe(sessionId);
+		expect(session.getSessionFile()).toBe(branchedFile);
+		expect(storage.readTextSync(sessionFile)).not.toContain("detached");
+
+		session.appendMessage(assistantMessage([{ type: "text", text: "after" }]));
+		await session.flush();
+		expect(storage.readTextSync(sessionFile)).not.toContain("after");
+		expect(storage.readTextSync(branchedFile!)).toContain("after");
+		await session.close();
+		expect(storage.activeWriterPaths.has(sessionFile)).toBe(false);
+		expect(storage.activeWriterPaths.has(branchedFile!)).toBe(false);
+	});
 	it("does not clobber the previous JSONL when sync temp rename fails", () => {
 		const storage = new RenameFailRewriteStorage();
 		const session = SessionManager.create("/cwd", "/sessions", storage);

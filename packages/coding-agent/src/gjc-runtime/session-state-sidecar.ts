@@ -65,6 +65,48 @@ export type TerminalRuntimeStateStatus =
 				| "session_file_mismatch"
 				| "non_terminal_state";
 	  };
+export type StrictTerminalRuntimeStateResult = TerminalRuntimeStateStatus;
+export type StrictTerminalRuntimeStateStatus = StrictTerminalRuntimeStateResult;
+
+export interface StrictTerminalRuntimeStateCandidate {
+	stateFile: string;
+	sessionId: string;
+	sessionFile: string;
+	cwd: string;
+}
+
+export async function resolveStrictTerminalRuntimeState(
+	candidate: StrictTerminalRuntimeStateCandidate,
+): Promise<StrictTerminalRuntimeStateStatus> {
+	if (!candidate.stateFile || !candidate.sessionId || !candidate.sessionFile || !candidate.cwd) {
+		return { terminal: false, reason: "missing_state_file" };
+	}
+
+	let payload: RuntimeStateSidecarPayload;
+	try {
+		const parsed: unknown = JSON.parse(await Bun.file(candidate.stateFile).text());
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return { terminal: false, reason: "invalid_json" };
+		}
+		payload = parsed as RuntimeStateSidecarPayload;
+	} catch (error) {
+		const code = (error as { code?: unknown }).code;
+		return {
+			terminal: false,
+			reason: code === "ENOENT" || code === "ENOTDIR" ? "missing_state_file" : "invalid_json",
+		};
+	}
+
+	if (payload.session_id !== candidate.sessionId) return { terminal: false, reason: "session_id_mismatch" };
+	if (typeof payload.cwd !== "string" || !sameResolvedPath(payload.cwd, candidate.cwd)) {
+		return { terminal: false, reason: "cwd_mismatch" };
+	}
+	if (typeof payload.session_file !== "string" || !sameResolvedPath(payload.session_file, candidate.sessionFile)) {
+		return { terminal: false, reason: "session_file_mismatch" };
+	}
+	if (payload.state === "completed" || payload.state === "errored") return { terminal: true, state: payload.state };
+	return { terminal: false, reason: "non_terminal_state" };
+}
 
 function sameResolvedPath(left: string, right: string): boolean {
 	return path.resolve(left) === path.resolve(right);

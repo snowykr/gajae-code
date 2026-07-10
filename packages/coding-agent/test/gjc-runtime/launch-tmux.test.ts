@@ -9,6 +9,7 @@ import {
 	buildDefaultTmuxLaunchPlan,
 	buildGjcTmuxProfileCommands,
 	buildGjcTmuxWindowTitle,
+	buildStrictTmuxHeldChildArgs,
 	GJC_TMUX_LAUNCHED_ENV,
 	GJC_TMUX_SESSION_PREFIX,
 	launchDefaultTmuxIfNeeded,
@@ -16,6 +17,11 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import { __setBinaryResolverForTests } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	buildGjcTmuxIdOptionTarget,
+	buildGjcTmuxIdSessionTarget,
+	resolveStrictNativeTmuxRuntime,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -2114,4 +2120,239 @@ it("does not retry Windows psmux attach failures without os error 10061", () => 
 	expect(calls.filter(call => call.command === "attach-session")).toHaveLength(1);
 	expect(calls.some(call => call.command === "kill-session")).toBe(true);
 	expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach failed.");
+});
+describe("strict native tmux restart substrate", () => {
+	const binary = "/usr/bin/tmux";
+	const options = {
+		platform: "linux" as NodeJS.Platform,
+		resolveBinary: () => binary,
+		isExecutable: () => true,
+		run: (_command: string, args: string[]) =>
+			args.includes("list-sessions") ? { exitCode: 0, stdout: "$7\n" } : { exitCode: 0, stdout: "tmux 3.4\n" },
+	};
+
+	it("rejects unsupported platforms and command overrides before probing", () => {
+		expect(resolveStrictNativeTmuxRuntime({ ...options, platform: "win32" })).toEqual({
+			state: "unavailable",
+			reason: "unsupported-platform",
+		});
+		expect(resolveStrictNativeTmuxRuntime({ ...options, env: { GJC_TMUX_COMMAND: "tmux" } })).toEqual({
+			state: "unavailable",
+			reason: "command-override",
+		});
+	});
+	it("rejects WSL before platform/provider probing", () => {
+		let probed = false;
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				env: {},
+				wslProbe: () => true,
+				resolveBinary: () => {
+					probed = true;
+					return binary;
+				},
+			}),
+		).toEqual({ state: "unavailable", reason: "unsupported-wsl" });
+		expect(probed).toBe(false);
+	});
+
+	it("admits exact native tmux version output only", () => {
+		expect(resolveStrictNativeTmuxRuntime({ ...options, handshake: () => true })).toEqual({
+			state: "available",
+			runtime: { command: binary, version: "3.4" },
+		});
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				handshake: () => true,
+				run: () => ({ exitCode: 0, stdout: "tmux shim 3.4" }),
+			}),
+		).toEqual({
+			state: "unavailable",
+			reason: "unsupported-version",
+		});
+	});
+	it("rejects unknown named binaries and requires the default handshake", () => {
+		expect(resolveStrictNativeTmuxRuntime({ ...options, resolveBinary: () => "/usr/bin/tmux-shim" })).toEqual({
+			state: "unavailable",
+			reason: "unsupported-provider",
+		});
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				run: () => ({ exitCode: 1, stdout: "" }),
+			}),
+		).toEqual({ state: "unavailable", reason: "version-probe-failed" });
+	});
+	it("rejects false and throwing injected handshakes", () => {
+		expect(resolveStrictNativeTmuxRuntime({ ...options, handshake: () => false })).toEqual({
+			state: "unavailable",
+			reason: "handshake-failed",
+		});
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				handshake: () => {
+					throw new Error("probe");
+				},
+			}),
+		).toEqual({
+			state: "unavailable",
+			reason: "handshake-failed",
+		});
+	});
+	it("uses an isolated functional handshake, cleans up only the created IDs, and verifies the sentinel remains", () => {
+		const calls: string[][] = [];
+		let probeKilled = false;
+		let createdSessions = 0;
+		let sentinelKilled = false;
+		const result = resolveStrictNativeTmuxRuntime({
+			...options,
+			run: (_command, args) => {
+				calls.push(args);
+				if (args.includes("new-session")) {
+					createdSessions += 1;
+					return { exitCode: 0, stdout: createdSessions === 1 ? "$12\n" : "$13\n" };
+				}
+				if (args.includes("kill-session")) {
+					if (args.includes("$12")) probeKilled = true;
+					if (args.includes("$13")) sentinelKilled = true;
+					return { exitCode: 0 };
+				}
+				if (args.includes("list-sessions")) {
+					return { exitCode: 0, stdout: probeKilled ? "$13\n" : "$12\n$13\n" };
+				}
+				return args.includes("-V") ? { exitCode: 0, stdout: "tmux 3.4\n" } : { exitCode: 1 };
+			},
+		});
+		expect(result.state).toBe("available");
+		expect(calls.filter(call => call.includes("new-session"))).toHaveLength(2);
+		expect(new Set(calls.filter(call => call.includes("-L")).map(call => call[1]))).toHaveLength(1);
+		expect(calls.some(call => call.includes("new-session") && call.includes("#{session_id}"))).toBe(true);
+		expect(calls.some(call => call.includes("kill-session") && call.includes("$12"))).toBe(true);
+		expect(calls.some(call => call.includes("kill-session") && call.includes("$13"))).toBe(true);
+		expect(sentinelKilled).toBe(true);
+		expect(calls.some(call => call.includes("kill-server"))).toBe(false);
+	});
+	it("rejects invalid runtime ID targets", () => {
+		expect(() => buildGjcTmuxIdOptionTarget("$bad")).toThrow();
+		expect(() => buildGjcTmuxIdSessionTarget("session-name")).toThrow();
+	});
+	it("requires APFS proofs for both Darwin restart locations", () => {
+		const classifyFilesystem = (location: string) => ({
+			exists: location === "/sessions",
+			filesystem: "apfs",
+		});
+		const darwin = {
+			...options,
+			platform: "darwin" as NodeJS.Platform,
+			handshake: () => true,
+			sessionPath: "/sessions",
+			manifestPath: "/records",
+			classifyFilesystem,
+		};
+		expect(resolveStrictNativeTmuxRuntime(darwin)).toEqual({
+			state: "unavailable",
+			reason: "filesystem-admission-failed",
+		});
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...darwin,
+				classifyFilesystem: () => ({ exists: true, filesystem: "hfs" }),
+			}),
+		).toEqual({ state: "unavailable", reason: "filesystem-admission-failed" });
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...darwin,
+				classifyFilesystem: () => {
+					throw new Error("unavailable");
+				},
+			}),
+		).toEqual({ state: "unavailable", reason: "filesystem-classification-failed" });
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				platform: "darwin" as NodeJS.Platform,
+				handshake: () => true,
+			}),
+		).toEqual({ state: "unavailable", reason: "missing-restart-paths" });
+	});
+	it("does not classify Linux restart locations", () => {
+		let classified = false;
+		expect(
+			resolveStrictNativeTmuxRuntime({
+				...options,
+				handshake: () => true,
+				sessionPath: "/sessions",
+				manifestPath: "/records",
+				classifyFilesystem: () => {
+					classified = true;
+					return { exists: true, filesystem: "hfs" };
+				},
+			}).state,
+		).toBe("available");
+		expect(classified).toBe(false);
+	});
+
+	it("builds held child argv without shell construction", () => {
+		const nonce = "a".repeat(64);
+		expect(
+			buildStrictTmuxHeldChildArgs({
+				runtime: { command: "/usr/bin/tmux", version: "3.4" },
+				sessionName: "-session 名",
+				cwd: "/tmp/space 'quoted'",
+				manifestPath: path.resolve("state/manifest file.json"),
+				nonce,
+				gjcExecutable: "/opt/GJC Bin/gjc",
+				sessionPath: "/tmp/session path",
+			}),
+		).toEqual([
+			"new-session",
+			"-d",
+			"-s",
+			"-session 名",
+			"-c",
+			"/tmp/space 'quoted'",
+			"/usr/bin/env",
+			"GJC_TMUX_RESTART_HELD=1",
+			`GJC_TMUX_RESTART_MANIFEST=${path.resolve("state/manifest file.json")}`,
+			`GJC_TMUX_RESTART_NONCE=${nonce}`,
+			"/opt/GJC Bin/gjc",
+			"--resume-existing",
+			"/tmp/session path",
+		]);
+	});
+	it("rejects relative and non-normalized held-child paths", () => {
+		const base = {
+			runtime: { command: binary, version: "3.4" },
+			sessionName: "session",
+			cwd: "/tmp",
+			manifestPath: "/tmp/manifest.json",
+			nonce: "a".repeat(64),
+			gjcExecutable: "/opt/gjc",
+			sessionPath: "/tmp/session",
+		};
+		expect(() => buildStrictTmuxHeldChildArgs({ ...base, manifestPath: "manifest.json" })).toThrow();
+		expect(() => buildStrictTmuxHeldChildArgs({ ...base, sessionPath: "/tmp/../tmp/session" })).toThrow();
+		expect(() => buildStrictTmuxHeldChildArgs({ ...base, sessionName: "" })).toThrow();
+	});
+	it("rejects launch paths that do not match Darwin admission binding", () => {
+		const nonce = "a".repeat(64);
+		expect(() =>
+			buildStrictTmuxHeldChildArgs({
+				runtime: {
+					command: binary,
+					version: "3.4",
+					restartBinding: { sessionPath: "/tmp/session", manifestPath: "/tmp/manifest.json" },
+				},
+				sessionName: "session",
+				cwd: "/tmp",
+				manifestPath: "/tmp/other.json",
+				nonce,
+				gjcExecutable: "/opt/gjc",
+				sessionPath: "/tmp/session",
+			}),
+		).toThrow();
+	});
 });

@@ -163,10 +163,16 @@ describe("python eval lifecycle red-team", () => {
 		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
 		const controller = new AbortController();
 		const listeners = countAbortListeners(controller.signal);
+		const executionStarted = Promise.withResolvers<void>();
 		let shutdown: (() => Promise<KernelShutdownResult>) | undefined;
 		try {
 			PythonKernel.start = async () => {
 				const kernel = await originalStart({ cwd: tempDir.path() });
+				const originalExecute = kernel.execute.bind(kernel);
+				kernel.execute = async (code, options) => {
+					executionStarted.resolve();
+					return await originalExecute(code, options);
+				};
 				shutdown = () => kernel.shutdown({ timeoutMs: 100 });
 				return kernel;
 			};
@@ -178,7 +184,7 @@ describe("python eval lifecycle red-team", () => {
 				signal: controller.signal,
 				timeoutMs: 60_000,
 			});
-			await Bun.sleep(250);
+			await executionStarted.promise;
 			expect(listeners.count()).toBe(1);
 			expect(shutdown).toBeDefined();
 

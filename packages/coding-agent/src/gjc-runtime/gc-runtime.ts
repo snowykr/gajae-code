@@ -84,6 +84,7 @@ export interface GcContext {
 	force: boolean;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
+	fileLockRoots?: readonly string[];
 }
 
 /**

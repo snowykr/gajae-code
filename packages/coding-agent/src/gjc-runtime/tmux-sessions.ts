@@ -1,4 +1,5 @@
 import { resolveGjcTmuxBinary } from "./psmux-detect";
+import type { TmuxSessionId } from "./tmux-common";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
@@ -14,6 +15,7 @@ import {
 	GJC_TMUX_SESSION_STATE_FILE_OPTION,
 	GJC_TMUX_VERSION_OPTION,
 	normalizeTmuxCreatedAt,
+	parseTmuxSessionId,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
 
@@ -28,6 +30,7 @@ export interface GjcTmuxSessionStatus {
 	branchSlug?: string;
 	project?: string;
 	sessionId?: string;
+	nativeSessionId?: TmuxSessionId;
 	sessionStateFile?: string;
 	version?: string;
 	panePids: number[];
@@ -92,6 +95,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		sessionId = "",
 		sessionStateFile = "",
 		version = "",
+		nativeSessionId = "",
 	] = line.split("\t");
 	if (!name) return null;
 	return {
@@ -112,6 +116,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		sessionId: sessionId || undefined,
 		sessionStateFile: sessionStateFile || undefined,
 		version: version || undefined,
+		nativeSessionId: parseTmuxSessionId(nativeSessionId),
 	};
 }
 
@@ -148,7 +153,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 				if (!match) return line;
 				const [, name, windows, created] = match;
 				const createdEpoch = String(Math.floor(new Date(`${created} UTC`).getTime() / 1000) || 0);
-				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", ""].join("\t");
+				return [name, windows, "0", createdEpoch, "", "", "0", "", "", "", "", "", "", "", ""].join("\t");
 			});
 		}
 	}
@@ -157,7 +162,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 
 function listSessionLines(env: NodeJS.ProcessEnv = process.env): string[] {
 	return runListSessions(
-		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}`,
+		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{session_id}`,
 		env,
 	);
 }

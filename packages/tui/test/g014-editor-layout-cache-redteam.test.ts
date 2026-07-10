@@ -21,8 +21,11 @@ type CaseResult = {
 const WIDTH = 72;
 const reportPath = "artifacts/g014-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
+const editors = new Set<Editor>();
 
 afterEach(() => {
+	for (const editor of editors) editor.dispose();
+	editors.clear();
 	setDefaultTabWidth(originalTabWidth);
 });
 
@@ -33,6 +36,7 @@ function plain(lines: string[]): string {
 function makeEditor(): Editor {
 	const editor = new Editor(defaultEditorTheme);
 	editor.focused = true;
+	editors.add(editor);
 	return editor;
 }
 
@@ -413,6 +417,7 @@ describe("G014 editor layout cache red-team", () => {
 		};
 		mkdirSync("artifacts", { recursive: true });
 		writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+		expect(blockers).toHaveLength(0);
 		expect(results.map(result => result.id)).toEqual([
 			"CURSOR-PARITY-FUZZ",
 			"WRAPPED-CURSOR",

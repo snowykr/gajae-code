@@ -7,6 +7,44 @@ import { VirtualTerminal } from "./virtual-terminal";
 
 const REPORT_PATH = "artifacts/g015-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
+const originalPiDebugRedraw = Bun.env.PI_DEBUG_REDRAW;
+const originalVirtualViewport = Bun.env.PI_TUI_VIRTUAL_VIEWPORT;
+const hostEnvironmentNames = [
+	"TMUX",
+	"TMUX_PANE",
+	"STY",
+	"ZELLIJ",
+	"GJC_TMUX_LAUNCHED",
+	"TERMUX_VERSION",
+	"WT_SESSION",
+	"TERM",
+	"TERM_PROGRAM",
+	"Windows_Terminal",
+	"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
+] as const;
+const originalHostEnvironment = Object.fromEntries(hostEnvironmentNames.map(name => [name, Bun.env[name]])) as Record<
+	(typeof hostEnvironmentNames)[number],
+	string | undefined
+>;
+
+function restoreBunEnvironmentValue(name: string, value: string | undefined): void {
+	if (value === undefined) {
+		delete Bun.env[name];
+	} else {
+		Bun.env[name] = value;
+	}
+}
+
+function restoreInheritedEnvironment(): void {
+	restoreBunEnvironmentValue("PI_DEBUG_REDRAW", originalPiDebugRedraw);
+	restoreBunEnvironmentValue("PI_TUI_VIRTUAL_VIEWPORT", originalVirtualViewport);
+	for (const name of hostEnvironmentNames) {
+		restoreBunEnvironmentValue(name, originalHostEnvironment[name]);
+	}
+}
+function clearHostEnvironment(): void {
+	for (const name of hostEnvironmentNames) delete Bun.env[name];
+}
 
 type CaseResult = {
 	id: string;
@@ -188,20 +226,16 @@ function makeReport() {
 }
 
 beforeEach(() => {
-	delete Bun.env.PI_DEBUG_REDRAW;
+	clearHostEnvironment();
 	delete Bun.env.PI_TUI_VIRTUAL_VIEWPORT;
-	delete process.env.TMUX;
-	delete process.env.TMUX_PANE;
+	delete Bun.env.PI_DEBUG_REDRAW;
 	setDefaultTabWidth(originalTabWidth);
 	TUI.resetRenderCountersForTest();
 });
 
 afterEach(() => {
 	vi.restoreAllMocks();
-	delete Bun.env.PI_DEBUG_REDRAW;
-	delete Bun.env.PI_TUI_VIRTUAL_VIEWPORT;
-	delete process.env.TMUX;
-	delete process.env.TMUX_PANE;
+	restoreInheritedEnvironment();
 	setDefaultTabWidth(originalTabWidth);
 	TUI.resetRenderCountersForTest();
 });
@@ -232,6 +266,9 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			await settle(term);
 		});
 		const counters = TUI.getRenderCountersForTest();
+		expect(counters.debugRedrawEnvReads).toBeLessThanOrEqual(1);
+		expect(counters.debugRedrawAppendWrites).toBe(0);
+		expect(appendSpy).not.toHaveBeenCalled();
 		record({
 			id: "DEBUG-OFF-ZERO-COST",
 			status: "passed",
@@ -242,9 +279,6 @@ describe("G015 debug flag cache and carried width red-team", () => {
 				appendSpyCalls: appendSpy.mock.calls.length,
 			},
 		});
-		expect(counters.debugRedrawEnvReads).toBeLessThanOrEqual(1);
-		expect(counters.debugRedrawAppendWrites).toBe(0);
-		expect(appendSpy).not.toHaveBeenCalled();
 	});
 
 	it("DEBUG-ON-LOGS", async () => {
@@ -261,6 +295,8 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			await settle(term);
 		});
 		const counters = TUI.getRenderCountersForTest();
+		expect(counters.debugRedrawAppendWrites).toBeGreaterThan(0);
+		expect(writes.join("\n")).toContain("fullRender");
 		record({
 			id: "DEBUG-ON-LOGS",
 			status: "passed",
@@ -271,8 +307,6 @@ describe("G015 debug flag cache and carried width red-team", () => {
 				writes,
 			},
 		});
-		expect(counters.debugRedrawAppendWrites).toBeGreaterThan(0);
-		expect(writes.join("\n")).toContain("fullRender");
 	});
 
 	it("WIDTH-REUSE and OVER-WIDTH-TRUNCATION", async () => {
@@ -289,6 +323,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			await settle(term);
 			const reuseCounters = TUI.getRenderCountersForTest();
 			const viewport = visible(term);
+			expect(reuseCounters.differentialGuardVisibleWidthCalls).toBe(0);
 			record({
 				id: "WIDTH-REUSE",
 				status: "passed",
@@ -299,13 +334,15 @@ describe("G015 debug flag cache and carried width red-team", () => {
 					viewport: viewport.slice(0, 2),
 				},
 			});
-			expect(reuseCounters.differentialGuardVisibleWidthCalls).toBe(0);
 			TUI.resetRenderCountersForTest();
 			component.setLines(["short", `${"界".repeat(9)}X`, ...wideLines.slice(2)]);
 			tui.requestRender(false, "uncached-over-width");
 			await settle(term);
 			const truncationCounters = TUI.getRenderCountersForTest();
 			const truncated = visible(term)[1]!;
+			expect(truncationCounters.differentialGuardVisibleWidthCalls).toBe(0);
+			expect(visibleWidth(truncated)).toBe(12);
+			expect(truncated).toBe("界".repeat(6));
 			record({
 				id: "OVER-WIDTH-TRUNCATION",
 				status: "passed",
@@ -319,9 +356,6 @@ describe("G015 debug flag cache and carried width red-team", () => {
 					truncatedWidth: visibleWidth(truncated),
 				},
 			});
-			expect(truncationCounters.differentialGuardVisibleWidthCalls).toBe(0);
-			expect(visibleWidth(truncated)).toBe(12);
-			expect(truncated).toBe("界".repeat(6));
 		});
 	});
 
@@ -344,6 +378,8 @@ describe("G015 debug flag cache and carried width red-team", () => {
 		}
 		const reference = await runScenario("0");
 		const candidate = await runScenario("1");
+		expect(candidate.viewport).toEqual(reference.viewport);
+		expect(candidate.writeLog.join("")).toBe(reference.writeLog.join(""));
 		record({
 			id: "PARITY",
 			status: "passed",
@@ -355,8 +391,6 @@ describe("G015 debug flag cache and carried width red-team", () => {
 				candidateWrites: candidate.writeLog.length,
 			},
 		});
-		expect(candidate.viewport).toEqual(reference.viewport);
-		expect(candidate.writeLog.join("")).toBe(reference.writeLog.join(""));
 	});
 
 	it("STALE-WIDTH", async () => {
@@ -365,26 +399,31 @@ describe("G015 debug flag cache and carried width red-team", () => {
 		const term = new VirtualTerminal(5, 3);
 		await withTui(term, component, async () => {
 			await settle(term);
-			const width2Line = visible(term)[0]!;
+			const initialBytes = term.getWriteLog().join("");
+			const width2 = visibleWidth("a\tbc");
+			expect(initialBytes).toContain("a\tbc");
+			term.clearWriteLog();
+
 			setDefaultTabWidth(6);
 			await settle(term);
-			const width6Line = visible(term)[0]!;
+
+			const postChangeBytes = term.getWriteLog().join("");
+			const width6 = visibleWidth("a\tbc");
+			expect(postChangeBytes).toContain("a\x1b[0m");
+			expect(postChangeBytes).not.toContain("a\tbc");
 			record({
 				id: "STALE-WIDTH",
 				status: "passed",
 				details: {
 					scenario: "Default tab width changes after a cached line containing a tab has been rendered",
 					expectedBehavior:
-						"TUI cache invalidates and re-renders with truncation appropriate to the new tab width",
-					width2Line,
-					width6Line,
-					width2VisibleWidth: visibleWidth(width2Line),
-					width6VisibleWidth: visibleWidth(width6Line),
+						"Tab-width cache invalidation emits a newly truncated frame without the stale raw tab payload",
+					initialBytes,
+					postChangeBytes,
+					width2,
+					width6,
 				},
 			});
-			expect(width2Line).toBe("a   b");
-			expect(width6Line).toBe("a");
-			expect(visibleWidth(width6Line)).toBeLessThanOrEqual(5);
 		});
 	});
 
@@ -399,6 +438,12 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			const viewport = visible(term);
 			const writeBytes = term.getWriteLog().join("");
 			const expectedOverBoundary = truncateToWidth(overBoundary, 11, Ellipsis.Omit);
+			expect(visibleWidth(family)).toBe(2);
+			expect(visibleWidth(exactBoundary)).toBe(11);
+			expect(writeBytes).toContain(exactBoundary);
+			expect(writeBytes).toContain(expectedOverBoundary);
+			expect(expectedOverBoundary).toBe(`abcd${family}wxyzz`);
+			expect(visibleWidth(expectedOverBoundary)).toBeLessThanOrEqual(11);
 			record({
 				id: "ZWJ-BOUNDARY",
 				status: "passed",
@@ -416,12 +461,6 @@ describe("G015 debug flag cache and carried width red-team", () => {
 					writeBytesIncludesOverReference: writeBytes.includes(expectedOverBoundary),
 				},
 			});
-			expect(visibleWidth(family)).toBe(2);
-			expect(visibleWidth(exactBoundary)).toBe(11);
-			expect(writeBytes).toContain(exactBoundary);
-			expect(writeBytes).toContain(expectedOverBoundary);
-			expect(expectedOverBoundary).toBe(`abcd${family}wxyzz`);
-			expect(visibleWidth(expectedOverBoundary)).toBeLessThanOrEqual(11);
 		});
 	});
 });

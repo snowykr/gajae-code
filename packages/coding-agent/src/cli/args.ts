@@ -1,6 +1,8 @@
 /**
  * CLI argument parsing and help display
  */
+
+import * as path from "node:path";
 import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
@@ -27,6 +29,7 @@ export interface Args {
 	thinking?: Effort;
 	continue?: boolean;
 	resume?: string | true;
+	resumeExisting?: string;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
@@ -120,6 +123,12 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.resume = true;
 			}
+		} else if (arg === "--resume-existing") {
+			const next = args[i + 1];
+			if (!next || !path.isAbsolute(next)) {
+				throw new CliParseError("--resume-existing requires an absolute session path");
+			}
+			result.resumeExisting = args[++i];
 		} else if (arg === "--fork" && i + 1 < args.length) {
 			result.fork = args[++i];
 		} else if (arg === "--provider" && i + 1 < args.length) {

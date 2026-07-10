@@ -42,7 +42,50 @@ export * from "./session/agent-session";
 export * from "./session/auth-storage";
 export * from "./session/messages";
 export * from "./session/session-dump-format";
-export * from "./session/session-manager";
+export type {
+	BranchSummaryEntry,
+	ColdSpillRef,
+	CompactionEntry,
+	CustomEntry,
+	CustomMessageEntry,
+	EvictCompactedContentResult,
+	FileEntry,
+	LabelEntry,
+	MCPToolSelectionEntry,
+	ModeChangeEntry,
+	ModelChangeEntry,
+	NewSessionOptions,
+	ReadonlySessionManager,
+	ResolvedSessionMatch,
+	ServiceTierChangeEntry,
+	SessionContext,
+	SessionEntry,
+	SessionEntryBase,
+	SessionHeader,
+	SessionInfo,
+	SessionInitEntry,
+	SessionManagerObservabilityStats,
+	SessionMessageEntry,
+	SessionTreeNode,
+	ThinkingLevelChangeEntry,
+	TtsrInjectionEntry,
+	UsageStatistics,
+} from "./session/session-manager";
+export {
+	buildSessionContext,
+	CURRENT_SESSION_VERSION,
+	findMostRecentSession,
+	getLatestCompactionEntry,
+	getRecentSessions,
+	loadEntriesFromFile,
+	materializeResidentEntriesForPersistenceForTests,
+	migrateSessionEntries,
+	parseSessionEntries,
+	recoverOrphanedBackups,
+	residentBlobSentinelForTests,
+	resolveResumableSession,
+	SessionManager,
+} from "./session/session-manager";
 export * from "./task/executor";
 export type * from "./task/types";
 // Tools (detail types and utilities)

@@ -45,21 +45,28 @@ function countMatches(lines: string[], pattern: RegExp): number {
 
 describe("TUI terminal-state regressions", () => {
 	let monotonicNow = 0;
-	let previousTmux: string | undefined;
-	let previousSty: string | undefined;
-	let previousZellij: string | undefined;
-	let previousLegacyFullRender: string | undefined;
+	const hostEnvironmentNames = [
+		"TMUX",
+		"TMUX_PANE",
+		"STY",
+		"ZELLIJ",
+		"GJC_TMUX_LAUNCHED",
+		"TERMUX_VERSION",
+		"WT_SESSION",
+		"TERM",
+		"TERM_PROGRAM",
+		"Windows_Terminal",
+		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
+		"PI_TUI_VIRTUAL_VIEWPORT",
+		"PI_DEBUG_REDRAW",
+	] as const;
+	const previousHostEnvironment = Object.fromEntries(
+		hostEnvironmentNames.map(name => [name, Bun.env[name]]),
+	) as Record<(typeof hostEnvironmentNames)[number], string | undefined>;
 	// Keep TUI's 16ms render throttle deterministic without sleeping a real frame per render.
 
 	beforeEach(() => {
-		previousTmux = Bun.env.TMUX;
-		previousSty = Bun.env.STY;
-		previousZellij = Bun.env.ZELLIJ;
-		previousLegacyFullRender = Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
-		delete Bun.env.TMUX;
-		delete Bun.env.STY;
-		delete Bun.env.ZELLIJ;
-		delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+		for (const name of hostEnvironmentNames) delete Bun.env[name];
 		monotonicNow = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => {
 			monotonicNow += 20;
@@ -69,25 +76,10 @@ describe("TUI terminal-state regressions", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
-		if (previousTmux === undefined) {
-			delete Bun.env.TMUX;
-		} else {
-			Bun.env.TMUX = previousTmux;
-		}
-		if (previousSty === undefined) {
-			delete Bun.env.STY;
-		} else {
-			Bun.env.STY = previousSty;
-		}
-		if (previousZellij === undefined) {
-			delete Bun.env.ZELLIJ;
-		} else {
-			Bun.env.ZELLIJ = previousZellij;
-		}
-		if (previousLegacyFullRender === undefined) {
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
-		} else {
-			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = previousLegacyFullRender;
+		for (const name of hostEnvironmentNames) {
+			const value = previousHostEnvironment[name];
+			if (value === undefined) delete Bun.env[name];
+			else Bun.env[name] = value;
 		}
 	});
 
@@ -111,6 +103,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(before);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -137,6 +130,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(after[4]).toBe(before[4]);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -163,6 +157,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[4]?.trim()).toBe("");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -185,6 +180,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(["row-3", "row-4", "row-5", "row-6", "row-7"]);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -207,6 +203,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[0]?.trim()).toBe("");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 	});
@@ -232,6 +229,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(stats.truncationLimit).toBe(2);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 	});
@@ -257,6 +255,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(buffer.includes("shell-")).toBeFalsy();
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -282,6 +281,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[2]?.trim()).toBe("");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("truncates compatibility jamo before the terminal can auto-wrap them", async () => {
@@ -300,6 +300,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[1]?.trim()).toBe("");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -320,6 +321,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport.join("\n")).not.toContain("\\u");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -385,6 +387,7 @@ describe("TUI terminal-state regressions", () => {
 				}
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("aggressive resize storm does not duplicate viewport content", async () => {
@@ -454,6 +457,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(expectedViewport(finalWidth, finalHeight));
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("height-only resize recovers from cursor drift without duplicate rows", async () => {
@@ -520,6 +524,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(expectedViewport(80, 17));
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("streaming content under aggressive resize keeps a single consistent viewport", async () => {
@@ -607,6 +612,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(expectedViewport(finalWidth, finalHeight));
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("forced renders during resize storm stay stable under cursor relocation", async () => {
@@ -642,6 +648,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(visible(term)).toEqual(expectedViewport(finalWidth, finalHeight));
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("shrink then grow keeps tail anchored to latest rows", async () => {
@@ -668,6 +675,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[5]?.trim()).toBe("row-23");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("mixed width/height resize storm keeps scrollback bounded for static content", async () => {
@@ -736,6 +744,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(after - before).toBeLessThan(120);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		}, 15_000);
 	});
@@ -771,6 +780,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(writes).toContain("line-79");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -801,6 +811,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(writes).toContain("updated-offscreen-header");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -839,6 +850,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(writes).toContain("UPDATED-70");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -859,6 +871,7 @@ describe("TUI terminal-state regressions", () => {
 				}
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -894,6 +907,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(duplicated).toEqual([]);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -934,6 +948,7 @@ describe("TUI terminal-state regressions", () => {
 				}
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("updates visible tail line when appending during overflow", async () => {
@@ -960,6 +975,7 @@ describe("TUI terminal-state regressions", () => {
 				}
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 		it("forced full redraws do not duplicate persistent content", async () => {
@@ -983,6 +999,7 @@ describe("TUI terminal-state regressions", () => {
 				expect((allText.match(/gamma/g) ?? []).length).toBe(1);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 	});
@@ -1016,6 +1033,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[3]?.trim()).toBe("base-3");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 	});
@@ -1046,6 +1064,7 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[3]?.trim()).toBe("");
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 	});
@@ -1084,6 +1103,7 @@ describe("TUI terminal-state regressions", () => {
 				assertCursorSequencesInsideSyncBlocks(writes);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -1105,6 +1125,7 @@ describe("TUI terminal-state regressions", () => {
 				assertCursorSequencesInsideSyncBlocks(writes);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -1127,6 +1148,7 @@ describe("TUI terminal-state regressions", () => {
 				assertCursorSequencesInsideSyncBlocks(writes);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 
@@ -1149,6 +1171,7 @@ describe("TUI terminal-state regressions", () => {
 				assertCursorSequencesInsideSyncBlocks(writes);
 			} finally {
 				tui.stop();
+				tui.dispose();
 			}
 		});
 

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use napi::{
-	Env, Result,
+	Env, JsNumber, Result, ValueType,
 	bindgen_prelude::{PromiseRaw, Unknown},
 };
 use napi_derive::napi;
@@ -42,7 +42,94 @@ pub struct ProcessWaitOptions<'env> {
 	pub signal:     Option<Unknown<'env>>,
 }
 
-/// Current state of a process reference.
+#[derive(Clone)]
+#[napi(object)]
+pub struct ProcessIdentityDiagnostic {
+	pub code: String,
+	pub errno: Option<i32>,
+}
+
+#[derive(Clone)]
+#[napi(object)]
+pub struct ProcessIdentityCapture {
+	pub state: String,
+	pub identity: Option<String>,
+	pub diagnostic: Option<ProcessIdentityDiagnostic>,
+}
+
+#[derive(Clone)]
+#[napi(object)]
+pub struct ProcessIdentityComparison {
+	pub state: String,
+	pub diagnostic: Option<ProcessIdentityDiagnostic>,
+}
+fn validate_i32(number: f64, allow_zero: bool) -> Option<i32> {
+	if !number.is_finite()
+		|| number.fract() != 0.0
+		|| number < 0.0
+		|| (!allow_zero && number == 0.0)
+		|| number > f64::from(i32::MAX)
+	{
+		return None;
+	}
+	Some(number as i32)
+}
+
+fn parse_i32<'env>(value: Unknown<'env>, name: &str, allow_zero: bool) -> Result<Option<i32>> {
+	if value.get_type()? != ValueType::Number {
+		return Err(napi::Error::from_reason(format!("invalid_{name}: expected a number")));
+	}
+	let number = unsafe { value.cast::<JsNumber>()? }.get_double()?;
+	Ok(validate_i32(number, allow_zero))
+}
+fn unavailable_capture(code: &str, errno: Option<i32>) -> ProcessIdentityCapture {
+	ProcessIdentityCapture {
+		state: "unavailable".to_string(),
+		identity: None,
+		diagnostic: Some(ProcessIdentityDiagnostic { code: code.to_string(), errno }),
+	}
+}
+
+fn unavailable_comparison(code: &str, errno: Option<i32>) -> ProcessIdentityComparison {
+	ProcessIdentityComparison {
+		state: "unavailable".to_string(),
+		diagnostic: Some(ProcessIdentityDiagnostic { code: code.to_string(), errno }),
+	}
+}
+
+#[napi]
+pub fn capture_process_identity<'env>(pid: Unknown<'env>) -> Result<ProcessIdentityCapture> {
+	let Some(pid) = parse_i32(pid, "pid", false)? else {
+		return Ok(unavailable_capture("invalid_pid", None));
+	};
+	Ok(match core_process::capture_process_identity(pid) {
+		core_process::ProcessIdentityCapture::Captured { identity } => ProcessIdentityCapture {
+			state: "captured".to_string(), identity: Some(identity), diagnostic: None,
+		},
+		core_process::ProcessIdentityCapture::Unavailable { diagnostic } => ProcessIdentityCapture {
+			state: "unavailable".to_string(),
+			identity: None,
+			diagnostic: Some(ProcessIdentityDiagnostic { code: diagnostic.code, errno: diagnostic.errno }),
+		},
+	})
+}
+
+#[napi]
+pub fn compare_process_identity<'env>(pid: Unknown<'env>, identity: String) -> Result<ProcessIdentityComparison> {
+	let Some(pid) = parse_i32(pid, "pid", false)? else {
+		return Ok(unavailable_comparison("invalid_pid", None));
+	};
+	let (state, diagnostic) = match core_process::compare_process_identity(pid, &identity) {
+		core_process::ProcessIdentityComparison::Same => ("same", None),
+		core_process::ProcessIdentityComparison::Different { diagnostic } => ("different", Some(diagnostic)),
+		core_process::ProcessIdentityComparison::Absent { diagnostic } => ("absent", Some(diagnostic)),
+		core_process::ProcessIdentityComparison::Unavailable { diagnostic } => ("unavailable", Some(diagnostic)),
+	};
+	Ok(ProcessIdentityComparison {
+		state: state.to_string(),
+		diagnostic: diagnostic.map(|value| ProcessIdentityDiagnostic { code: value.code, errno: value.errno }),
+	})
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[napi(string_enum)]
 pub enum ProcessStatus {
@@ -75,8 +162,11 @@ pub struct Process {
 impl Process {
 	/// Open a stable process reference from a PID.
 	#[napi]
-	pub fn from_pid(pid: i32) -> Option<Process> {
-		core_process::Process::from_pid(pid).map(Self::from_inner)
+	pub fn from_pid<'env>(pid: Unknown<'env>) -> Result<Option<Process>> {
+		let Some(pid) = parse_i32(pid, "pid", false)? else {
+			return Err(napi::Error::from_reason("invalid_pid"));
+		};
+		Ok(core_process::Process::from_pid(pid).map(Self::from_inner))
 	}
 
 	/// Open stable process references whose executable path matches exactly.

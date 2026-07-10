@@ -15,6 +15,34 @@ pub enum ProcessStatus {
 	Exited,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessIdentityDiagnostic {
+	pub code: String,
+	pub errno: Option<i32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessIdentityCapture {
+	Captured { identity: String },
+	Unavailable { diagnostic: ProcessIdentityDiagnostic },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessIdentityComparison {
+	Same,
+	Different { diagnostic: ProcessIdentityDiagnostic },
+	Absent { diagnostic: ProcessIdentityDiagnostic },
+	Unavailable { diagnostic: ProcessIdentityDiagnostic },
+}
+
+pub fn capture_process_identity(pid: i32) -> ProcessIdentityCapture {
+	platform::capture_process_identity(pid)
+}
+
+pub fn compare_process_identity(pid: i32, identity: &str) -> ProcessIdentityComparison {
+	platform::compare_process_identity(pid, identity)
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
 	use std::{
@@ -27,6 +55,67 @@ mod platform {
 	};
 
 	use super::ProcessStatus;
+
+	pub fn capture_process_identity(pid: i32) -> super::ProcessIdentityCapture {
+		if pid <= 0 {
+			return unavailable_capture("invalid_pid", None);
+		}
+		let path = format!("/proc/{pid}/stat");
+		let content = match fs::read_to_string(&path) {
+			Ok(content) => content,
+			Err(error) => {
+				let errno = error.raw_os_error();
+				let code = if error.kind() == std::io::ErrorKind::NotFound || errno == Some(libc::ENOENT) {
+					"process_absent"
+				} else {
+					"read_failed"
+				};
+				return unavailable_capture(code, errno);
+			}
+		};
+		let Some(start_time) = parse_start_time(&content) else {
+			return unavailable_capture("malformed_kernel_data", None);
+		};
+		super::ProcessIdentityCapture::Captured { identity: format!("linux:{start_time}") }
+	}
+
+	pub fn compare_process_identity(pid: i32, identity: &str) -> super::ProcessIdentityComparison {
+		if !parse_identity(identity) {
+			return unavailable_compare("invalid_identity", None);
+		}
+		match capture_process_identity(pid) {
+			super::ProcessIdentityCapture::Captured { identity: actual } if actual == identity => super::ProcessIdentityComparison::Same,
+			super::ProcessIdentityCapture::Captured { .. } => super::ProcessIdentityComparison::Different {
+				diagnostic: diagnostic("identity_different", None),
+			},
+			super::ProcessIdentityCapture::Unavailable { diagnostic } if diagnostic.code == "process_absent" => {
+				super::ProcessIdentityComparison::Absent { diagnostic }
+			}
+			super::ProcessIdentityCapture::Unavailable { diagnostic } => super::ProcessIdentityComparison::Unavailable { diagnostic },
+		}
+	}
+
+	fn parse_identity(identity: &str) -> bool {
+		identity.strip_prefix("linux:").is_some_and(|value| {
+			!value.is_empty() && (value == "0" || !value.starts_with('0'))
+				&& value.bytes().all(|byte| byte.is_ascii_digit()) && value.parse::<u64>().is_ok()
+		})
+	}
+
+	fn parse_start_time(content: &str) -> Option<u64> {
+		let last_paren = content.rfind(')')?;
+		content[last_paren + 1..].split_whitespace().nth(19)?.parse().ok()
+	}
+
+	fn diagnostic(code: &str, errno: Option<i32>) -> super::ProcessIdentityDiagnostic {
+		super::ProcessIdentityDiagnostic { code: code.to_string(), errno }
+	}
+	fn unavailable_capture(code: &str, errno: Option<i32>) -> super::ProcessIdentityCapture {
+		super::ProcessIdentityCapture::Unavailable { diagnostic: diagnostic(code, errno) }
+	}
+	fn unavailable_compare(code: &str, errno: Option<i32>) -> super::ProcessIdentityComparison {
+		super::ProcessIdentityComparison::Unavailable { diagnostic: diagnostic(code, errno) }
+	}
 
 	/// Stable Linux process reference backed by a pidfd.
 	#[derive(Clone)]
@@ -304,6 +393,23 @@ mod platform {
 	}
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_darwin_identity(identity: &str) -> bool {
+	let Some(value) = identity.strip_prefix("darwin:") else {
+		return false;
+	};
+	let mut parts = value.split(':');
+	let valid_integer = |part: Option<&str>| {
+		part.is_some_and(|part| !part.is_empty() && (part == "0" || !part.starts_with('0')) && part.bytes().all(|byte| byte.is_ascii_digit()))
+	};
+	let seconds = parts.next();
+	let microseconds = parts.next();
+	valid_integer(seconds)
+		&& seconds.and_then(|part| part.parse::<u64>().ok()).is_some()
+		&& valid_integer(microseconds)
+		&& microseconds.and_then(|part| part.parse::<u64>().ok()).is_some_and(|value| value <= 999_999)
+		&& parts.next().is_none()
+}
 #[cfg(target_os = "macos")]
 mod platform {
 	use std::{
@@ -312,6 +418,38 @@ mod platform {
 	};
 
 	use super::ProcessStatus;
+	pub fn capture_process_identity(pid: i32) -> super::ProcessIdentityCapture {
+		if pid <= 0 {
+			return super::ProcessIdentityCapture::Unavailable {
+				diagnostic: super::ProcessIdentityDiagnostic { code: "invalid_pid".to_string(), errno: None },
+			};
+		}
+		match read_bsdinfo_identity(pid) {
+			Ok(info) => super::ProcessIdentityCapture::Captured {
+				identity: format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+			},
+			Err((code, errno)) => super::ProcessIdentityCapture::Unavailable {
+				diagnostic: super::ProcessIdentityDiagnostic { code: code.to_string(), errno },
+			},
+		}
+	}
+
+	pub fn compare_process_identity(pid: i32, identity: &str) -> super::ProcessIdentityComparison {
+		let valid = super::parse_darwin_identity(identity);
+		if !valid {
+			return super::ProcessIdentityComparison::Unavailable {
+				diagnostic: super::ProcessIdentityDiagnostic { code: "invalid_identity".to_string(), errno: None },
+			};
+		}
+		match capture_process_identity(pid) {
+			super::ProcessIdentityCapture::Captured { identity: actual } if actual == identity => super::ProcessIdentityComparison::Same,
+			super::ProcessIdentityCapture::Captured { .. } => super::ProcessIdentityComparison::Different {
+				diagnostic: super::ProcessIdentityDiagnostic { code: "identity_different".to_string(), errno: None },
+			},
+			super::ProcessIdentityCapture::Unavailable { diagnostic } if diagnostic.code == "process_absent" => super::ProcessIdentityComparison::Absent { diagnostic },
+			super::ProcessIdentityCapture::Unavailable { diagnostic } => super::ProcessIdentityComparison::Unavailable { diagnostic },
+		}
+	}
 
 	#[link(name = "proc", kind = "dylib")]
 	unsafe extern "C" {
@@ -565,6 +703,23 @@ mod platform {
 		matches
 	}
 
+	fn read_bsdinfo_identity(pid: i32) -> Result<libc::proc_bsdinfo, (&'static str, Option<i32>)> {
+		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+		let actual = unsafe {
+			libc::proc_pidinfo(
+				pid,
+				libc::PROC_PIDTBSDINFO,
+				0,
+				(&raw mut info).cast::<std::ffi::c_void>(),
+				size_of::<libc::proc_bsdinfo>() as i32,
+			)
+		};
+		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
+			let errno = std::io::Error::last_os_error().raw_os_error();
+			return Err(if errno == Some(libc::ESRCH) { ("process_absent", errno) } else { ("proc_query_failed", errno) });
+		}
+		Ok(info)
+	}
 	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
 		// SAFETY: `proc_bsdinfo` is a plain C data struct. Zero initialization is
 		// valid because every field is an integer or fixed-size integer array, and
@@ -683,6 +838,26 @@ mod platform {
 	use smallvec::SmallVec;
 
 	use super::ProcessStatus;
+	pub fn capture_process_identity(_pid: i32) -> super::ProcessIdentityCapture {
+		super::ProcessIdentityCapture::Unavailable {
+			diagnostic: super::ProcessIdentityDiagnostic {
+				code: "unsupported_platform".to_string(),
+				errno: None,
+			},
+		}
+	}
+
+	pub fn compare_process_identity(
+		_pid: i32,
+		_identity: &str,
+	) -> super::ProcessIdentityComparison {
+		super::ProcessIdentityComparison::Unavailable {
+			diagnostic: super::ProcessIdentityDiagnostic {
+				code: "unsupported_platform".to_string(),
+				errno: None,
+			},
+		}
+	}
 
 	#[repr(C)]
 	#[allow(non_snake_case, reason = "Windows PROCESSENTRY32W field names must match Win32 ABI")]
@@ -1666,6 +1841,65 @@ fn select_termination_targets<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn process_identity_capture_and_compare_states() {
+		let pid = i32::try_from(std::process::id()).expect("self pid fits");
+		let ProcessIdentityCapture::Captured { identity } = capture_process_identity(pid) else {
+			panic!("self identity must be captured");
+		};
+		assert!(identity.starts_with("linux:"));
+		assert_eq!(compare_process_identity(pid, &identity), ProcessIdentityComparison::Same);
+		assert!(matches!(
+			compare_process_identity(pid, "linux:0"),
+			ProcessIdentityComparison::Different { .. }
+		));
+		assert!(matches!(
+			compare_process_identity(pid, "not-an-identity"),
+			ProcessIdentityComparison::Unavailable { .. }
+		));
+		assert!(matches!(
+			compare_process_identity(-1, &identity),
+			ProcessIdentityComparison::Unavailable { .. }
+		));
+		assert!(matches!(
+			compare_process_identity(i32::MAX, &identity),
+			ProcessIdentityComparison::Absent { .. } | ProcessIdentityComparison::Unavailable { .. }
+		));
+	}
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn windows_process_identity_is_unavailable() {
+		let ProcessIdentityCapture::Unavailable { diagnostic } = capture_process_identity(1) else {
+			panic!("Windows process identity must be unavailable");
+		};
+		assert_eq!(diagnostic.code, "unsupported_platform");
+		assert_eq!(diagnostic.errno, None);
+
+		let ProcessIdentityComparison::Unavailable { diagnostic } =
+			compare_process_identity(1, "windows:identity")
+		else {
+			panic!("Windows process identity comparison must be unavailable");
+		};
+		assert_eq!(diagnostic.code, "unsupported_platform");
+		assert_eq!(diagnostic.errno, None);
+	}
+	#[test]
+	fn darwin_identity_parser_enforces_microsecond_range() {
+		assert!(parse_darwin_identity("darwin:123:999999"));
+		assert!(!parse_darwin_identity("darwin:123:1000000"));
+	}
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn linux_identity_parser_rejects_noncanonical_values() {
+		let pid = i32::try_from(std::process::id()).expect("self pid fits");
+		for identity in ["linux:00", "linux:01", "linux:+1", "linux: 1", "linux:1x", "linux:18446744073709551616"] {
+			assert!(matches!(
+				compare_process_identity(pid, identity),
+				ProcessIdentityComparison::Unavailable { diagnostic } if diagnostic.code == "invalid_identity"
+			));
+		}
+	}
 
 	/// Regression test for the cancellation-kills-harness bug.
 	///

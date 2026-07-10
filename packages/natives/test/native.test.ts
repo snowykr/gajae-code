@@ -3,6 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	captureProcessIdentity,
+	classifyStrictFs,
+	compareProcessIdentity,
 	executeShell,
 	FileType,
 	fuzzyFind,
@@ -88,6 +91,29 @@ describe("pi-natives", () => {
 	it("keeps native crash diagnostics opt-in", () => {
 		delete process.env.GJC_NATIVE_CRASH_DIAGNOSTICS;
 		expect(initNativeCrashDiagnostics()).toBe(false);
+	});
+	describe("native numeric boundary validation", () => {
+		it("rejects invalid PID number classes before native lookup", () => {
+			for (const pid of [NaN, Infinity, -1, 0, 1.5, 2 ** 32, 2 ** 53 + 1]) {
+				expect(captureProcessIdentity(pid)).toMatchObject({
+					state: "unavailable",
+					diagnostic: { code: "invalid_pid" },
+				});
+				expect(compareProcessIdentity(pid, "linux:1")).toMatchObject({
+					state: "unavailable",
+					diagnostic: { code: "invalid_pid" },
+				});
+			}
+		});
+
+		it("rejects invalid descriptor number classes before native lookup", () => {
+			for (const fd of [NaN, Infinity, -1, 1.5, 2 ** 32, 2 ** 53 + 1]) {
+				expect(classifyStrictFs(fd)).toMatchObject({
+					state: "unavailable",
+					diagnostic: { code: "invalid_fd" },
+				});
+			}
+		});
 	});
 
 	describe("summarize", () => {

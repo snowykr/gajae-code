@@ -17,7 +17,6 @@ const nativeBindings = loadNative();
 nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
-export const ComputerController = nativeBindings.ComputerController;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NotificationControlServer = nativeBindings.NotificationControlServer;
@@ -31,6 +30,9 @@ export const __piNativesV0_9_6 = nativeBindings.__piNativesV0_9_6;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const captureProcessIdentity = nativeBindings.captureProcessIdentity;
+export const classifyStrictFs = nativeBindings.classifyStrictFs;
+export const compareProcessIdentity = nativeBindings.compareProcessIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;

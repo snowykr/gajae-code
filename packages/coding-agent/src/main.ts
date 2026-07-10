@@ -34,6 +34,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { validateStrictHeldResumeEnvironment } from "./gjc-runtime/tmux-restart-protocol";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
@@ -49,7 +50,13 @@ import {
 } from "./sdk";
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
-import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
+import {
+	openStrictSessionForMain,
+	resolveResumableSession,
+	type SessionInfo,
+	SessionManager,
+} from "./session/session-manager";
+import { FileSessionStorage } from "./session/session-storage";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
@@ -525,6 +532,16 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
+	if (parsed.resumeExisting) {
+		if (parsed.noSession || parsed.fork || parsed.resume || parsed.continue) {
+			throw new Error("--resume-existing cannot be combined with another session selector");
+		}
+		const storage = new FileSessionStorage();
+		const held = await validateStrictHeldResumeEnvironment(parsed.resumeExisting, {
+			pinSession: sessionPath => storage.pinStrictSession(sessionPath),
+		});
+		return await openStrictSessionForMain(parsed.resumeExisting, storage, held.authorization);
+	}
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new Error("--fork requires session persistence");

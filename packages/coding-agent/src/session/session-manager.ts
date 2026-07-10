@@ -29,7 +29,8 @@ import {
 } from "@gajae-code/utils";
 import type { TtsrInjectionRecord } from "../export/ttsr";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
-
+import type { StrictHeldProtocolAuthorization } from "../gjc-runtime/tmux-restart-protocol";
+import { consumeStrictHeldProtocolAuthorization } from "../gjc-runtime/tmux-restart-protocol";
 import * as git from "../utils/git";
 import { ArtifactManager } from "./artifacts";
 import {
@@ -61,8 +62,16 @@ import {
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 	stripInternalDetailsFields,
 } from "./messages";
-import type { SessionStorage, SessionStorageWriter } from "./session-storage";
-import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
+import type { SessionStorage, SessionStorageWriter, StrictHeldSessionCapability } from "./session-storage";
+import {
+	closeStrictHeldSessionCapability,
+	consumeStrictHeldSessionCapability,
+	FileSessionStorage,
+	MemorySessionStorage,
+	strictHeldSessionMatches,
+} from "./session-storage";
+
+const strictSessionBootstrap = Symbol("strictSessionBootstrap");
 
 export const CURRENT_SESSION_VERSION = 3;
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
@@ -963,7 +972,7 @@ export async function loadEntriesFromFile(
 	// Validate session header
 	if (entries.length === 0) return entries;
 	const header = entries[0] as SessionHeader;
-	if (header.type !== "session" || typeof header.id !== "string") {
+	if (header?.type !== "session" || typeof header?.id !== "string") {
 		return [];
 	}
 
@@ -2197,12 +2206,18 @@ class NdjsonFileWriter {
 	#pendingWrites: Promise<void> = Promise.resolve();
 	#onError: ((err: Error) => void) | undefined;
 
-	constructor(storage: SessionStorage, path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
+	constructor(
+		storage: SessionStorage,
+		path: string,
+		options?: { flags?: "a" | "w"; onError?: (err: Error) => void; writer?: SessionStorageWriter },
+	) {
 		this.#onError = options?.onError;
-		this.#writer = storage.openWriter(path, {
-			flags: options?.flags ?? "a",
-			onError: (err: Error) => this.#recordError(err),
-		});
+		this.#writer =
+			options?.writer ??
+			storage.openWriter(path, {
+				flags: options?.flags ?? "a",
+				onError: (err: Error) => this.#recordError(err),
+			});
 	}
 
 	#recordError(err: unknown): Error {
@@ -2694,7 +2709,17 @@ interface SessionManagerStateSnapshot {
 	materializedFileEntries: FileEntry[];
 }
 
+interface SessionSnapshotMetadata {
+	persistWriter: NdjsonFileWriter | undefined;
+	persistWriterPath: string | undefined;
+	sessionId: string;
+	sessionFile: string | undefined;
+}
+
 export class SessionManager {
+	#strictResume = false;
+	#strictPersistenceClosed = false;
+	#snapshotMetadata = new WeakMap<SessionManagerStateSnapshot, SessionSnapshotMetadata>();
 	#sessionId: string = "";
 	/** True once a lifecycle pre-allocated id has been adopted (consume-once). */
 	#lifecycleIdAdopted: boolean = false;
@@ -2758,15 +2783,16 @@ export class SessionManager {
 	#materializedEntriesCachePopulateCount = 0;
 	#pathOnlyContextBuildCount = 0;
 
-	private constructor(
+	constructor(
 		private cwd: string,
 		private sessionDir: string,
 		private readonly persist: boolean,
 		private readonly storage: SessionStorage,
+		ensureDirectory = true,
 	) {
 		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
 		this.#residentImageBlobStore = this.#blobStore;
-		if (persist && sessionDir) {
+		if (persist && sessionDir && ensureDirectory) {
 			this.storage.ensureDirSync(sessionDir);
 		}
 		// Note: call _initSession() or _initSessionFile() after construction
@@ -2867,15 +2893,18 @@ export class SessionManager {
 
 	/** Puts a binary blob into the blob store and returns the blob reference */
 	async putBlob(data: Buffer): Promise<BlobPutResult> {
+		this.#assertStrictPersistenceOpen();
 		return this.#blobStore.put(data);
 	}
 
 	captureState(): SessionManagerStateSnapshot {
+		if (this.#strictResume) throw new Error("Strict resume cannot capture state");
+		this.#assertStrictPersistenceOpen();
 		const materializedFileEntries = materializeResidentEntriesForReadSync(
 			this.#fileEntries,
 			this.#residentBlobStores(),
 		);
-		return {
+		const snapshot: SessionManagerStateSnapshot = {
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
@@ -2889,19 +2918,65 @@ export class SessionManager {
 			// the ephemeral store backing the resident sentinels above.
 			materializedFileEntries,
 		};
+		this.#snapshotMetadata.set(snapshot, {
+			persistWriter: this.#persistWriter,
+			persistWriterPath: this.#persistWriterPath,
+			sessionId: this.#sessionId,
+			sessionFile: this.#sessionFile,
+		});
+		return snapshot;
 	}
 
-	restoreState(snapshot: SessionManagerStateSnapshot): void {
-		const restoredFileEntries = [...snapshot.materializedFileEntries];
-		this.#sessionId = snapshot.sessionId;
-		this.#sessionName = snapshot.sessionName;
-		this.#titleSource = snapshot.titleSource;
-		this.#sessionFile = snapshot.sessionFile;
-		this.#flushed = snapshot.flushed;
-		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
+	restoreState(_snapshot: SessionManagerStateSnapshot): void {
+		if (this.#strictResume) throw new Error("Strict resume cannot restore state");
+		const snapshot = _snapshot;
+		const currentSessionId = this.#sessionId;
+		const currentSessionFile = this.#sessionFile;
+		const currentPersistWriter = this.#persistWriter;
+		const currentPersistWriterPath = this.#persistWriterPath;
+		const metadata = this.#snapshotMetadata.get(snapshot);
+		const stagedSessionId = snapshot.sessionId;
+		const stagedSessionFile = snapshot.sessionFile;
+		const stagedSessionName = snapshot.sessionName;
+		const stagedTitleSource = snapshot.titleSource;
+		const stagedFlushed = snapshot.flushed;
+		const stagedNeedsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
+		// Detach the complete snapshot graph before validating identity. Accessors in
+		// nested entries must run while the snapshot is still untrusted, never during
+		// or after the atomic commit below. structuredClone preserves binary and typed
+		// values that JSON serialization would corrupt.
+		const stagedMaterializedFileEntries = structuredClone(snapshot.materializedFileEntries);
+		if (
+			metadata &&
+			(metadata.sessionId !== currentSessionId ||
+				metadata.sessionFile !== currentSessionFile ||
+				metadata.persistWriter !== currentPersistWriter ||
+				metadata.persistWriterPath !== currentPersistWriterPath)
+		) {
+			throw new Error("Cannot restore a snapshot from a different session");
+		}
+		const authoritativeSessionId = currentSessionId;
+		const authoritativeSessionFile = currentSessionFile;
+		const restoredFileEntries = stagedMaterializedFileEntries;
+		if (
+			currentSessionId !== this.#sessionId ||
+			currentSessionFile !== this.#sessionFile ||
+			currentPersistWriter !== this.#persistWriter ||
+			currentPersistWriterPath !== this.#persistWriterPath ||
+			stagedSessionId !== authoritativeSessionId ||
+			stagedSessionFile !== authoritativeSessionFile
+		) {
+			throw new Error("Cannot restore a snapshot from a different session");
+		}
+		this.#sessionId = authoritativeSessionId;
+		this.#sessionName = stagedSessionName;
+		this.#titleSource = stagedTitleSource;
+		this.#sessionFile = authoritativeSessionFile;
+		this.#flushed = stagedFlushed;
+		this.#needsFullRewriteOnNextPersist = stagedNeedsFullRewriteOnNextPersist;
 		this.#fileEntries = restoredFileEntries;
-		this.#persistWriter = undefined;
-		this.#persistWriterPath = undefined;
+		this.#persistWriter = currentPersistWriter;
+		this.#persistWriterPath = currentPersistWriterPath;
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -2929,6 +3004,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	async setSessionFile(sessionFile: string): Promise<void> {
+		if (this.#strictResume) throw new Error("Strict resume cannot switch session files");
 		await this.#closePersistWriter();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
@@ -2969,6 +3045,7 @@ export class SessionManager {
 
 	/** Start a new session. Closes any existing writer first. */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		if (this.#strictResume) throw new Error("Strict resume cannot create a new session");
 		await this.#closePersistWriter();
 		const sessionFile = this.#newSessionSync(options);
 		this.#bumpAllRevisions();
@@ -2977,6 +3054,7 @@ export class SessionManager {
 
 	/** Delete a session file and its artifacts. Drains the persist writer first to avoid EPERM on Windows. ENOENT is treated as success. */
 	async dropSession(sessionPath: string): Promise<void> {
+		if (this.#strictResume) throw new Error("Strict resume cannot delete a session");
 		await this.#closePersistWriter();
 		try {
 			await this.storage.deleteSessionWithArtifacts(sessionPath);
@@ -2992,6 +3070,7 @@ export class SessionManager {
 	 * @returns { oldSessionFile, newSessionFile } or undefined if not persisting
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
+		if (this.#strictResume) throw new Error("Strict resume cannot fork a session");
 		if (!this.persist || !this.#sessionFile) {
 			return undefined;
 		}
@@ -3047,6 +3126,7 @@ export class SessionManager {
 	 * and rewrites the session header with the new cwd.
 	 */
 	async moveTo(newCwd: string): Promise<void> {
+		if (this.#strictResume) throw new Error("Strict resume cannot move a session");
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
 
@@ -3273,11 +3353,19 @@ export class SessionManager {
 		return next;
 	}
 
+	#assertStrictPersistenceOpen(): void {
+		if (this.#strictResume && this.#strictPersistenceClosed) throw new Error("Strict persistence is closed");
+	}
 	#ensurePersistWriter(): NdjsonFileWriter | undefined {
+		this.#assertStrictPersistenceOpen();
 		if (!this.persist || !this.#sessionFile) return undefined;
 		if (this.#persistError) throw this.#persistError;
 		if (this.#persistWriter && this.#persistWriterPath === this.#sessionFile) {
 			if (this.#persistWriter.isOpen()) return this.#persistWriter;
+			if (this.#strictResume) {
+				this.#strictPersistenceClosed = true;
+				throw new Error("Strict persistence is closed");
+			}
 			// Cached writer for the current file is mid-close (queued
 			// `#closePersistWriterInternal` has flipped `#closing` but not yet
 			// cleared `#persistWriter`). Returning it would make `writeSync`
@@ -3296,11 +3384,12 @@ export class SessionManager {
 	}
 
 	async #closePersistWriterInternal(): Promise<void> {
-		if (this.#persistWriter) {
-			await this.#persistWriter.close();
+		try {
+			if (this.#persistWriter) await this.#persistWriter.close();
+		} finally {
 			this.#persistWriter = undefined;
+			this.#persistWriterPath = undefined;
 		}
-		this.#persistWriterPath = undefined;
 	}
 
 	#closePersistWriterInternalSync(): void {
@@ -3480,6 +3569,7 @@ export class SessionManager {
 	}
 
 	async #rewriteFile(): Promise<void> {
+		if (this.#strictResume) throw new Error("Strict resume cannot rewrite a session file");
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#queuePersistTask(async () => {
 			await this.#closePersistWriterInternal();
@@ -3496,6 +3586,7 @@ export class SessionManager {
 	}
 
 	#rewriteFileSync(): void {
+		if (this.#strictResume) throw new Error("Strict resume cannot synchronously rewrite a session file");
 		if (!this.persist || !this.#sessionFile) return;
 		this.#closePersistWriterInternalSync();
 		const entries = materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(
@@ -3516,6 +3607,7 @@ export class SessionManager {
 	 * Used by ACP mode where session/new must create a discoverable session immediately.
 	 */
 	async ensureOnDisk(): Promise<void> {
+		this.#assertStrictPersistenceOpen();
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#flushed && !this.#needsFullRewriteOnNextPersist) return;
 		await this.#rewriteFile();
@@ -3524,6 +3616,7 @@ export class SessionManager {
 
 	/** Flush pending writes to disk. Call before switching sessions or on shutdown. */
 	async flush(): Promise<void> {
+		this.#assertStrictPersistenceOpen();
 		await this.#queuePersistTask(async () => {
 			if (this.#persistWriter) {
 				await this.#persistWriter.flush();
@@ -3535,12 +3628,16 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
-		await this.#queuePersistTask(async () => {
-			if (this.#persistWriter) {
-				await this.#closePersistWriterInternal();
-				this.#flushed = true;
-			}
-		});
+		if (this.#strictResume) this.#strictPersistenceClosed = true;
+		await this.#queuePersistTask(
+			async () => {
+				if (this.#persistWriter) {
+					await this.#closePersistWriterInternal();
+					this.#flushed = true;
+				}
+			},
+			{ ignoreError: this.#strictResume },
+		);
 		this.#disposeResidentTextBlobStore();
 		if (this.#persistError) throw this.#persistError;
 	}
@@ -3584,6 +3681,7 @@ export class SessionManager {
 	 * the parent session's artifact directory and ID counter.
 	 */
 	adoptArtifactManager(manager: ArtifactManager): void {
+		this.#assertStrictPersistenceOpen();
 		this.#adoptedArtifactManager = manager;
 	}
 
@@ -3602,6 +3700,7 @@ export class SessionManager {
 	 * Recreates the manager when the active session file changes.
 	 */
 	#getOrCreateArtifactManager(): ArtifactManager | null {
+		this.#assertStrictPersistenceOpen();
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile) {
@@ -3625,6 +3724,7 @@ export class SessionManager {
 	 * Returns an empty object when the session is not persisted.
 	 */
 	async allocateArtifactPath(toolType: string): Promise<{ id?: string; path?: string }> {
+		this.#assertStrictPersistenceOpen();
 		const manager = this.#getOrCreateArtifactManager();
 		if (!manager) return {};
 		return manager.allocatePath(toolType);
@@ -3635,6 +3735,7 @@ export class SessionManager {
 	 * Returns an artifact ID for all sessions (file-backed for persistent, in-memory fallback otherwise).
 	 */
 	async saveArtifact(content: string, toolType: string): Promise<string | undefined> {
+		this.#assertStrictPersistenceOpen();
 		const manager = this.#getOrCreateArtifactManager();
 		if (manager) return manager.save(content, toolType);
 		// Non-persistent session: store in memory so spill truncation can proceed.
@@ -3670,6 +3771,7 @@ export class SessionManager {
 	 * session is not persisted.
 	 */
 	async saveDraft(text: string): Promise<void> {
+		this.#assertStrictPersistenceOpen();
 		const draftPath = this.#getDraftPath();
 		if (!draftPath || !this.persist) return;
 		if (text.length === 0) {
@@ -3694,6 +3796,7 @@ export class SessionManager {
 	 * sidecar so a subsequent resume does not re-restore the same text.
 	 */
 	async consumeDraft(): Promise<string | null> {
+		this.#assertStrictPersistenceOpen();
 		const draftPath = this.#getDraftPath();
 		if (!draftPath) return null;
 		let text: string;
@@ -3734,11 +3837,13 @@ export class SessionManager {
 	 *   Auto-generated titles are silently ignored when the user has already set a name.
 	 */
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
+		this.#assertStrictPersistenceOpen();
 		// User-set names take permanent precedence over auto-generated ones.
 		if (this.#titleSource === "user" && source === "auto") return false;
 
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
+		if (this.#strictResume) throw new Error("Strict resume cannot rewrite session history");
 
 		this.#sessionName = sanitized;
 		this.#titleSource = source;
@@ -3761,6 +3866,7 @@ export class SessionManager {
 
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
+		this.#assertStrictPersistenceOpen();
 		if (this.#persistError) throw this.#persistError;
 
 		// Normally we wait for the first assistant message before persisting to avoid
@@ -3820,6 +3926,7 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
+		this.#assertStrictPersistenceOpen();
 		const normalizedEntry = normalizeSessionEntryForStorage(entry);
 		const residentEntry = prepareEntryForResidentSync(normalizedEntry, this.#residentBlobStores()) as SessionEntry;
 		this.#fileEntries.push(residentEntry);
@@ -3867,6 +3974,7 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.#byId),
@@ -3880,6 +3988,7 @@ export class SessionManager {
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
 	appendThinkingLevelChange(thinkingLevel?: string): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
 			id: generateId(this.#byId),
@@ -3892,6 +4001,7 @@ export class SessionManager {
 	}
 
 	appendServiceTierChange(serviceTier: ServiceTier | null): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
 			id: generateId(this.#byId),
@@ -3905,6 +4015,7 @@ export class SessionManager {
 
 	/** Append a mode change as child of current leaf, then advance leaf. Returns entry id. */
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: ModeChangeEntry = {
 			type: "mode_change",
 			id: generateId(this.#byId),
@@ -3927,6 +4038,7 @@ export class SessionManager {
 		role?: string,
 		metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
 	): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(this.#byId),
@@ -3950,6 +4062,7 @@ export class SessionManager {
 		outputSchema?: unknown;
 		forkContext?: unknown;
 	}): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: SessionInitEntry = {
 			type: "session_init",
 			id: generateId(this.#byId),
@@ -3971,6 +4084,7 @@ export class SessionManager {
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
 	): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			id: generateId(this.#byId),
@@ -3990,6 +4104,7 @@ export class SessionManager {
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
@@ -4009,6 +4124,7 @@ export class SessionManager {
 	 * available for diagnostics/export.
 	 */
 	appendContextClearEntry(data?: Record<string, unknown>): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: CustomEntry = {
 			type: "custom",
 			customType: "context_clear",
@@ -4029,6 +4145,9 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
+		this.#assertStrictPersistenceOpen();
+		if (this.#strictResume) throw new Error("Strict resume cannot rewrite session history");
+
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
 			if (canonical?.type !== "message") continue;
@@ -4048,6 +4167,7 @@ export class SessionManager {
 	 * Use sparingly (e.g., pruning old tool outputs).
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.#assertStrictPersistenceOpen();
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
 	}
@@ -4068,6 +4188,7 @@ export class SessionManager {
 		details?: T,
 		attribution: MessageAttribution = "agent",
 	): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
@@ -4096,6 +4217,7 @@ export class SessionManager {
 	 * @returns Entry id
 	 */
 	appendMCPToolSelection(selectedToolNames: string[]): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: MCPToolSelectionEntry = {
 			type: "mcp_tool_selection",
 			id: generateId(this.#byId),
@@ -4113,6 +4235,7 @@ export class SessionManager {
 	 * @returns Entry id
 	 */
 	appendTtsrInjection(ruleNames: string[], records?: TtsrInjectionRecord[], ttsrMessageCount?: number): string {
+		this.#assertStrictPersistenceOpen();
 		const entry: TtsrInjectionEntry = {
 			type: "ttsr_injection",
 			id: generateId(this.#byId),
@@ -4192,6 +4315,8 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
+		this.#assertStrictPersistenceOpen();
+		if (this.#strictResume) throw new Error("Strict resume cannot rewrite session history");
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);
 		if (!firstKept) throw new Error(`Entry ${firstKeptEntryId} not found`);
@@ -4438,6 +4563,7 @@ export class SessionManager {
 	 * Pass undefined or empty string to clear the label.
 	 */
 	appendLabelChange(targetId: string, label: string | undefined): string {
+		this.#assertStrictPersistenceOpen();
 		if (!this.#byId.has(targetId)) {
 			throw new Error(`Entry ${targetId} not found`);
 		}
@@ -4555,6 +4681,7 @@ export class SessionManager {
 	}
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
+		this.#assertStrictPersistenceOpen();
 		let didSanitize = false;
 		for (const entry of this.#fileEntries) {
 			if (entry.type !== "message" || entry.message.role !== "assistant") {
@@ -4582,7 +4709,7 @@ export class SessionManager {
 	 */
 	getHeader(): SessionHeader | null {
 		const h = this.#fileEntries.find(e => e.type === "session");
-		return h ? (h as SessionHeader) : null;
+		return h ? { ...(h as SessionHeader) } : null;
 	}
 
 	/**
@@ -4703,6 +4830,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this.#assertStrictPersistenceOpen();
 		if (!this.#byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -4716,6 +4844,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this.#assertStrictPersistenceOpen();
 		this.#leafId = null;
 		this.#leafRevision++;
 	}
@@ -4726,6 +4855,7 @@ export class SessionManager {
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromExtension?: boolean): string {
+		this.#assertStrictPersistenceOpen();
 		if (branchFromId !== null && !this.#byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -4750,6 +4880,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		if (this.#strictResume) throw new Error("Strict resume cannot create a branched session");
 		const previousSessionFile = this.#sessionFile;
 		const branchPath = this.#getCanonicalBranchClones(leafId);
 		if (branchPath.length === 0) {
@@ -4810,6 +4941,9 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 			this.storage.writeTextSync(newSessionFile, `${lines.join("\n")}\n`);
+			// The branch file is complete; retire the writer captured by any snapshot
+			// before publishing the new session identity.
+			this.#closePersistWriterInternalSync();
 			this.#sessionId = newSessionId;
 			this.#sessionFile = newSessionFile;
 			this.#resetResidentTextBlobStore();
@@ -5014,4 +5148,93 @@ export class SessionManager {
 			return [];
 		}
 	}
+	static async [strictSessionBootstrap](
+		filePath: string,
+		storage: SessionStorage,
+		authorization: StrictHeldProtocolAuthorization,
+	): Promise<SessionManager> {
+		let capability: StrictHeldSessionCapability;
+		try {
+			capability = consumeStrictHeldProtocolAuthorization(authorization);
+		} catch {
+			throw new Error("Strict resume requires a validated protocol authorization");
+		}
+		if (!path.isAbsolute(filePath) || !strictHeldSessionMatches(capability, filePath, storage)) {
+			await closeStrictHeldSessionCapability(capability).catch(() => undefined);
+			throw new Error("Strict resume capability does not match requested session");
+		}
+		const pinned = consumeStrictHeldSessionCapability(capability);
+		try {
+			const header = pinned.header;
+			if (
+				header.type !== "session" ||
+				!(pinned.storage instanceof FileSessionStorage) ||
+				!isCanonicalStrictSessionId(header.id) ||
+				header.version !== CURRENT_SESSION_VERSION ||
+				!isCanonicalStrictSessionId(pinned.sessionId) ||
+				header.id !== pinned.sessionId ||
+				typeof header.cwd !== "string" ||
+				!path.isAbsolute(header.cwd)
+			) {
+				throw new Error("Strict resume requires a valid current session header");
+			}
+			const entries = parseSessionEntries(pinned.content);
+			const parsedHeader = entries[0] as SessionHeader | undefined;
+			if (
+				parsedHeader?.type !== "session" ||
+				!isCanonicalStrictSessionId(parsedHeader.id) ||
+				parsedHeader.id !== pinned.sessionId ||
+				parsedHeader.cwd !== header.cwd ||
+				parsedHeader.version !== CURRENT_SESSION_VERSION
+			) {
+				throw new Error("Strict resume requires a valid current session header");
+			}
+			const manager = new SessionManager(header.cwd, path.dirname(pinned.sessionPath), true, pinned.storage, false);
+			manager.#strictResume = true;
+			manager.#sessionFile = pinned.sessionPath;
+			manager.#sessionId = pinned.sessionId;
+			manager.#sessionName = parsedHeader.title;
+			manager.#titleSource = parsedHeader.titleSource;
+			manager.#fileEntries = entries;
+			await resolveBlobRefsInEntries(manager.#fileEntries, manager.#blobStore);
+			manager.#resetResidentTextBlobStore();
+			manager.#fileEntries = manager.#fileEntries.map(entry =>
+				prepareEntryForResidentSync(entry, manager.#residentBlobStores()),
+			);
+			manager.#buildIndex();
+			manager.#persistWriter = new NdjsonFileWriter(manager.storage, manager.#sessionFile, {
+				writer: pinned.writer,
+				onError: err => manager.#recordPersistError(err),
+			});
+			manager.#persistWriterPath = manager.#sessionFile;
+			manager.#flushed = true;
+			manager.#ensuredOnDisk = true;
+			manager.#bumpAllRevisions();
+			return manager;
+		} catch (error) {
+			await pinned.writer.close().catch(() => undefined);
+			throw error;
+		}
+	}
+}
+async function bootstrapStrictSession(
+	filePath: string,
+	storage: SessionStorage,
+	authorization: StrictHeldProtocolAuthorization,
+): Promise<SessionManager> {
+	return SessionManager[strictSessionBootstrap](filePath, storage, authorization);
+}
+function isCanonicalStrictSessionId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length === 36 &&
+		/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+	);
+}
+export async function openStrictSessionForMain(
+	filePath: string,
+	storage: SessionStorage,
+	authorization: StrictHeldProtocolAuthorization,
+): Promise<SessionManager> {
+	return bootstrapStrictSession(filePath, storage, authorization);
 }

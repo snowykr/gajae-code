@@ -1,9 +1,14 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { classifyStrictFs, type StrictFsResult } from "@gajae-code/natives";
 import { isEnoent, peekFile, toError } from "@gajae-code/utils";
 
 const utf8Decoder = new TextDecoder("utf-8");
+export type StrictFsClassifier = (fd: number) => StrictFsResult;
+function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
 
 export interface SessionStorageStat {
 	size: number;
@@ -26,6 +31,91 @@ export interface SessionStorageWriter {
 	close(): Promise<void>;
 	getError(): Error | undefined;
 }
+const strictHeldSessionCapabilities = new WeakSet<object>();
+const strictHeldSessionData = new WeakMap<
+	object,
+	{
+		content: string;
+		sessionId: string;
+		sessionPath: string;
+		storage: SessionStorage;
+		header: Record<string, unknown>;
+		writer: SessionStorageWriter;
+		consumed: boolean;
+	}
+>();
+
+declare const strictHeldSessionCapabilityBrand: unique symbol;
+export interface StrictHeldSessionCapability {
+	readonly [strictHeldSessionCapabilityBrand]: true;
+}
+
+function createStrictHeldSessionCapability(
+	sessionPath: string,
+	storage: SessionStorage,
+	content: string,
+	sessionId: string,
+	header: Record<string, unknown>,
+	writer: SessionStorageWriter,
+): StrictHeldSessionCapability {
+	const capability = {};
+	strictHeldSessionCapabilities.add(capability);
+	strictHeldSessionData.set(capability, {
+		content,
+		sessionId,
+		sessionPath,
+		storage,
+		header: Object.freeze({ ...header }),
+		writer,
+		consumed: false,
+	});
+	return capability as unknown as StrictHeldSessionCapability;
+}
+
+export function strictHeldSessionId(capability: StrictHeldSessionCapability): string {
+	if (!strictHeldSessionCapabilities.has(capability)) throw new Error("Invalid strict held-session capability");
+	const data = strictHeldSessionData.get(capability);
+	if (!data || data.consumed) throw new Error("Strict held-session capability was already consumed");
+	return data.sessionId;
+}
+
+export function consumeStrictHeldSessionCapability(capability: StrictHeldSessionCapability): {
+	content: string;
+	sessionId: string;
+	sessionPath: string;
+	storage: SessionStorage;
+	header: Record<string, unknown>;
+	writer: SessionStorageWriter;
+} {
+	if (!strictHeldSessionCapabilities.has(capability)) throw new Error("Invalid strict held-session capability");
+	const data = strictHeldSessionData.get(capability);
+	if (!data || data.consumed) throw new Error("Strict held-session capability was already consumed");
+	data.consumed = true;
+	return {
+		content: data.content,
+		sessionId: data.sessionId,
+		sessionPath: data.sessionPath,
+		storage: data.storage,
+		header: data.header,
+		writer: data.writer,
+	};
+}
+
+export function strictHeldSessionMatches(
+	capability: StrictHeldSessionCapability,
+	sessionPath: string,
+	storage: SessionStorage,
+): boolean {
+	if (!strictHeldSessionCapabilities.has(capability)) throw new Error("Invalid strict held-session capability");
+	const data = strictHeldSessionData.get(capability);
+	if (!data || data.consumed) throw new Error("Strict held-session capability was already consumed");
+	return data.sessionPath === path.resolve(sessionPath) && data.storage === storage;
+}
+
+export async function closeStrictHeldSessionCapability(capability: StrictHeldSessionCapability): Promise<void> {
+	const pinned = consumeStrictHeldSessionCapability(capability);
+	await pinned.writer.close();
+}
 
 export interface SessionStorage {
 	ensureDirSync(dir: string): void;
@@ -45,6 +135,7 @@ export interface SessionStorage {
 	unlinkSync(path: string): void;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter;
+	pinStrictSession(path: string): StrictHeldSessionCapability;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -62,18 +153,25 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
 
-	constructor(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }) {
+	constructor(fpath: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void; fd?: number }) {
 		this.#onError = options?.onError;
-		const flags = options?.flags ?? "a";
-		// Ensure parent directory exists
-		const dir = path.dirname(fpath);
-		if (!fs.existsSync(dir)) {
-			fs.mkdirSync(dir, { recursive: true });
+		if (options?.fd !== undefined) {
+			this.#fd = options.fd;
+		} else {
+			const flags = options?.flags ?? "a";
+			// Ensure parent directory exists
+			const dir = path.dirname(fpath);
+			if (!fs.existsSync(dir)) {
+				fs.mkdirSync(dir, { recursive: true });
+			}
+			// Open file once, keep fd for lifetime
+			this.#fd = fs.openSync(fpath, flags === "w" ? "w" : "a");
 		}
-		// Open file once, keep fd for lifetime
-		this.#fd = fs.openSync(fpath, flags === "w" ? "w" : "a");
 		// Register for cleanup if abandoned without close()
 		writerRegistry.register(this, this.#fd, this);
+	}
+	static fromExistingFd(fd: number, onError?: (err: Error) => void): FileSessionStorageWriter {
+		return new FileSessionStorageWriter("", { fd, onError });
 	}
 
 	#recordError(err: unknown): Error {
@@ -138,6 +236,13 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 }
 
 export class FileSessionStorage implements SessionStorage {
+	#classifyStrictFs: StrictFsClassifier;
+	#platform: NodeJS.Platform;
+
+	constructor(options?: { classifyStrictFs?: StrictFsClassifier; platform?: NodeJS.Platform }) {
+		this.#classifyStrictFs = options?.classifyStrictFs ?? classifyStrictFs;
+		this.#platform = options?.platform ?? process.platform;
+	}
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
@@ -218,6 +323,100 @@ export class FileSessionStorage implements SessionStorage {
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
 		return new FileSessionStorageWriter(path, options);
+	}
+	openExistingWriter(fpath: string): {
+		content: string;
+		sessionId: string;
+		header: Record<string, unknown>;
+		writer: SessionStorageWriter;
+	} {
+		return this.#openExistingWriter(fpath);
+	}
+	pinStrictSession(fpath: string): StrictHeldSessionCapability {
+		const normalizedPath = path.resolve(fpath);
+		const pinned = this.#openExistingWriter(normalizedPath);
+		return createStrictHeldSessionCapability(
+			normalizedPath,
+			this,
+			pinned.content,
+			pinned.sessionId,
+			pinned.header,
+			pinned.writer,
+		);
+	}
+	#openExistingWriter(fpath: string): {
+		content: string;
+		sessionId: string;
+		header: Record<string, unknown>;
+		writer: SessionStorageWriter;
+	} {
+		if (this.#platform !== "linux" && this.#platform !== "darwin") {
+			throw new Error("Strict resume requires Linux or Darwin");
+		}
+		const sessionPathStat = fs.lstatSync(fpath);
+		if (!sessionPathStat.isFile()) throw new Error("Strict resume requires a regular session file");
+		const fd = fs.openSync(fpath, fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
+		let parentFd: number | undefined;
+		try {
+			const sessionFdStat = fs.fstatSync(fd);
+			if (!sessionFdStat.isFile() || !sameFileIdentity(sessionPathStat, sessionFdStat)) {
+				throw new Error("Strict resume session path changed during open");
+			}
+
+			const parentPath = path.dirname(fpath);
+			const parentPathStat = fs.lstatSync(parentPath);
+			if (!parentPathStat.isDirectory()) throw new Error("Strict resume requires a regular parent directory");
+			parentFd = fs.openSync(parentPath, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+			const parentFdStat = fs.fstatSync(parentFd);
+			if (!parentFdStat.isDirectory() || !sameFileIdentity(parentPathStat, parentFdStat)) {
+				throw new Error("Strict resume parent path changed during open");
+			}
+
+			if (this.#platform === "darwin") {
+				const strictFs = this.#classifyStrictFs(parentFd);
+				if (
+					typeof strictFs !== "object" ||
+					strictFs === null ||
+					strictFs.state !== "classified" ||
+					strictFs.platform !== "darwin" ||
+					strictFs.f_fstypename !== "apfs"
+				) {
+					throw new Error("Strict resume requires an APFS session directory");
+				}
+			}
+
+			const content = fs.readFileSync(fd, "utf8");
+			const firstLine = content.split("\n", 1)[0];
+			let header: Record<string, unknown>;
+			try {
+				const parsed = JSON.parse(firstLine) as unknown;
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+				header = parsed as Record<string, unknown>;
+			} catch {
+				throw new Error("Strict resume requires a valid session header");
+			}
+			const sessionId = header.id;
+			if (typeof sessionId !== "string" || sessionId.length === 0) {
+				throw new Error("Strict resume requires a valid session header");
+			}
+			fs.closeSync(parentFd);
+			parentFd = undefined;
+			return { content, sessionId, header, writer: FileSessionStorageWriter.fromExistingFd(fd) };
+		} catch (error) {
+			if (parentFd !== undefined) {
+				try {
+					fs.closeSync(parentFd);
+				} catch {
+					// Ignore cleanup errors.
+				}
+			}
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Ignore cleanup errors.
+			}
+			throw error;
+		}
 	}
 
 	/**
@@ -411,5 +610,11 @@ export class MemorySessionStorage implements SessionStorage {
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
 		return new MemorySessionStorageWriter(this, path, options);
+	}
+	openExistingWriter(_path: string): { content: string; writer: SessionStorageWriter } {
+		throw new Error("Strict resume requires filesystem session storage");
+	}
+	pinStrictSession(_path: string): StrictHeldSessionCapability {
+		throw new Error("Strict resume requires filesystem session storage");
 	}
 }
