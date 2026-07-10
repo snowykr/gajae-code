@@ -246,17 +246,20 @@ explicitly enabled.
 
 When the dormant command endpoint is enabled for an internal deployment,
 `setDefaultModelSelection(sessionId, provider, modelId, thinkingLevel)` sends
-the same ordered durable operation as RPC. It requires the `model` scope and a
-concrete reasoning level; Bridge command scheduling preserves its arrival order
-even when requests use different idempotency keys.
+the same atomic durable operation as RPC. It requires the `model` scope and a
+concrete reasoning level. The command route reserves mutation order when each
+authenticated request arrives, before reading its body, so differently sized
+requests and different idempotency keys cannot reorder admitted mutations.
+The helper returns the canonical `BridgeResolvedModelSelection`; malformed
+success payloads are rejected, and a legacy server's unsupported-command or
+HTTP failure is surfaced explicitly.
 
 `BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth, the `control` scope on the (by-default-disabled) `ui-responses` endpoint, and the current controller owner token; unauthorized owner-token attempts return `403 not_controller` without resolving the gate.
 
-> Response typing: in this experimental version, `command()` and the typed
-> command helpers return `Promise<unknown>`. Callers narrow the response
-> themselves. Importing `@gajae-code/coding-agent` internal `rpc-types` into the
-> SDK is intentionally avoided to preserve the package boundary; stable shared
-> protocol response types are tracked as follow-up work.
+> Response typing: `setDefaultModelSelection()` is typed as
+> `Promise<BridgeResolvedModelSelection>`. The generic `command()` method and
+> most other command helpers still return `Promise<unknown>`, so callers narrow
+> those responses themselves.
 
 ## Limitations
 

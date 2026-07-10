@@ -147,10 +147,10 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 ### `set_default_model_selection` payload
 
 Persists and activates the default model and a concrete reasoning level as one
-ordered operation. The model must be available in the current working
-directory, including its `enabledModels` rules, and its provider credentials
-must already be configured. `inherit` is not accepted because the persisted
-selection must be unambiguous across restarts.
+atomic operation. Admission uses the effective model scope for the current
+working directory, including path-scoped `enabledModels` rules, and requires
+configured credentials for the selected provider. `inherit` is not accepted
+because the persisted selection must be unambiguous across restarts.
 
 On success the response returns the exact committed tuple:
 
@@ -168,11 +168,22 @@ On success the response returns the exact committed tuple:
 }
 ```
 
-Validation and persistence failures leave the live and durable defaults
-unchanged. A successful durable commit remains authoritative if a later session
-history append fails, so the live tuple and the next process start still agree.
-The existing `set_model` and `set_thinking_level` commands remain session-only
-operations and are unchanged.
+Validation and pre-replacement persistence failures leave the live and durable
+defaults unchanged. Once the settings replacement linearizes at rename, it
+remains authoritative if a later session-history append fails, so the live tuple
+and the next process start still agree.
+The settings commit preserves unrelated configuration, including credential
+fields, by writing an exclusively created mode-`0600` temporary sibling,
+fsyncing that file before atomic rename, and requesting a parent-directory fsync
+afterward. These steps define the replacement boundary; they do not guarantee
+survival across every filesystem or machine crash.
+
+The existing commands are unchanged: `set_model` continues to activate the
+model and persist the default model-role selection, while `set_thinking_level`
+remains session-scoped. TypeScript `setDefaultModelSelection()` returns the
+canonical `RpcResolvedModelSelection`. It rejects malformed success payloads,
+and an older server that does not support the command surfaces its explicit
+command failure instead of being treated as success.
 
 
 By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.

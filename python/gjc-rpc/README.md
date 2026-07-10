@@ -72,7 +72,9 @@ with RpcClient(model="openrouter/anthropic/claude-sonnet-4.6", no_session=True) 
 phases, and `get_state().todo_phases` returns the typed current todo state.
 
 To change both the active selection and the defaults restored by later
-processes, use the atomic helper instead of separate session-only setters:
+processes, use the atomic helper. Unlike `set_thinking_level()`, which is
+session-scoped, the existing `set_model()` also retains its durable default-role
+behavior.
 
 ```python
 selection = client.set_default_model_selection(
@@ -84,8 +86,13 @@ print(selection.provider, selection.model_id, selection.thinking_level)
 ```
 
 The reasoning level must be concrete (`off`, `minimal`, `low`, `medium`,
-`high`, `xhigh`, or `max`); `inherit` is intentionally rejected. The call only
-returns after the tuple is durably committed and active.
+`high`, `xhigh`, or `max`); `inherit` is intentionally rejected. Model admission
+uses the effective scope for the client's working directory, including
+path-scoped `enabledModels`, and requires configured provider credentials. The
+call returns a typed `ResolvedModelSelection` only after the settings replacement
+completes and the tuple is active. A malformed success payload raises
+`ValueError`; an older server's unsupported-command response remains an explicit
+`RpcCommandError`.
 
 By default the client runs:
 

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added an ordered `set_default_model_selection` RPC command and typed TypeScript, Bridge, and Python client helpers that atomically persist and activate one validated model/reasoning tuple.
+- Added the durable, atomic `set_default_model_selection` RPC operation with typed TypeScript, Bridge, and Python helpers for committing and activating one validated default model/reasoning tuple.
 
 ### Changed
 
