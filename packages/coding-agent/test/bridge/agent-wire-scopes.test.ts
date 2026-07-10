@@ -106,4 +106,14 @@ describe("agent-wire RPC command scopes", () => {
 		expect(scopeForRpcCommand("set_host_uri_schemes")).toBe("host_uri");
 		expect(scopeForRpcCommand("handoff")).toBe("admin");
 	});
+
+	it("requires model scope for durable default selection", () => {
+		// Given tokens with and without the model capability.
+		const controlOnly = new Set<BridgeCommandScope>(["control"]);
+		const model = new Set<BridgeCommandScope>(["model"]);
+
+		// When/Then authorization is checked, only model scope grants the command.
+		expect(isRpcCommandAllowed("set_default_model_selection", controlOnly)).toBe(false);
+		expect(isRpcCommandAllowed("set_default_model_selection", model)).toBe(true);
+	});
 });

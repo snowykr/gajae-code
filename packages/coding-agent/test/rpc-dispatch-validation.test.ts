@@ -21,6 +21,24 @@ function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
 
 describe("dispatchRpcCommand validation + error correlation", () => {
 	test("rejects inherited and malformed default selections at the raw boundary", () => {
+		// Given malformed values for each field owned by the command.
+		const malformedSelections: readonly unknown[] = [
+			{
+				type: "set_default_model_selection",
+				provider: 42,
+				modelId: "claude-sonnet-4-6",
+				thinkingLevel: "off",
+			},
+			{
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: null,
+				thinkingLevel: "off",
+			},
+		];
+
+		// When/Then the raw boundary validates those fields before dispatch.
+		for (const command of malformedSelections) expect(isRpcCommand(command)).toBe(false);
 		expect(
 			isRpcCommand({
 				type: "set_default_model_selection",
@@ -68,6 +86,31 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 		});
 	});
 
+	test("keeps set_model on the durable default-role setter path", async () => {
+		// Given an available model and a session seam that records optional setter arguments.
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!model) throw new Error("Expected bundled anthropic model");
+		let selectedModel: unknown;
+		let selectedRole: string | undefined = "not-called";
+
+		// When the legacy raw command is dispatched.
+		const res = await dispatchRpcCommand(
+			{ id: "model-1", type: "set_model", provider: model.provider, modelId: model.id },
+			ctx({
+				getAvailableModels: () => [model],
+				setModel: async (nextModel, role) => {
+					selectedModel = nextModel;
+					selectedRole = role;
+				},
+			}),
+		);
+
+		// Then dispatch still delegates without overriding setModel's durable default role.
+		expect(res.success).toBe(true);
+		expect(selectedModel).toBe(model);
+		expect(selectedRole).toBeUndefined();
+	});
+
 	test("rejects an invalid thinking level with a correlated error (issue 02)", async () => {
 		const res = await dispatchRpcCommand(
 			{ id: "t1", type: "set_thinking_level", level: "BOGUS" } as unknown as RpcCommand,
@@ -97,18 +140,26 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 		expect(res.command).toBe("set_interrupt_mode");
 	});
 
-	test("applies a valid thinking level", async () => {
+	test("applies a valid thinking level only to the current session", async () => {
+		// Given a session seam that records whether durable persistence was requested.
 		let applied: unknown;
+		let persistArgument: boolean | undefined = true;
+
+		// When the raw session thinking command is dispatched.
 		const res = await dispatchRpcCommand(
 			{ id: "t2", type: "set_thinking_level", level: ThinkingLevel.High },
 			ctx({
-				setThinkingLevel: ((level: unknown) => {
+				setThinkingLevel: ((level: unknown, persist?: boolean) => {
 					applied = level;
+					persistArgument = persist;
 				}) as AgentSession["setThinkingLevel"],
 			}),
 		);
+
+		// Then the level is applied without opting into durable settings persistence.
 		expect(res.success).toBe(true);
 		expect(applied).toBe(ThinkingLevel.High);
+		expect(persistArgument).toBeUndefined();
 	});
 
 	test("a handler exception is correlated to the request id and real command, not 'parse' (issue 01)", async () => {

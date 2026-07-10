@@ -183,6 +183,35 @@ describe("createRpcCommandScheduler ordering behavior", () => {
 		expect(order).toEqual(["bash", "set_model"]);
 	});
 
+	test("set_default_model_selection cannot overtake earlier ordered work", async () => {
+		// Given an in-flight ordered command that holds the serial chain.
+		const order: string[] = [];
+		const { promise: longRunning, resolve: releaseLong } = Promise.withResolvers<void>();
+		const run = async (command: RpcCommand): Promise<void> => {
+			if (command.type === "bash") {
+				await longRunning;
+			}
+			order.push(command.type);
+		};
+		const { dispatch } = createRpcCommandScheduler(run, () => {});
+
+		// When the durable default selection arrives behind that work.
+		dispatch({ type: "bash", command: "sleep 1000" } as RpcCommand);
+		dispatch({
+			type: "set_default_model_selection",
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-6",
+			thinkingLevel: "off",
+		} as RpcCommand);
+		await flushMicrotasks();
+
+		// Then it stays queued until the earlier command completes.
+		expect(order).toEqual([]);
+		releaseLong();
+		await flushMicrotasks();
+		expect(order).toEqual(["bash", "set_default_model_selection"]);
+	});
+
 	test("a mutating setter does not overtake an earlier queued ordered command (#618)", async () => {
 		const order: string[] = [];
 		let releaseLong: () => void = () => {};
