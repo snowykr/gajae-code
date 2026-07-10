@@ -6880,6 +6880,17 @@ export class AgentSession {
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		const projectDefaults = [
+			this.settings.getProject("modelProfile.default") !== undefined ? "modelProfile.default" : undefined,
+			this.settings.getProject("modelRoles")?.default !== undefined ? "modelRoles.default" : undefined,
+		].filter((path): path is string => path !== undefined);
+		if (projectDefaults.length > 0) {
+			throw new Error(
+				`Cannot set the durable default model while project settings define authoritative defaults: ${projectDefaults.join(
+					", ",
+				)}. Remove the project-owned defaults first.`,
+			);
+		}
 
 		const previousEditMode = this.#resolveActiveEditMode();
 		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);

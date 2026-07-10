@@ -5,6 +5,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { applyStartupModelProfiles } from "@gajae-code/coding-agent/main";
 import type { RpcResponse } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 import { dispatchRpcCommand } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -17,6 +18,7 @@ describe("durable default model selection", () => {
 	let tempDir: TempDir;
 	let session: AgentSession | undefined;
 	let authStorage: AuthStorage | undefined;
+	let modelRegistry: ModelRegistry | undefined;
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync("@gjc-default-selection-");
@@ -51,7 +53,7 @@ describe("durable default model selection", () => {
 		});
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -60,6 +62,11 @@ describe("durable default model selection", () => {
 		});
 		session.setThinkingLevel(Effort.High);
 		return session;
+	}
+
+	function requireModelRegistry(): ModelRegistry {
+		if (!modelRegistry) throw new Error("Expected model registry");
+		return modelRegistry;
 	}
 
 	it("persists and applies one canonical model/thinking tuple", async () => {
@@ -248,19 +255,16 @@ describe("durable default model selection", () => {
 		expect(activeSession.getActiveModelProfile()).toBeUndefined();
 	});
 
-	it("does not materialize repository profile settings into the global default", async () => {
+	it("rejects a project-owned default role without mutating session or global settings", async () => {
 		// Given
 		const projectDir = path.join(tempDir.path(), "project");
-		const otherDir = path.join(tempDir.path(), "other");
 		const agentDir = path.join(tempDir.path(), "agent");
 		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
-		await fs.promises.mkdir(otherDir, { recursive: true });
 		await fs.promises.mkdir(agentDir, { recursive: true });
 		await Bun.write(
 			path.join(agentDir, "config.yml"),
 			YAML.stringify({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: "global/smol" },
-				modelProfile: { default: "global-profile" },
 				task: { agentModelOverrides: { critic: "global/critic" } },
 			}),
 		);
@@ -268,23 +272,88 @@ describe("durable default model selection", () => {
 			path.join(projectDir, ".gjc", "settings.json"),
 			JSON.stringify({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: "repository/smol" },
-				modelProfile: { default: "repository-profile" },
 				task: { agentModelOverrides: { executor: "repository/executor" } },
 			}),
 		);
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		const activeSession = await createSession(settings, false);
 		const selected = model("claude-sonnet-4-6");
+		const globalBefore = await Bun.file(path.join(agentDir, "config.yml")).text();
 
 		// When
-		await activeSession.setDefaultModelSelection(selected, Effort.Low);
-		resetSettingsForTest();
-		const freshSettings = await Settings.init({ cwd: otherDir, agentDir });
+		await expect(activeSession.setDefaultModelSelection(selected, Effort.Low)).rejects.toThrow(
+			"project settings define authoritative defaults: modelRoles.default",
+		);
 
 		// Then
-		expect(freshSettings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}:low`);
-		expect(freshSettings.getModelRole("smol")).toBe("global/smol");
-		expect(freshSettings.get("task.agentModelOverrides")).toEqual({ critic: "global/critic" });
-		expect(freshSettings.get("modelProfile.default")).toBe("global-profile");
+		expect(activeSession.model).toEqual(model("claude-sonnet-4-5"));
+		expect(activeSession.thinkingLevel).toBe(Effort.High);
+		expect(await Bun.file(path.join(agentDir, "config.yml")).text()).toBe(globalBefore);
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-5:high");
+	});
+
+	it("rejects a project-owned default profile that would override the tuple on same-project restart", async () => {
+		// Given: normal startup applies the project-owned profile in this cwd.
+		const projectDir = path.join(tempDir.path(), "project");
+		const agentDir = path.join(tempDir.path(), "agent");
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ modelRoles: { default: "anthropic/claude-sonnet-4-5:high" } }),
+		);
+		await Bun.write(
+			path.join(projectDir, ".gjc", "settings.json"),
+			JSON.stringify({ modelProfile: { default: "claude-opus" } }),
+		);
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const activeSession = await createSession(settings, false);
+		const startupRegistry = requireModelRegistry();
+		const refreshSpy = spyOn(startupRegistry, "refresh").mockImplementation(async () => {});
+		try {
+			await applyStartupModelProfiles({
+				session: activeSession,
+				settings,
+				modelRegistry: startupRegistry,
+				parsedArgs: {},
+			});
+		} finally {
+			refreshSpy.mockRestore();
+		}
+		expect(activeSession.model).toEqual(model("claude-opus-4-8"));
+		const globalBefore = await Bun.file(path.join(agentDir, "config.yml")).text();
+
+		// When: the durable command must not report success for a tuple the project will replace.
+		await expect(activeSession.setDefaultModelSelection(model("claude-sonnet-4-6"), Effort.Low)).rejects.toThrow(
+			"project settings define authoritative defaults: modelProfile.default",
+		);
+
+		// Then: no state changed, and a real same-cwd restart still applies the authoritative profile.
+		expect(activeSession.model).toEqual(model("claude-opus-4-8"));
+		expect(activeSession.thinkingLevel).toBe(Effort.XHigh);
+		expect(activeSession.getActiveModelProfile()).toBe("claude-opus");
+		expect(await Bun.file(path.join(agentDir, "config.yml")).text()).toBe(globalBefore);
+		await activeSession.dispose();
+		session = undefined;
+		authStorage?.close();
+		authStorage = undefined;
+		resetSettingsForTest();
+
+		const restartedSettings = await Settings.init({ cwd: projectDir, agentDir });
+		const restartedSession = await createSession(restartedSettings, false);
+		const restartedRegistry = requireModelRegistry();
+		const restartRefreshSpy = spyOn(restartedRegistry, "refresh").mockImplementation(async () => {});
+		try {
+			await applyStartupModelProfiles({
+				session: restartedSession,
+				settings: restartedSettings,
+				modelRegistry: restartedRegistry,
+				parsedArgs: {},
+			});
+		} finally {
+			restartRefreshSpy.mockRestore();
+		}
+		expect(restartedSession.model).toEqual(model("claude-opus-4-8"));
+		expect(restartedSession.thinkingLevel).toBe(Effort.XHigh);
 	});
 });

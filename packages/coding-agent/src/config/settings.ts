@@ -315,6 +315,11 @@ export class Settings {
 		return value === undefined ? undefined : (value as SettingValue<P>);
 	}
 
+	getProject<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#project, path.split("."));
+		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
 	has(path: SettingPath): boolean {
 		return getByPath(this.#merged, path.split(".")) !== undefined;
