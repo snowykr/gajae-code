@@ -124,6 +124,14 @@ describe("RpcClient UDS transport", () => {
 			const [state, tools] = await Promise.all([client.getState(), client.setCustomTools([hostEchoTool])]);
 			expect(state.sessionId).toBeTruthy();
 			expect(tools).toContain("host_echo");
+			await expect(
+				client.setDefaultModelSelection({
+					provider: "rpc-test",
+					modelId: "rpc-test-model",
+					thinkingLevel: "off",
+				}),
+			).resolves.toEqual({ provider: "rpc-test", modelId: "rpc-test-model", thinkingLevel: "off" });
+			expect((await client.getState()).thinkingLevel).toBe("off");
 			expect(Array.isArray(await client.getPendingWorkflowGates())).toBe(true);
 			await expect(client.respondGate("wg_missing", "approve", "k1")).rejects.toThrow(
 				/workflow gates are not available|no pending gate|not negotiated|not available/i,
@@ -142,6 +150,7 @@ describe("RpcClient UDS transport", () => {
 			const reconnect = new RpcClient({ transport: "uds", socketPath });
 			await reconnect.start();
 			expect((await reconnect.getState()).sessionId).toBe(state.sessionId);
+			expect((await reconnect.getState()).thinkingLevel).toBe("off");
 			reconnect.stop();
 		} finally {
 			proc.kill();

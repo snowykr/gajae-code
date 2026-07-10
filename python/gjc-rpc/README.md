@@ -71,6 +71,22 @@ with RpcClient(model="openrouter/anthropic/claude-sonnet-4.6", no_session=True) 
 `set_todos()` accepts either a flat list of todo strings/items or explicit
 phases, and `get_state().todo_phases` returns the typed current todo state.
 
+To change both the active selection and the defaults restored by later
+processes, use the atomic helper instead of separate session-only setters:
+
+```python
+selection = client.set_default_model_selection(
+    "anthropic",
+    "claude-sonnet-4-6",
+    "high",
+)
+print(selection.provider, selection.model_id, selection.thinking_level)
+```
+
+The reasoning level must be concrete (`off`, `minimal`, `low`, `medium`,
+`high`, `xhigh`, or `max`); `inherit` is intentionally rejected. The call only
+returns after the tuple is durably committed and active.
+
 By default the client runs:
 
 ```bash

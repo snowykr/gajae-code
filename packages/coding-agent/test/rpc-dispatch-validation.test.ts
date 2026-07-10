@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
 import type { RpcCommand } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
 import {
 	dispatchRpcCommand,
 	type RpcCommandDispatchContext,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
+import { isRpcCommand } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-validation";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
 function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
@@ -18,6 +20,54 @@ function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
 }
 
 describe("dispatchRpcCommand validation + error correlation", () => {
+	test("rejects inherited and malformed default selections at the raw boundary", () => {
+		expect(
+			isRpcCommand({
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: "claude-sonnet-4-6",
+				thinkingLevel: "inherit",
+			}),
+		).toBe(false);
+		expect(
+			isRpcCommand({
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: "claude-sonnet-4-6",
+				thinkingLevel: "bogus",
+			}),
+		).toBe(false);
+	});
+
+	test("returns the normalized default selection with request correlation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-6");
+		if (!model) throw new Error("Expected bundled anthropic model");
+		const res = await dispatchRpcCommand(
+			{
+				id: "default-1",
+				type: "set_default_model_selection",
+				provider: model.provider,
+				modelId: model.id,
+				thinkingLevel: "off",
+			},
+			ctx({
+				getAvailableModels: () => [model],
+				setDefaultModelSelection: async () => ({
+					provider: model.provider,
+					modelId: model.id,
+					thinkingLevel: "off",
+				}),
+			}),
+		);
+		expect(res).toEqual({
+			id: "default-1",
+			type: "response",
+			command: "set_default_model_selection",
+			success: true,
+			data: { provider: model.provider, modelId: model.id, thinkingLevel: "off" },
+		});
+	});
+
 	test("rejects an invalid thinking level with a correlated error (issue 02)", async () => {
 		const res = await dispatchRpcCommand(
 			{ id: "t1", type: "set_thinking_level", level: "BOGUS" } as unknown as RpcCommand,

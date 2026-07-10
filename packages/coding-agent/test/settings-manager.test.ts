@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -235,6 +235,82 @@ describe("Settings", () => {
 				executor: "persisted/executor",
 				planner: "user/planner:high",
 			});
+		});
+	});
+
+	describe("request-scoped durable commits", () => {
+		it("restores the committed model/thinking tuple from fresh settings", async () => {
+			await writeSettings({ theme: { dark: "initial-dark" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			await settings.commitDurable({
+				defaultThinkingLevel: Effort.Low,
+				modelRoles: { default: "anthropic/claude-sonnet-4-6:low" },
+			});
+
+			resetSettingsForTest();
+			const freshSettings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(freshSettings.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(freshSettings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-6:low");
+		});
+
+		it("keeps unrelated dirty paths retryable when a durable candidate fails", async () => {
+			await writeSettings({ theme: { dark: "initial-dark" }, modelRoles: { default: "initial/model" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("theme.dark", "pending-dark");
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (String(target).endsWith(".tmp")) throw new Error("forced durable candidate failure");
+				const lockMetadata = String(data);
+				await fs.promises.writeFile(String(target), lockMetadata);
+				return Buffer.byteLength(lockMetadata);
+			});
+
+			try {
+				await expect(settings.commitDurable({ modelRoles: { default: "candidate/model" } })).rejects.toThrow(
+					"forced durable candidate failure",
+				);
+			} finally {
+				writeSpy.mockRestore();
+			}
+			await settings.flush();
+
+			resetSettingsForTest();
+			const freshSettings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(freshSettings.get("theme.dark")).toBe("pending-dark");
+			expect(freshSettings.getModelRole("default")).toBe("initial/model");
+		});
+
+		it("preserves writes made while a durable candidate is linearizing", async () => {
+			await writeSettings({ theme: { dark: "initial-dark" }, modelRoles: { default: "initial/model" } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const realWrite = Bun.write;
+			let blocked = true;
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (blocked && String(target).endsWith(".tmp")) {
+					blocked = false;
+					writeStarted.resolve();
+					await releaseWrite.promise;
+				}
+				return realWrite(String(target), String(data));
+			});
+
+			try {
+				const commit = settings.commitDurable({ modelRoles: { default: "candidate/model" } });
+				await writeStarted.promise;
+				settings.set("theme.dark", "concurrent-dark");
+				releaseWrite.resolve();
+				await commit;
+				await settings.flush();
+			} finally {
+				writeSpy.mockRestore();
+			}
+
+			resetSettingsForTest();
+			const freshSettings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(freshSettings.getModelRole("default")).toBe("candidate/model");
+			expect(freshSettings.get("theme.dark")).toBe("concurrent-dark");
 		});
 	});
 

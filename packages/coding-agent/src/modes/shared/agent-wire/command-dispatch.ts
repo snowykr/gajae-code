@@ -239,6 +239,20 @@ export async function dispatchRpcCommand(
 				return rpcSuccess(id, "set_model", model);
 			}
 
+			case "set_default_model_selection": {
+				const models = session.getAvailableModels();
+				const model = models.find(m => m.provider === command.provider && m.id === command.modelId);
+				if (!model) {
+					return rpcError(
+						id,
+						"set_default_model_selection",
+						`Model not found: ${command.provider}/${command.modelId}`,
+					);
+				}
+				const selection = await session.setDefaultModelSelection(model, command.thinkingLevel);
+				return rpcSuccess(id, "set_default_model_selection", selection);
+			}
+
 			case "cycle_model": {
 				const result = await session.cycleModel();
 				if (!result) {

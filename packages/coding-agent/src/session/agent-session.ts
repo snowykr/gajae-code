@@ -27,6 +27,7 @@ import {
 	type AgentState,
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
+	type ResolvedThinkingLevel,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -143,6 +144,7 @@ import {
 	formatModelString,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveAllowedModels,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
@@ -6851,6 +6853,76 @@ export class AgentSession {
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
 		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	async setDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ResolvedThinkingLevel,
+	): Promise<{ provider: string; modelId: string; thinkingLevel: ResolvedThinkingLevel }> {
+		const effectiveLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+		if (effectiveLevel === undefined) {
+			throw new Error(`Thinking level ${thinkingLevel} is not supported by ${model.provider}/${model.id}`);
+		}
+
+		const allowedModels = await resolveAllowedModels(this.#modelRegistry, this.settings, {
+			usageOrder: this.settings.getStorage()?.getModelUsageOrder(),
+		});
+		if (!allowedModels.some(candidate => modelsAreEqual(candidate, model))) {
+			throw new Error(`Model unavailable for default selection: ${model.provider}/${model.id}`);
+		}
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+		if (!apiKey) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const previousEditMode = this.#resolveActiveEditMode();
+		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);
+		const activeProfile = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
+		const modelRoles = {
+			...(activeProfile ? this.settings.get("modelRoles") : (this.settings.getGlobal("modelRoles") ?? {})),
+			default: selector,
+		};
+		const agentModelOverrides = { ...this.settings.get("task.agentModelOverrides") };
+		await this.settings.commitDurable({
+			defaultThinkingLevel: effectiveLevel,
+			modelRoles,
+			...(activeProfile
+				? {
+						"task.agentModelOverrides": agentModelOverrides,
+						"modelProfile.default": undefined,
+					}
+				: {}),
+		});
+
+		if (activeProfile) {
+			try {
+				this.settings.clearOverride("modelProfile.default");
+				this.settings.override("modelRoles", modelRoles);
+				this.settings.override("task.agentModelOverrides", agentModelOverrides);
+				this.setActiveModelProfile(undefined);
+			} catch (error) {
+				logger.warn("Session: model profile publication failed", { error: String(error) });
+			}
+		}
+
+		this.#clearActiveRetryFallback();
+		this.#setModelWithProviderSessionReset(model);
+		try {
+			this.setThinkingLevel(effectiveLevel);
+		} catch (error) {
+			logger.warn("Session: default thinking log append failed", { error: String(error) });
+		}
+		try {
+			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
+		} catch (error) {
+			logger.warn("Session: default model log append failed", { error: String(error) });
+		}
+		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode).catch(error => {
+			logger.warn("Session: default model edit-mode sync failed", { error: String(error) });
+		});
+
+		return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 	}
 
 	setActiveModelProfile(name: string | undefined): void {

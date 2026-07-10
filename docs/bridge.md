@@ -178,6 +178,7 @@ endpoint matrix, the default handshake advertises no accepted scopes.
 | `get_pending_workflow_gates` | `message:read` |
 | `set_capabilities` | `control` |
 | `set_model` | `model` |
+| `set_default_model_selection` | `model` |
 | `cycle_model` | `model` |
 | `get_available_models` | `model` |
 | `set_thinking_level` | `model` |
@@ -242,6 +243,12 @@ session-control surface remains fail-closed by default, so against an
 unconfigured bridge those helpers should be expected to fail because the server
 endpoint matrix disables the corresponding session endpoints until they are
 explicitly enabled.
+
+When the dormant command endpoint is enabled for an internal deployment,
+`setDefaultModelSelection(sessionId, provider, modelId, thinkingLevel)` sends
+the same ordered durable operation as RPC. It requires the `model` scope and a
+concrete reasoning level; Bridge command scheduling preserves its arrival order
+even when requests use different idempotency keys.
 
 `BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth, the `control` scope on the (by-default-disabled) `ui-responses` endpoint, and the current controller owner token; unauthorized owner-token attempts return `403 not_controller` without resolving the gate.
 

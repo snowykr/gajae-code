@@ -66,6 +66,8 @@ export interface SettingsOptions {
 	overrides?: Partial<Record<SettingPath, unknown>>;
 }
 
+export type DurableSettingsUpdate = Readonly<Partial<Record<SettingPath, unknown>>>;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
 // ═══════════════════════════════════════════════════════════════════════════
@@ -334,6 +336,19 @@ export class Settings {
 	}
 
 	/**
+	 * Commit one request-scoped settings candidate before publishing it to the
+	 * in-memory view. Ordinary dirty paths are included in the same serialized
+	 * write and remain retryable if the candidate cannot be committed.
+	 */
+	async commitDurable(updates: DurableSettingsUpdate): Promise<void> {
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
+		}
+		await this.#startSave(() => this.#commitDurableNow(updates));
+	}
+
+	/**
 	 * Apply runtime overrides (not persisted).
 	 */
 	override<P extends SettingPath>(path: P, value: SettingValue<P>): void {
@@ -367,10 +382,10 @@ export class Settings {
 			this.#saveTimer = undefined;
 		}
 		if (this.#savePromise) {
-			await this.#savePromise;
+			await this.#savePromise.catch(() => undefined);
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow();
+			await this.#startSave(() => this.#saveNow());
 		}
 	}
 
@@ -389,7 +404,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow({ throwOnError: true });
+			await this.#startSave(() => this.#saveNow({ throwOnError: true }));
 		}
 	}
 
@@ -830,10 +845,80 @@ export class Settings {
 		}
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			this.#saveNow().catch(err => {
+			this.#startSave(() => this.#saveNow()).catch(err => {
 				logger.warn("Settings: background save failed", { error: String(err) });
 			});
 		}, 100);
+	}
+
+	#startSave(task: () => Promise<void>): Promise<void> {
+		const previousSave = this.#savePromise ?? Promise.resolve();
+		const savePromise = previousSave.catch(() => undefined).then(task);
+		this.#savePromise = savePromise;
+		savePromise.then(
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+		);
+		return savePromise;
+	}
+
+	async #commitDurableNow(updates: DurableSettingsUpdate): Promise<void> {
+		const modifiedPaths = [...this.#modified];
+		this.#modified.clear();
+		const candidateEntries = Object.entries(updates);
+		if (!this.#persist || !this.#configPath) {
+			for (const [settingPath, value] of candidateEntries) {
+				setByPath(this.#global, settingPath.split("."), value);
+			}
+			this.#rebuildMerged();
+			return;
+		}
+
+		const configPath = this.#configPath;
+		let committed: RawSettings = {};
+		let linearized = false;
+		try {
+			await withFileLock(configPath, async () => {
+				committed = await this.#loadYaml(configPath);
+				for (const modifiedPath of modifiedPaths) {
+					const segments = modifiedPath.split(".");
+					setByPath(committed, segments, getByPath(this.#global, segments));
+				}
+				for (const [settingPath, value] of candidateEntries) {
+					setByPath(committed, settingPath.split("."), value);
+				}
+
+				const tempPath = `${configPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+				try {
+					await Bun.write(tempPath, YAML.stringify(committed, null, 2));
+					await fs.promises.rename(tempPath, configPath);
+					linearized = true;
+				} finally {
+					await fs.promises.rm(tempPath, { force: true }).catch(error => {
+						logger.warn("Settings: temporary durable file cleanup failed", { error: String(error) });
+					});
+				}
+			});
+		} catch (error) {
+			if (!linearized) {
+				for (const modifiedPath of modifiedPaths) this.#modified.add(modifiedPath);
+				throw error;
+			}
+			logger.warn("Settings: post-commit lock reconciliation failed", { error: String(error) });
+		}
+
+		const concurrentPaths = [...this.#modified];
+		for (const concurrentPath of concurrentPaths) {
+			const segments = concurrentPath.split(".");
+			setByPath(committed, segments, getByPath(this.#global, segments));
+		}
+		this.#global = committed;
+		this.#rebuildMerged();
+		if (concurrentPaths.length > 0) this.#queueSave();
 	}
 
 	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {

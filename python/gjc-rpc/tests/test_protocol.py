@@ -12,6 +12,7 @@ from gjc_rpc import (
     GoalUpdatedEvent,
     IrcMessageEvent,
     NoticeEvent,
+    ResolvedModelSelection,
     SessionState,
     SubagentSteerMessageEvent,
     ThinkingLevelChangedEvent,
@@ -24,6 +25,7 @@ from gjc_rpc import (
     assistant_text,
     assistant_text_with_thinking,
     parse_notification,
+    parse_resolved_model_selection,
     parse_session_state,
     parse_workflow_gate,
     parse_workflow_gate_event,
@@ -43,6 +45,20 @@ def _wrapped_event(event: dict) -> dict:
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_resolved_model_selection_rejects_inherit(self) -> None:
+        result = parse_resolved_model_selection(
+            {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "high"}
+        )
+
+        self.assertIsInstance(result, ResolvedModelSelection)
+        self.assertEqual(result.provider, "anthropic")
+        self.assertEqual(result.model_id, "claude-sonnet-4-6")
+        self.assertEqual(result.thinking_level, "high")
+        with self.assertRaises(ValueError):
+            parse_resolved_model_selection(
+                {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "inherit"}
+            )
+
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
             {

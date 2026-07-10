@@ -12,6 +12,7 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 
 Attribution: TypeAlias = Literal["user", "agent"]
 ThinkingLevel: TypeAlias = Literal["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+ResolvedThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
@@ -742,6 +743,13 @@ class ModelCycleResult:
 
 
 @dataclass(slots=True, frozen=True)
+class ResolvedModelSelection:
+    provider: str
+    model_id: str
+    thinking_level: ResolvedThinkingLevel
+
+
+@dataclass(slots=True, frozen=True)
 class ThinkingLevelCycleResult:
     level: ThinkingLevel
 
@@ -1381,6 +1389,20 @@ def parse_model_cycle_result(payload: JsonObject | None) -> ModelCycleResult | N
         model=model,
         thinking_level=cast(ThinkingLevel | None, payload.get("thinkingLevel")),
         is_scoped=bool(payload.get("isScoped", False)),
+    )
+
+
+def parse_resolved_model_selection(payload: JsonObject) -> ResolvedModelSelection:
+    raw_level = payload.get("thinkingLevel")
+    match raw_level:
+        case "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max":
+            thinking_level = raw_level
+        case _:
+            raise ValueError("thinkingLevel must be one of: high, low, max, medium, minimal, off, xhigh")
+    return ResolvedModelSelection(
+        provider=_require_str(payload, "provider"),
+        model_id=_require_str(payload, "modelId"),
+        thinking_level=thinking_level,
     )
 
 

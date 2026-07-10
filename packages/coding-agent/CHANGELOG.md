@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an ordered `set_default_model_selection` RPC command and typed TypeScript, Bridge, and Python client helpers that atomically persist and activate one validated model/reasoning tuple.
+
 ### Changed
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.

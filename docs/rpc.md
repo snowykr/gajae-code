@@ -91,6 +91,7 @@ Important edge behavior from runtime:
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
+- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }`
 - `{ id?, type: "cycle_model" }`
 - `{ id?, type: "get_available_models" }`
 
@@ -142,6 +143,36 @@ All command results use `RpcResponse`:
 - Failure: `{ id?, type: "response", command: string, success: false, error: string | object }`; typed control-plane failures use object-valued errors such as `{ "code": "scope_denied", ... }`.
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
+
+### `set_default_model_selection` payload
+
+Persists and activates the default model and a concrete reasoning level as one
+ordered operation. The model must be available in the current working
+directory, including its `enabledModels` rules, and its provider credentials
+must already be configured. `inherit` is not accepted because the persisted
+selection must be unambiguous across restarts.
+
+On success the response returns the exact committed tuple:
+
+```json
+{
+  "id": "req_3",
+  "type": "response",
+  "command": "set_default_model_selection",
+  "success": true,
+  "data": {
+    "provider": "anthropic",
+    "modelId": "claude-sonnet-4-6",
+    "thinkingLevel": "high"
+  }
+}
+```
+
+Validation and persistence failures leave the live and durable defaults
+unchanged. A successful durable commit remains authoritative if a later session
+history append fails, so the live tuple and the next process start still agree.
+The existing `set_model` and `set_thinking_level` commands remain session-only
+operations and are unchanged.
 
 
 By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.
@@ -724,6 +755,7 @@ Current helper characteristics:
 - Dispatches recognized `AgentEvent` types to event listeners
 - Dispatches top-level `workflow_gate` frames to `onWorkflowGate()` listeners
 - Supports host-owned custom tools via `setCustomTools()` and automatic handling of `host_tool_call` / `host_tool_cancel`
+- Exposes `setDefaultModelSelection()` for the durable model/reasoning operation
 - Exposes `respondGate()` for `workflow_gate_response` and waits for the accepted/rejected resolution envelope
 - Does **not** expose helper methods for every protocol command (for example, `set_interrupt_mode` and `set_session_name` are in protocol types but not wrapped as dedicated methods)
 

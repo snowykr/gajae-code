@@ -273,6 +273,45 @@ describe("bridge mode fetch handler", () => {
 		expect(await first.json()).toEqual({ id: "req-1", type: "response", command: "prompt", success: true });
 	});
 
+	it("preserves mutation arrival order across distinct idempotency keys", async () => {
+		const releaseFirst = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model"],
+			endpointMatrix: { commands: true },
+			idempotencyCache: new Map(),
+			commandDispatcher: async command => {
+				order.push(`start:${command.type}`);
+				if (command.type === "set_model") await releaseFirst.promise;
+				order.push(`end:${command.type}`);
+				return rpcSuccess(command.id, command.type);
+			},
+		});
+		const first = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret", "Idempotency-Key": "model-1" },
+				body: JSON.stringify({ id: "model-1", type: "set_model", provider: "p", modelId: "m" }),
+			}),
+		);
+		const second = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret", "Idempotency-Key": "thinking-1" },
+				body: JSON.stringify({ id: "thinking-1", type: "set_thinking_level", level: "high" }),
+			}),
+		);
+		await Bun.sleep(1);
+
+		expect(order).toEqual(["start:set_model"]);
+		releaseFirst.resolve();
+		expect((await first).status).toBe(200);
+		expect((await second).status).toBe(200);
+		expect(order).toEqual(["start:set_model", "end:set_model", "start:set_thinking_level", "end:set_thinking_level"]);
+	});
+
 	it("rejects command scopes before dispatch", async () => {
 		let calls = 0;
 		const handle = createBridgeFetchHandler({
