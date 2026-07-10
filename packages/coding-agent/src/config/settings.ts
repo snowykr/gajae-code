@@ -65,6 +65,7 @@ export interface SettingsOptions {
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
 }
+export type DurableSettingsUpdate = Partial<Record<SettingPath, unknown>>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
@@ -331,6 +332,20 @@ export class Settings {
 		if (hook) {
 			hook(value, prev);
 		}
+	}
+	/**
+	 * Commit a request-scoped settings candidate durably.
+	 *
+	 * The candidate is not published to the in-memory settings view until its
+	 * writer completes. Dirty paths already queued by other callers are included
+	 * in the same write and remain retryable when that write fails.
+	 */
+	async commitDurable(updates: DurableSettingsUpdate): Promise<void> {
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
+		}
+		await this.#startSave(true, () => this.#commitDurableNow(updates));
 	}
 
 	/**
@@ -830,9 +845,9 @@ export class Settings {
 		}, 100);
 	}
 
-	#startSave(throwOnError = false): Promise<void> {
+	#startSave(throwOnError = false, task: (() => Promise<void>) | undefined = undefined): Promise<void> {
 		const previousSave = this.#savePromise ?? Promise.resolve();
-		const savePromise = previousSave.then(() => this.#saveNow(throwOnError));
+		const savePromise = previousSave.then(() => (task ? task() : this.#saveNow(throwOnError)));
 		this.#savePromise = savePromise;
 		savePromise.then(
 			() => {
@@ -843,6 +858,53 @@ export class Settings {
 			},
 		);
 		return savePromise;
+	}
+
+	async #commitDurableNow(updates: DurableSettingsUpdate): Promise<void> {
+		const modifiedPaths = [...this.#modified];
+		this.#modified.clear();
+		const candidateEntries = Object.entries(updates);
+		if (!this.#persist || !this.#configPath) {
+			for (const [settingPath, value] of candidateEntries) {
+				setByPath(this.#global, settingPath.split("."), value);
+			}
+			this.#rebuildMerged();
+			return;
+		}
+
+		const configPath = this.#configPath;
+		try {
+			let committed: RawSettings = {};
+			await withFileLock(configPath, async () => {
+				committed = await this.#loadYaml(configPath);
+				for (const modifiedPath of modifiedPaths) {
+					setByPath(committed, modifiedPath.split("."), getByPath(this.#global, modifiedPath.split(".")));
+				}
+				for (const [settingPath, value] of candidateEntries) {
+					setByPath(committed, settingPath.split("."), value);
+				}
+				const tempPath = `${configPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+				try {
+					await Bun.write(tempPath, YAML.stringify(committed, null, 2));
+					await fs.promises.rename(tempPath, configPath);
+				} finally {
+					try {
+						await fs.promises.unlink(tempPath);
+					} catch {}
+				}
+			});
+
+			for (const modifiedPath of this.#modified) {
+				setByPath(committed, modifiedPath.split("."), getByPath(this.#global, modifiedPath.split(".")));
+			}
+			this.#global = committed;
+			this.#rebuildMerged();
+		} catch (error) {
+			for (const modifiedPath of modifiedPaths) {
+				this.#modified.add(modifiedPath);
+			}
+			throw error;
+		}
 	}
 
 	async #saveNow(throwOnError = false): Promise<void> {

@@ -289,13 +289,11 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
 		});
 
-		const flushOrThrow = sessionSettings.flushOrThrow;
-		let flushedRole: string | undefined;
-		let flushedDefaultThinkingLevel: unknown;
-		sessionSettings.flushOrThrow = async () => {
-			flushedRole = sessionSettings.getModelRole("default");
-			flushedDefaultThinkingLevel = sessionSettings.get("defaultThinkingLevel");
-			await flushOrThrow.call(sessionSettings);
+		const commitDurable = sessionSettings.commitDurable;
+		let committedUpdate: Record<string, unknown> | undefined;
+		sessionSettings.commitDurable = async updates => {
+			committedUpdate = updates;
+			await commitDurable.call(sessionSettings, updates);
 		};
 
 		const result = await session.setDefaultModelSelection(selectedModel, "off");
@@ -304,8 +302,10 @@ describe("AgentSession role model thinking behavior", () => {
 			modelId: selectedModel.id,
 			thinkingLevel: "off",
 		});
-		expect(flushedRole).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
-		expect(flushedDefaultThinkingLevel).toBe("off");
+		expect(committedUpdate).toEqual({
+			defaultThinkingLevel: "off",
+			modelRoles: { default: `${selectedModel.provider}/${selectedModel.id}:off` },
+		});
 		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
 	});
 	it("materializes an active model profile before persisting a default selection", async () => {
@@ -342,8 +342,11 @@ describe("AgentSession role model thinking behavior", () => {
 			throw new Error("durable save failed");
 		});
 
+		const publishSpy = spyOn(session, "setModelTemporary");
 		try {
-			await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow("durable save failed");
+			await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow(
+				"durable save failed",
+			);
 		} finally {
 			writeSpy.mockRestore();
 		}
@@ -355,6 +358,9 @@ describe("AgentSession role model thinking behavior", () => {
 		};
 		expect(savedSettings.modelRoles?.default).toBe(`${initialModel.provider}/${initialModel.id}:high`);
 		expect(savedSettings.defaultThinkingLevel).toBeUndefined();
+		expect(session.model).toEqual(initialModel);
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(publishSpy).not.toHaveBeenCalled();
 	});
 	it("rejects a cwd-disabled durable default before mutating the session", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

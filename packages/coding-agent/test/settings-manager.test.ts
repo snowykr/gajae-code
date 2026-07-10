@@ -286,6 +286,31 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.defaultThinkingLevel).toBe(Effort.Off);
 		});
+		it("preserves dirty paths for retry when a durable candidate fails", async () => {
+			await writeSettings({
+				theme: { dark: "initial-dark" },
+				modelRoles: { default: "initial/model" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("theme.dark", "pending-dark");
+
+			const realWrite = Bun.write.bind(Bun) as (path: string, data: string) => Promise<number>;
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (String(target).endsWith(".tmp")) throw new Error("durable candidate failed");
+				return realWrite(String(target), String(data));
+			});
+			await expect(
+				settings.commitDurable({
+					modelRoles: { default: "candidate/model" },
+				}),
+			).rejects.toThrow("durable candidate failed");
+			writeSpy.mockRestore();
+
+			await settings.flush();
+			const savedSettings = await readSettings();
+			expect(savedSettings.theme).toEqual({ dark: "pending-dark" });
+			expect(savedSettings.modelRoles).toEqual({ default: "initial/model" });
+		});
 	});
 
 	describe("migrations", () => {

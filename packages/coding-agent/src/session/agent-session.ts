@@ -136,7 +136,6 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
-import { materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -6716,14 +6715,39 @@ export class AgentSession {
 			throw new Error(`Model unavailable for default selection: ${model.provider}/${model.id}`);
 		}
 
-		await this.setModel(model, "default", { thinkingLevel: effectiveLevel, persistThinkingLevel: true });
-		materializeActiveModelProfileAssignment({
-			session: this,
-			settings: this.settings,
-			role: "default",
-			selector: this.#formatRoleModelValue("default", model, undefined, effectiveLevel),
-		});
-		await this.settings.flushOrThrow();
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+		if (!apiKey) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);
+		const activeProfile = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
+		const modelRoles = {
+			...(activeProfile ? this.settings.get("modelRoles") : (this.settings.getGlobal("modelRoles") ?? {})),
+			default: selector,
+		};
+		const agentModelOverrides = { ...this.settings.get("task.agentModelOverrides") };
+		const durableUpdate = {
+			defaultThinkingLevel: effectiveLevel,
+			modelRoles,
+			...(activeProfile
+				? {
+						"task.agentModelOverrides": agentModelOverrides,
+						"modelProfile.default": undefined,
+					}
+				: {}),
+		};
+
+		await this.settings.commitDurable(durableUpdate);
+
+		await this.setModelTemporary(model, effectiveLevel, { persistAsSessionDefault: true });
+
+		if (activeProfile) {
+			this.settings.clearOverride("modelProfile.default");
+			this.settings.override("modelRoles", modelRoles);
+			this.settings.override("task.agentModelOverrides", agentModelOverrides);
+			this.setActiveModelProfile(undefined);
+		}
 
 		return {
 			provider: model.provider,
