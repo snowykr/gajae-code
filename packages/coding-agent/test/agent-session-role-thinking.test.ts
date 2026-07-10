@@ -362,6 +362,40 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 		expect(publishSpy).not.toHaveBeenCalled();
 	});
+	it("does not report a post-commit publication failure", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		resetSettingsForTest();
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const persistentSettings = await Settings.init({ cwd: tempDir.path(), agentDir: tempDir.path() });
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+			settings: persistentSettings,
+		});
+		await sessionSettings.flush();
+
+		const appendSpy = spyOn(session.sessionManager, "appendModelChange").mockImplementation(() => {
+			throw new Error("session append failed");
+		});
+		try {
+			await expect(session.setDefaultModelSelection(selectedModel, "off")).resolves.toEqual({
+				provider: selectedModel.provider,
+				modelId: selectedModel.id,
+				thinkingLevel: "off",
+			});
+		} finally {
+			appendSpy.mockRestore();
+		}
+
+		const savedSettings = YAML.parse(await Bun.file(path.join(tempDir.path(), "config.yml")).text()) as {
+			modelRoles?: { default?: string };
+			defaultThinkingLevel?: string;
+		};
+		expect(savedSettings.modelRoles?.default).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
+		expect(savedSettings.defaultThinkingLevel).toBe("off");
+		expect(session.model).toEqual(selectedModel);
+	});
 	it("rejects a cwd-disabled durable default before mutating the session", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");

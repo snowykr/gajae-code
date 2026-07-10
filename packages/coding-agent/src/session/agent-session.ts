@@ -1084,6 +1084,14 @@ export function buildContextInjectionSignature(kind: string, parts: readonly str
 	}
 	return hash.digest("base64url");
 }
+
+export interface PreparedModelTemporary {
+	model: Model;
+	thinkingLevel?: ThinkingLevel;
+	persistAsSessionDefault: boolean;
+	previousEditMode: EditMode;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -6715,10 +6723,9 @@ export class AgentSession {
 			throw new Error(`Model unavailable for default selection: ${model.provider}/${model.id}`);
 		}
 
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
+		const preparedPublish = await this.prepareModelTemporary(model, effectiveLevel, {
+			persistAsSessionDefault: true,
+		});
 
 		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);
 		const activeProfile = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
@@ -6740,13 +6747,16 @@ export class AgentSession {
 
 		await this.settings.commitDurable(durableUpdate);
 
-		await this.setModelTemporary(model, effectiveLevel, { persistAsSessionDefault: true });
-
+		this.publishPreparedModelTemporary(preparedPublish);
 		if (activeProfile) {
-			this.settings.clearOverride("modelProfile.default");
-			this.settings.override("modelRoles", modelRoles);
-			this.settings.override("task.agentModelOverrides", agentModelOverrides);
-			this.setActiveModelProfile(undefined);
+			try {
+				this.settings.clearOverride("modelProfile.default");
+				this.settings.override("modelRoles", modelRoles);
+				this.settings.override("task.agentModelOverrides", agentModelOverrides);
+				this.setActiveModelProfile(undefined);
+			} catch (error) {
+				logger.warn("Session: model profile publication failed", { error: String(error) });
+			}
 		}
 
 		return {
@@ -6787,6 +6797,61 @@ export class AgentSession {
 	}
 
 	/**
+	 * Prepare a temporary model publication. All validation and potentially
+	 * failing work happens before a durable settings commit.
+	 */
+	async prepareModelTemporary(
+		model: Model,
+		thinkingLevel?: ThinkingLevel,
+		options?: { persistAsSessionDefault?: boolean },
+	): Promise<PreparedModelTemporary> {
+		const previousEditMode = this.#resolveActiveEditMode();
+		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+		if (!apiKey) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+		return {
+			model,
+			thinkingLevel,
+			persistAsSessionDefault: options?.persistAsSessionDefault === true,
+			previousEditMode,
+		};
+	}
+
+	#publishPreparedModelTemporary(prepared: PreparedModelTemporary): void {
+		const { model } = prepared;
+		this.#clearActiveRetryFallback();
+		this.#setModelWithProviderSessionReset(model);
+		this.sessionManager.appendModelChange(
+			`${model.provider}/${model.id}`,
+			prepared.persistAsSessionDefault ? "default" : "temporary",
+		);
+		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+
+		// Apply explicit thinking level if given; otherwise prefer the model's
+		// configured defaultLevel; otherwise re-clamp the current level.
+		this.setThinkingLevel(prepared.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+	}
+
+	/**
+	 * Publish a prepared temporary model after its durability linearization.
+	 *
+	 * This method intentionally performs no I/O and never propagates failures:
+	 * callers have already received the durable acknowledgement and must not
+	 * report failure for post-commit session publication.
+	 */
+	publishPreparedModelTemporary(prepared: PreparedModelTemporary): void {
+		try {
+			this.#publishPreparedModelTemporary(prepared);
+		} catch (error) {
+			logger.warn("Session: prepared model publication failed", { error: String(error) });
+		}
+		void this.#syncEditToolModeAfterModelChange(prepared.previousEditMode).catch(error => {
+			logger.warn("Session: prepared model edit-mode sync failed", { error: String(error) });
+		});
+	}
+
+	/**
 	 * Set model temporarily (for this session only).
 	 * Validates API key, saves to session log but NOT to settings.
 	 *
@@ -6804,24 +6869,9 @@ export class AgentSession {
 		thinkingLevel?: ThinkingLevel,
 		options?: { persistAsSessionDefault?: boolean },
 	): Promise<void> {
-		const previousEditMode = this.#resolveActiveEditMode();
-		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
-
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(model);
-		this.sessionManager.appendModelChange(
-			`${model.provider}/${model.id}`,
-			options?.persistAsSessionDefault ? "default" : "temporary",
-		);
-		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-
-		// Apply explicit thinking level if given; otherwise prefer the model's
-		// configured defaultLevel; otherwise re-clamp the current level.
-		this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		const prepared = await this.prepareModelTemporary(model, thinkingLevel, options);
+		this.#publishPreparedModelTemporary(prepared);
+		await this.#syncEditToolModeAfterModelChange(prepared.previousEditMode);
 	}
 
 	/**

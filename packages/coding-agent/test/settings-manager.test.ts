@@ -238,6 +238,16 @@ describe("Settings", () => {
 		});
 	});
 	describe("durable save barriers", () => {
+		it("persists off as an explicit default thinking level", async () => {
+			await writeSettings({ defaultThinkingLevel: Effort.High });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			settings.set("defaultThinkingLevel", "off");
+			await settings.flushOrThrow();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.defaultThinkingLevel).toBe("off");
+		});
 		it("does not retry an explicitly rejected durability save", async () => {
 			await writeSettings({ defaultThinkingLevel: Effort.High });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -270,7 +280,7 @@ describe("Settings", () => {
 
 			settings.set("defaultThinkingLevel", Effort.Low);
 			await Bun.sleep(120);
-			settings.set("defaultThinkingLevel", Effort.Off);
+			settings.set("defaultThinkingLevel", "off");
 
 			let flushCompleted = false;
 			const flushPromise = settings.flushOrThrow().then(() => {
@@ -284,7 +294,7 @@ describe("Settings", () => {
 			writeSpy.mockRestore();
 
 			const savedSettings = await readSettings();
-			expect(savedSettings.defaultThinkingLevel).toBe(Effort.Off);
+			expect(savedSettings.defaultThinkingLevel).toBe("off");
 		});
 		it("preserves dirty paths for retry when a durable candidate fails", async () => {
 			await writeSettings({
@@ -310,6 +320,39 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.theme).toEqual({ dark: "pending-dark" });
 			expect(savedSettings.modelRoles).toEqual({ default: "initial/model" });
+		});
+		it("preserves unrelated writes made while a durable candidate is linearizing", async () => {
+			await writeSettings({
+				theme: { dark: "initial-dark" },
+				modelRoles: { default: "initial/model" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const writeStarted = Promise.withResolvers<void>();
+			const releaseWrite = Promise.withResolvers<void>();
+			const realWrite = Bun.write.bind(Bun);
+			let blocked = true;
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (blocked && String(target).endsWith(".tmp")) {
+					blocked = false;
+					writeStarted.resolve();
+					await releaseWrite.promise;
+				}
+				return realWrite(target, data);
+			});
+
+			const commitPromise = settings.commitDurable({
+				modelRoles: { default: "candidate/model" },
+			});
+			await writeStarted.promise;
+			settings.set("theme.dark", "concurrent-dark");
+			releaseWrite.resolve();
+			await commitPromise;
+			await settings.flush();
+			writeSpy.mockRestore();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "candidate/model" });
+			expect(savedSettings.theme).toEqual({ dark: "concurrent-dark" });
 		});
 	});
 

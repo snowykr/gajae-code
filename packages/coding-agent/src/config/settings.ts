@@ -873,8 +873,9 @@ export class Settings {
 		}
 
 		const configPath = this.#configPath;
+		let committed: RawSettings = {};
+		let linearized = false;
 		try {
-			let committed: RawSettings = {};
 			await withFileLock(configPath, async () => {
 				committed = await this.#loadYaml(configPath);
 				for (const modifiedPath of modifiedPaths) {
@@ -887,23 +888,37 @@ export class Settings {
 				try {
 					await Bun.write(tempPath, YAML.stringify(committed, null, 2));
 					await fs.promises.rename(tempPath, configPath);
+					linearized = true;
 				} finally {
 					try {
 						await fs.promises.unlink(tempPath);
 					} catch {}
 				}
 			});
+		} catch (error) {
+			if (!linearized) {
+				for (const modifiedPath of modifiedPaths) {
+					this.#modified.add(modifiedPath);
+				}
+				throw error;
+			}
+			logger.warn("Settings: post-commit reconciliation failed", { error: String(error) });
+		}
 
-			for (const modifiedPath of this.#modified) {
-				setByPath(committed, modifiedPath.split("."), getByPath(this.#global, modifiedPath.split(".")));
+		try {
+			// Include changes made while the candidate was being written in the
+			// and schedule them for the next ordinary save.
+			const concurrentPaths = [...this.#modified];
+			for (const concurrentPath of concurrentPaths) {
+				setByPath(committed, concurrentPath.split("."), getByPath(this.#global, concurrentPath.split(".")));
 			}
 			this.#global = committed;
 			this.#rebuildMerged();
+			if (concurrentPaths.length > 0) this.#queueSave();
 		} catch (error) {
-			for (const modifiedPath of modifiedPaths) {
-				this.#modified.add(modifiedPath);
-			}
-			throw error;
+			// The candidate is already durable; publishing an in-memory view must
+			// not turn a successful durability acknowledgement into a failure.
+			logger.warn("Settings: post-commit publish failed", { error: String(error) });
 		}
 	}
 
