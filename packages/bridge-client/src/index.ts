@@ -1,4 +1,10 @@
-import type { BridgeClientCommand, BridgeCommandHelpers, BridgeCommandOptions, BridgeThinkingLevel } from "./commands";
+import type {
+	BridgeClientCommand,
+	BridgeCommandHelpers,
+	BridgeCommandOptions,
+	BridgeResolvedModelSelection,
+	BridgeThinkingLevel,
+} from "./commands";
 import type { BridgeFrame } from "./reference-consumer";
 
 export * from "./commands";
@@ -75,6 +81,61 @@ export interface BridgeHandshakeRejected {
 
 export type BridgeFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 export type BridgeHandshakeResponse = BridgeHandshakeAccepted | BridgeHandshakeRejected;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isBridgeThinkingLevel(value: unknown): value is BridgeThinkingLevel {
+	switch (value) {
+		case "off":
+		case "minimal":
+		case "low":
+		case "medium":
+		case "high":
+		case "xhigh":
+		case "max":
+			return true;
+		default:
+			return false;
+	}
+}
+
+function isResolvedModelSelection(value: unknown): value is BridgeResolvedModelSelection {
+	return (
+		isRecord(value) &&
+		typeof value.provider === "string" &&
+		value.provider.trim().length > 0 &&
+		typeof value.modelId === "string" &&
+		value.modelId.trim().length > 0 &&
+		isBridgeThinkingLevel(value.thinkingLevel)
+	);
+}
+
+function parseDefaultModelSelectionResponse(response: unknown): BridgeResolvedModelSelection {
+	if (
+		!isRecord(response) ||
+		response.type !== "response" ||
+		response.command !== "set_default_model_selection" ||
+		response.success !== true ||
+		!isResolvedModelSelection(response.data)
+	) {
+		throw new Error("Bridge returned a malformed set_default_model_selection response");
+	}
+	return response.data;
+}
+
+function parseBridgeErrorDetail(body: string): string | undefined {
+	if (body.length === 0) return undefined;
+	try {
+		const payload: unknown = JSON.parse(body);
+		return isRecord(payload) && typeof payload.error === "string" ? payload.error : undefined;
+	} catch (error) {
+		if (error instanceof SyntaxError) return undefined;
+		throw error;
+	}
+}
+
 function parseSseData(buffer: string): { frames: BridgeFrame[]; rest: string } {
 	const frames: BridgeFrame[] = [];
 	let rest = buffer.replaceAll("\r\n", "\n");
@@ -272,20 +333,21 @@ export class BridgeClient implements BridgeCommandHelpers {
 		return this.#command("set_model", sessionId, { provider, modelId }, options, "set-model");
 	}
 
-	setDefaultModelSelection(
+	async setDefaultModelSelection(
 		sessionId: string,
 		provider: string,
 		modelId: string,
 		thinkingLevel: BridgeThinkingLevel,
 		options: BridgeCommandOptions = {},
-	): Promise<unknown> {
-		return this.#command(
+	): Promise<BridgeResolvedModelSelection> {
+		const response = await this.#command(
 			"set_default_model_selection",
 			sessionId,
 			{ provider, modelId, thinkingLevel },
 			options,
 			"set-default-model-selection",
 		);
+		return parseDefaultModelSelectionResponse(response);
 	}
 
 	cycleModel(sessionId: string, options: BridgeCommandOptions = {}): Promise<unknown> {
@@ -530,7 +592,8 @@ export class BridgeClient implements BridgeCommandHelpers {
 	async #json<T>(pathname: string, init: RequestInit): Promise<T> {
 		const response = await this.#request(pathname, init);
 		if (!response.ok) {
-			throw new Error(`Bridge request failed: ${response.status}`);
+			const detail = parseBridgeErrorDetail(await response.text());
+			throw new Error(`Bridge request failed: ${response.status}${detail ? ` (${detail})` : ""}`);
 		}
 		return (await response.json()) as T;
 	}

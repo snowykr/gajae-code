@@ -43,6 +43,11 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 
 export type BridgeClientCommandType = (typeof BRIDGE_CLIENT_COMMAND_TYPES)[number];
 export type BridgeThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type BridgeResolvedModelSelection = {
+	readonly provider: string;
+	readonly modelId: string;
+	readonly thinkingLevel: BridgeThinkingLevel;
+};
 
 export type BridgeClientCommand<TType extends BridgeClientCommandType = BridgeClientCommandType> = {
 	id?: string;
@@ -81,7 +86,7 @@ export interface BridgeCommandHelpers {
 		modelId: string,
 		thinkingLevel: BridgeThinkingLevel,
 		options?: BridgeCommandOptions,
-	): Promise<unknown>;
+	): Promise<BridgeResolvedModelSelection>;
 	cycleModel(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	getAvailableModels(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	setThinkingLevel(sessionId: string, level: string, options?: BridgeCommandOptions): Promise<unknown>;

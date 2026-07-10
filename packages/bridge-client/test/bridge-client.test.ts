@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { BridgeFrame } from "../src";
+import type { BridgeFrame, BridgeResolvedModelSelection } from "../src";
 import { BridgeClient } from "../src";
 
 describe("BridgeClient", () => {
@@ -72,25 +72,86 @@ describe("BridgeClient", () => {
 		expect(headersSeen[3]).toBe("idem-3");
 	});
 
-	it("sends a concrete durable default selection", async () => {
+	it("returns a validated durable default selection", async () => {
+		// Given: a bridge server that canonicalizes the requested selection.
 		let body: unknown;
 		const client = new BridgeClient({
 			baseUrl: "https://bridge.test",
 			token: "secret",
 			fetch: async (_input, init) => {
 				body = JSON.parse(init?.body?.toString() ?? "");
-				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+				return new Response(
+					JSON.stringify({
+						type: "response",
+						command: "set_default_model_selection",
+						success: true,
+						data: { provider: "openai", modelId: "gpt-4o", thinkingLevel: "max" },
+					}),
+					{ status: 200 },
+				);
 			},
 		});
 
-		await client.setDefaultModelSelection("sess-1", "openai", "gpt-4o", "max");
+		// When: the typed helper receives the success envelope.
+		const selection: BridgeResolvedModelSelection = await client.setDefaultModelSelection(
+			"sess-1",
+			"openai",
+			"gpt-4o",
+			"max",
+		);
 
+		// Then: it returns only the validated canonical selection and sends the durable command.
+		expect(selection).toEqual({ provider: "openai", modelId: "gpt-4o", thinkingLevel: "max" });
 		expect(body).toEqual({
 			type: "set_default_model_selection",
 			provider: "openai",
 			modelId: "gpt-4o",
 			thinkingLevel: "max",
 		});
+	});
+
+	it.each([
+		{ provider: "", modelId: "gpt-4o", thinkingLevel: "max" },
+		{ provider: "openai", modelId: "", thinkingLevel: "max" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "inherit" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "bogus" },
+	])("rejects malformed default selection success data: %j", async malformedData => {
+		// Given: an HTTP-success response whose selection data violates the public contract.
+		const client = new BridgeClient({
+			baseUrl: "https://bridge.test",
+			token: "secret",
+			fetch: async () =>
+				new Response(
+					JSON.stringify({
+						type: "response",
+						command: "set_default_model_selection",
+						success: true,
+						data: malformedData,
+					}),
+					{ status: 200 },
+				),
+		});
+
+		// When: the typed helper parses the untrusted response boundary.
+		const selection = client.setDefaultModelSelection("sess-1", "openai", "gpt-4o", "max");
+
+		// Then: malformed success data is rejected rather than escaping as a typed value.
+		await expect(selection).rejects.toThrow("malformed set_default_model_selection response");
+	});
+
+	it("preserves the explicit old-server command error", async () => {
+		// Given: an older bridge server that does not recognize the new command.
+		const client = new BridgeClient({
+			baseUrl: "https://bridge.test",
+			token: "secret",
+			fetch: async () => new Response(JSON.stringify({ error: "invalid_command" }), { status: 400 }),
+		});
+
+		// When: the default-selection helper sends the command.
+		const selection = client.setDefaultModelSelection("sess-1", "openai", "gpt-4o", "max");
+
+		// Then: the server detail remains visible to callers diagnosing version skew.
+		await expect(selection).rejects.toThrow("Bridge request failed: 400 (invalid_command)");
 	});
 
 	it("sends controller claim and UI response requests", async () => {
