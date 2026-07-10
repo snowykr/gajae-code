@@ -149,11 +149,16 @@ Stores an `AgentMessage` directly.
   "parentId": "a1b2c3d4",
   "timestamp": "2026-02-16T10:21:30.000Z",
   "model": "openai/gpt-4o",
-  "role": "default"
+  "role": "default",
+  "thinkingLevel": "high"
 }
 ```
 
 `role` is optional; missing is treated as `default` in context reconstruction.
+`thinkingLevel` is also optional. Durable default-selection changes include the
+effective level on the default-role `model_change`, so the model and thinking
+level persist as one session tuple. Older entries without this field remain
+valid.
 
 ### `service_tier_change`
 
@@ -379,7 +384,8 @@ Algorithm:
    - otherwise fallback to last entry.
 2. Walk `parentId` chain from leaf to root and reverse to root->leaf path.
 3. Derive runtime state across path:
-   - `thinkingLevel` from latest `thinking_level_change` (default `"off"`)
+   - `thinkingLevel` from the latest path entry that carries it: either a legacy
+     `thinking_level_change` or `model_change.thinkingLevel` (default `"off"`)
    - `serviceTier` from latest `service_tier_change`
    - model map from `model_change` entries (`role ?? "default"`)
    - fallback `models.default` from assistant message provider/model if no explicit model change
@@ -394,6 +400,12 @@ Algorithm:
      - emit compaction summary first (`createCompactionSummaryMessage`)
      - emit path entries starting at `firstKeptEntryId` up to the compaction boundary
      - emit entries after the compaction boundary
+
+For a durable default selection, the default-role `model_change` supplies both
+the model and its effective thinking level. Startup and session switching
+therefore restore that persisted tuple together. Legacy sessions that record a
+separate `thinking_level_change` remain supported, with state replayed in path
+order.
 
 `custom`, `session_init`, `service_tier_change`, `mcp_tool_selection`, and `ttsr_injection` entries do not inject model context directly.
 

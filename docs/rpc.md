@@ -63,8 +63,16 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
+- A valid JSON object rejected by command-schema validation preserves a string
+  `id` and string `type` as the response correlation ID and command name. This
+  includes unsupported command types and malformed payloads for known commands.
+- After a command is admitted, dispatch and handler failures preserve its `id`
+  and actual command name.
+- Malformed JSON has no trustworthy request fields and returns a failure with
+  `command: "parse"` and no `id`. A valid non-object frame, or an object without
+  string correlation fields, is rejected as an invalid command using
+  `"parse"` and `undefined` as the applicable fallbacks; any trustworthy string
+  `id` or `type` present on an object is retained independently.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 
 ## Command Schema (canonical)
@@ -680,7 +688,8 @@ a message or fall back to `content` for textual error surfacing:
 
 ### Command-level failures
 
-Failures are `success: false` with string `error`.
+Failures are `success: false` with `error` as either a string for ordinary
+command failures or an object for typed control-plane failures.
 
 ```json
 {
