@@ -277,4 +277,48 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
+	it("persists the default model selection with concrete off thinking at the flush boundary", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		const flushOrThrow = sessionSettings.flushOrThrow;
+		let flushedRole: string | undefined;
+		let flushedDefaultThinkingLevel: unknown;
+		sessionSettings.flushOrThrow = async () => {
+			flushedRole = sessionSettings.getModelRole("default");
+			flushedDefaultThinkingLevel = sessionSettings.get("defaultThinkingLevel");
+			await flushOrThrow.call(sessionSettings);
+		};
+
+		const result = await session.setDefaultModelSelection(selectedModel, "off");
+		expect(result).toEqual({
+			provider: selectedModel.provider,
+			modelId: selectedModel.id,
+			thinkingLevel: "off",
+		});
+		expect(flushedRole).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
+		expect(flushedDefaultThinkingLevel).toBe("off");
+		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
+	});
+
+	it("does not report success when durable default selection save fails", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+		const flushOrThrow = sessionSettings.flushOrThrow;
+		sessionSettings.flushOrThrow = async () => {
+			throw new Error("durable save failed");
+		};
+		await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow("durable save failed");
+		sessionSettings.flushOrThrow = flushOrThrow;
+	});
 });

@@ -13,6 +13,7 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 	"set_capabilities",
 	"workflow_gate_response",
 	"set_model",
+	"set_default_model_selection",
 	"cycle_model",
 	"get_available_models",
 	"set_thinking_level",
@@ -41,6 +42,7 @@ export const BRIDGE_CLIENT_COMMAND_TYPES = [
 ] as const;
 
 export type BridgeClientCommandType = (typeof BRIDGE_CLIENT_COMMAND_TYPES)[number];
+export type BridgeThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type BridgeClientCommand<TType extends BridgeClientCommandType = BridgeClientCommandType> = {
 	id?: string;
@@ -73,6 +75,13 @@ export interface BridgeCommandHelpers {
 	setHostUriSchemes(sessionId: string, schemes: unknown[], options?: BridgeCommandOptions): Promise<unknown>;
 	getPendingWorkflowGates(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	setModel(sessionId: string, provider: string, modelId: string, options?: BridgeCommandOptions): Promise<unknown>;
+	setDefaultModelSelection(
+		sessionId: string,
+		provider: string,
+		modelId: string,
+		thinkingLevel: BridgeThinkingLevel,
+		options?: BridgeCommandOptions,
+	): Promise<unknown>;
 	cycleModel(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	getAvailableModels(sessionId: string, options?: BridgeCommandOptions): Promise<unknown>;
 	setThinkingLevel(sessionId: string, level: string, options?: BridgeCommandOptions): Promise<unknown>;

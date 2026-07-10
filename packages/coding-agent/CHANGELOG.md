@@ -1,6 +1,67 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added the additive `set_default_model_selection` RPC command, which applies a concrete normalized model+reasoning tuple to the active session and durably persists it for future sessions; the existing session-only `set_thinking_level` behavior is unchanged.
+
+## [0.9.6] - 2026-07-10
+### Changed
+
+- Moved the `codex-eco`/`codex-medium`/`codex-pro` presets and the `opus-codex`/`codex-opencodego`/`fable-opus-codex` combo presets from `gpt-5.5` onto the GPT-5.6 tier family: Sol drives `default` and `architect` on every codex preset (eco `sol:medium`, medium `sol:high`, pro `sol:xhigh`/`sol:max`), with Luna/Terra covering the lighter executor/planner/critic roles by tier.
+
+### Fixed
+
+- Fixed v0.9.3–v0.9.6 compiled release binaries crashing at first real launch with `Cannot find module '/$bunfs/root/node_modules/handlebars/lib/index.js'` while `--version`/`--help` still worked (#1939). `--minify` silently dropped the handlebars bunfs extra entrypoint; handlebars is now bundled through a statically-traceable `require("handlebars")` in `@gajae-code/utils` prompt rendering (still lazy at runtime), and the fragile extra entrypoint is gone from both release and dev compile args. `--minify` and its startup-RSS win are retained.
+
+## [0.9.5] - 2026-07-09
+### Fixed
+
+- ACP permission prompts now honor `clientCapabilities._meta.gjc.permissionHandling` and the `GJC_ACP_PERMISSION_MODE` fallback, so `auto` and `always-allow` no longer emit `session/request_permission` calls while invalid values fail safely to `prompt`.
+- Model selector batch assignments ("Set for all role agents" / "Set for all targets") now open the reasoning-effort menu whenever any batch target requires an explicit choice (e.g. Anthropic reasoning models like `claude-fable-5`), and the chosen effort plus the full batch survive the menu. Previously the menu never appeared for Anthropic models (silently persisting `:off` selectors for every role agent), and for OpenAI/Codex models picking an effort collapsed the batch to a DEFAULT-only assignment.
+### Added
+
+- ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.
+
+## [0.9.4] - 2026-07-09
+### Fixed
+
+- `RpcClient.onSessionEvent()` now exposes the full renderer-facing agent-wire event stream instead of dropping non-core session events such as notices, todo reminders, retry events, subagent steering, thinking-level changes, and goal updates, while `onEvent()` remains the filtered legacy `AgentEvent` subscription path.
+- Clarified `/session delete` help, confirmation, and completion wording to specify current vs. selected session transcript/artifact deletion and that other sessions plus topic/history metadata are not removed (#1913).
+- Home screen build labels now come from install/build metadata, so release binaries and package installs no longer show a misleading dev build label (#1911).
+
+## [0.9.3] - 2026-07-09
+
+### Fixed
+
+- Stabilized hotfix release checks by making generated docs lazy-load verification independent of Bun's module cache, preserving the docs index sync gate, and polling coordinator MCP watch reconciliation for runtime prompt acknowledgements.
+- Updated macOS-specific queue shortcut and clipboard-temp image paste tests to match the shipped runtime behavior.
+
+## [0.9.2] - 2026-07-09
+### Added
+
+- Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
+- Added `--mpreset <profile>` support to Telegram `/session_create`, forwarding both `--mpreset <name>` and `--mpreset=<name>` as split argv to the spawned GJC child.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project/user skills without injecting the full skill catalog into the core prompt.
+- Pasting or drag-dropping a path to an existing image file now attaches the image and inserts an `[image N]` placeholder, including quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces.
+- Pasted clipboard-temp image paths now attach as `[image N] source="/path"`, so the model receives both the image payload and the retrievable raw temp file path; ordinary saved image paths remain literal prompt text instead of being consumed into opaque placeholders.
+
+### Changed
+
+- The status line (information bar) token-percentage now renders inline within the model segment, right after the reasoning-effort indicator, instead of as a trailing segment at the far end of the line, so the context usage percentage stays grouped with the model it describes. The standalone `context_pct` segment was removed from the `default`, `default-usage`, `compact`, `full`, `nerd`, `ascii`, and `custom` presets (it remains available for `minimal` and custom configs); the inline percentage is color-coded by context-usage level, can be disabled per-preset with `segmentOptions.model.showContextPercent: false`, and is auto-suppressed when a standalone `context_pct` segment is also active so the value is never shown twice.
+
+### Fixed
+
+- Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.
+- `gjc --tmux` now wraps the inner GJC command with a durable `tmux-exit.json` marker next to `runtime-state.json`, so a tmux-resident session that exits before normal runtime-state finalization leaves a public-safe exit timestamp/code for silent-vanish diagnosis (#1746).
+- `gjc --tmux` terminal titles now track live tmux session renames while preserving the friendly project/branch title for untouched generated session ids.
+- Telegram session forum-topic renames now remain retryable after a transient `editForumTopic` failure, so topics do not get stuck at the provisional `GJC <session>` name while the daemon incorrectly records the final title locally.
+- `/effort` selector choices now show the current reasoning effort and mirror `/model` by asking whether to apply the selected effort for the current session or save it as the default, including support for persisting `off`. Default model presets also sync their encoded effort into the persisted effort default so later `/effort` defaults are not overwritten on restart.
+- Composer queue submissions (`Alt+Q` / `app.message.queue`) force one-at-a-time follow-up delivery, including replay after compaction, without disabling broader batch mode for other follow-up callers.
+- `--credential` now rejects a missing selector immediately instead of falling through into session launch with no output.
+- `gjc-session` prompt/monitor postmortem helpers now work on macOS's system Bash/Python, so missing tmux sessions write the public-safe `vanished.json` marker and prompt injection exits through the guarded refusal path.
+
+## [0.9.1] - 2026-07-08
 
 ### Added
 

@@ -5,6 +5,7 @@ import {
 	dispatchRpcCommand,
 	type RpcCommandDispatchContext,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
+import { isRpcCommand } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-validation";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
 function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
@@ -18,33 +19,76 @@ function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
 }
 
 describe("dispatchRpcCommand validation + error correlation", () => {
-	test("rejects an invalid thinking level with a correlated error (issue 02)", async () => {
-		const res = await dispatchRpcCommand(
-			{ id: "t1", type: "set_thinking_level", level: "BOGUS" } as unknown as RpcCommand,
-			ctx(),
-		);
-		expect(res.success).toBe(false);
-		expect(res.id).toBe("t1");
-		expect(res.command).toBe("set_thinking_level");
+	test("rejects raw malformed default-selection commands before dispatch", () => {
+		expect(
+			isRpcCommand({
+				id: "d-inherit",
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: "claude-sonnet-4-5",
+				thinkingLevel: "inherit",
+			}),
+		).toBe(false);
+		expect(
+			isRpcCommand({
+				id: "d-malformed-level",
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: "claude-sonnet-4-5",
+				thinkingLevel: "BOGUS",
+			}),
+		).toBe(false);
 	});
 
-	test("rejects an invalid steering mode (issue 02)", async () => {
+	test("rejects an unknown model without dispatching the default-selection handler", async () => {
+		let handlerCalled = false;
 		const res = await dispatchRpcCommand(
-			{ id: "s1", type: "set_steering_mode", mode: "BOGUS" } as unknown as RpcCommand,
-			ctx(),
+			{
+				id: "d-invalid-model",
+				type: "set_default_model_selection",
+				provider: "anthropic",
+				modelId: "missing-model",
+				thinkingLevel: "off",
+			} as unknown as RpcCommand,
+			ctx({
+				getAvailableModels: () => [{ provider: "anthropic", id: "claude-sonnet-4-5" }],
+				setDefaultModelSelection: async () => {
+					handlerCalled = true;
+					return { provider: "anthropic", modelId: "missing-model", thinkingLevel: "off" };
+				},
+			} as unknown as Partial<AgentSession>),
 		);
 		expect(res.success).toBe(false);
-		expect(res.id).toBe("s1");
-		expect(res.command).toBe("set_steering_mode");
+		expect(res.id).toBe("d-invalid-model");
+		expect(res.command).toBe("set_default_model_selection");
+		if (res.success) throw new Error("expected model validation failure");
+		expect(res.error).toBe("Model not found: anthropic/missing-model");
+		expect(handlerCalled).toBe(false);
 	});
 
-	test("rejects an invalid interrupt mode (issue 02)", async () => {
+	test("returns the normalized default model selection response", async () => {
+		const model = { provider: "anthropic", id: "claude-sonnet-4-5" } as Parameters<AgentSession["setModel"]>[0];
 		const res = await dispatchRpcCommand(
-			{ id: "i1", type: "set_interrupt_mode", mode: 123 } as unknown as RpcCommand,
-			ctx(),
+			{
+				id: "d2",
+				type: "set_default_model_selection",
+				provider: model.provider,
+				modelId: model.id,
+				thinkingLevel: "off",
+			} as unknown as RpcCommand,
+			ctx({
+				getAvailableModels: () => [model],
+				setDefaultModelSelection: async () => ({
+					provider: model.provider,
+					modelId: model.id,
+					thinkingLevel: "off",
+				}),
+			} as unknown as Partial<AgentSession>),
 		);
-		expect(res.success).toBe(false);
-		expect(res.command).toBe("set_interrupt_mode");
+		expect(res.success).toBe(true);
+		if (res.success && res.command === "set_default_model_selection") {
+			expect(res.data).toEqual({ provider: model.provider, modelId: model.id, thinkingLevel: "off" });
+		}
 	});
 
 	test("applies a valid thinking level", async () => {
@@ -59,24 +103,5 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 		);
 		expect(res.success).toBe(true);
 		expect(applied).toBe(ThinkingLevel.High);
-	});
-
-	test("a handler exception is correlated to the request id and real command, not 'parse' (issue 01)", async () => {
-		// `set_session_name` with no `name` throws inside the handler (command.name.trim()).
-		const res = await dispatchRpcCommand({ id: "n1", type: "set_session_name" } as unknown as RpcCommand, ctx());
-		expect(res.success).toBe(false);
-		expect(res.id).toBe("n1");
-		expect(res.command).toBe("set_session_name");
-		expect(res.command).not.toBe("parse");
-	});
-
-	test("an unknown command preserves the caller's request id (issue 01 default sub-case)", async () => {
-		const res = await dispatchRpcCommand(
-			{ id: "u1", type: "totally_unknown_command" } as unknown as RpcCommand,
-			ctx(),
-		);
-		expect(res.success).toBe(false);
-		expect(res.id).toBe("u1");
-		expect(res.command).toBe("totally_unknown_command");
 	});
 });

@@ -115,6 +115,13 @@ describe("RpcClient UDS transport", () => {
 			const [state, tools] = await Promise.all([client.getState(), client.setCustomTools([hostEchoTool])]);
 			expect(state.sessionId).toBeTruthy();
 			expect(tools).toContain("host_echo");
+			await expect(
+				client.setDefaultModelSelection({
+					provider: "rpc-test",
+					modelId: "rpc-test-model",
+					thinkingLevel: "off",
+				}),
+			).resolves.toEqual({ provider: "rpc-test", modelId: "rpc-test-model", thinkingLevel: "off" });
 			expect(Array.isArray(await client.getPendingWorkflowGates())).toBe(true);
 			await expect(client.respondGate("wg_missing", "approve", "k1")).rejects.toThrow(
 				/workflow gates are not available|no pending gate|not negotiated|not available/i,
@@ -139,6 +146,94 @@ describe("RpcClient UDS transport", () => {
 		}
 	}, 60_000);
 
+	test("setDefaultModelSelection sends the additive wire command and normalizes its response", async () => {
+		const socketPath = path.join(workspace, "default-selection.sock");
+		const server = net.createServer(socket => {
+			socket.write(`${JSON.stringify({ type: "ready" })}\n`);
+			let buffered = "";
+			socket.on("data", data => {
+				buffered += data.toString();
+				const newline = buffered.indexOf("\n");
+				if (newline < 0) return;
+				const frame = JSON.parse(buffered.slice(0, newline));
+				expect(frame.type).toBe("set_default_model_selection");
+				expect(frame.provider).toBe("rpc-test");
+				expect(frame.modelId).toBe("rpc-test-model");
+				expect(frame.thinkingLevel).toBe("off");
+				socket.write(
+					`${JSON.stringify({
+						id: frame.id,
+						type: "response",
+						command: frame.type,
+						success: true,
+						data: { provider: "rpc-test", modelId: "rpc-test-model", thinkingLevel: "off" },
+					})}\n`,
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		try {
+			const client = new RpcClient({ transport: "uds", socketPath });
+			await client.start();
+			await expect(
+				client.setDefaultModelSelection({
+					provider: "rpc-test",
+					modelId: "rpc-test-model",
+					thinkingLevel: "off",
+				}),
+			).resolves.toEqual({ provider: "rpc-test", modelId: "rpc-test-model", thinkingLevel: "off" });
+			client.stop();
+		} finally {
+			server.close();
+		}
+	});
+	test("rejects a correlated old-server unknown-command response without fallback", async () => {
+		const socketPath = path.join(workspace, "old-server-default-selection.sock");
+		let requests = 0;
+		const server = net.createServer(socket => {
+			socket.write(`${JSON.stringify({ type: "ready" })}\n`);
+			let buffered = "";
+			socket.on("data", data => {
+				buffered += data.toString();
+				const newline = buffered.indexOf("\n");
+				if (newline < 0) return;
+				const frame = JSON.parse(buffered.slice(0, newline)) as { id: string; type: string };
+				requests++;
+				expect(frame.type).toBe("set_default_model_selection");
+				socket.write(
+					`${JSON.stringify({
+						id: frame.id,
+						type: "response",
+						command: frame.type,
+						success: false,
+						error: "Unknown command: set_default_model_selection",
+					})}\n`,
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+		try {
+			const client = new RpcClient({ transport: "uds", socketPath });
+			await client.start();
+			await expect(
+				client.setDefaultModelSelection({
+					provider: "rpc-test",
+					modelId: "rpc-test-model",
+					thinkingLevel: "off",
+				}),
+			).rejects.toThrow("Unknown command: set_default_model_selection");
+			expect(requests).toBe(1);
+			client.stop();
+		} finally {
+			server.close();
+		}
+	});
 	test("dispatches real server UI, workflow gate, and host-tool frames over UDS", async () => {
 		const socketPath = path.join(workspace, "frame-dispatch.sock");
 		let serverSocket: net.Socket | undefined;
