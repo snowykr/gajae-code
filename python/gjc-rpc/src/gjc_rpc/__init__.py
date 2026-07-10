@@ -59,6 +59,7 @@ from .protocol import (
     MessageStartEvent,
     MessageUpdateEvent,
     ModelCycleResult,
+    ResolvedModelSelection,
     ModelInfo,
     ModelCost,
     NoticeEvent,
@@ -74,6 +75,7 @@ from .protocol import (
     SessionStats,
     SubagentSteerMessageEvent,
     ThinkingConfig,
+    ResolvedThinkingLevel,
     ThinkingLevel,
     ThinkingLevelChangedEvent,
     ThinkingLevelCycleResult,
@@ -110,6 +112,7 @@ from .protocol import (
     parse_todo_phases,
     parse_login_provider,
     parse_unattended_accepted,
+    parse_resolved_model_selection,
 )
 
 __all__ = [
@@ -168,6 +171,7 @@ __all__ = [
     "ModelCost",
     "ModelCycleResult",
     "ModelInfo",
+    "ResolvedModelSelection",
     "NoticeEvent",
     "NotificationListener",
     "PromptTurn",
@@ -193,6 +197,7 @@ __all__ = [
     "SubagentSteerMessageEvent",
     "ThinkingConfig",
     "ThinkingLevel",
+    "ResolvedThinkingLevel",
     "ThinkingLevelChangedEvent",
     "ThinkingLevelCycleResult",
     "TodoAutoClearEvent",
@@ -223,6 +228,7 @@ __all__ = [
     "parse_workflow_gate",
     "parse_workflow_gate_event",
     "parse_session_state",
+    "parse_resolved_model_selection",
     "parse_todo_phases",
     "host_tool",
     "host_uri",

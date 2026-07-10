@@ -26,7 +26,6 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
-	assertImagePlaceholdersHavePayload,
 	type ResolvedThinkingLevel,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
@@ -145,6 +144,7 @@ import {
 	formatModelString,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveAllowedModels,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
@@ -6709,6 +6709,13 @@ export class AgentSession {
 			throw new Error(`Thinking level ${thinkingLevel} is not supported by ${model.provider}/${model.id}`);
 		}
 
+		const allowedModels = await resolveAllowedModels(this.#modelRegistry, this.settings, {
+			usageOrder: this.settings.getStorage()?.getModelUsageOrder(),
+		});
+		if (!allowedModels.some(candidate => modelsAreEqual(candidate, model))) {
+			throw new Error(`Model unavailable for default selection: ${model.provider}/${model.id}`);
+		}
+
 		await this.setModel(model, "default", { thinkingLevel: effectiveLevel, persistThinkingLevel: true });
 		materializeActiveModelProfileAssignment({
 			session: this,
@@ -6978,8 +6985,8 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
-				this.settings.set("defaultThinkingLevel", effectiveLevel);
+			if (persist && effectiveLevel !== undefined) {
+				this.settings.set("defaultThinkingLevel", effectiveLevel as Effort);
 			}
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}

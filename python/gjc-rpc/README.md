@@ -27,6 +27,19 @@ with RpcClient(provider="anthropic", model="claude-sonnet-4-5") as client:
     print(turn.require_assistant_text())
 ```
 
+For hosts that need to persist the model used by future sessions, use the typed
+default-selection command. It rejects `inherit`, returns the server-normalized
+concrete reasoning level, and raises `RpcCommandError` without falling back to
+separate session-only setters when the server cannot handle the command:
+
+```python
+with RpcClient(model="anthropic/claude-sonnet-4-5") as client:
+    selection = client.set_default_model_selection(
+        "anthropic", "claude-sonnet-4-5", "high"
+    )
+    print(selection.model_id, selection.thinking_level)
+```
+
 The wrapper also exposes the common RPC startup flags directly, so scripts do not
 need to build `extra_args` by hand:
 

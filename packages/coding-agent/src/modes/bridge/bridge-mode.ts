@@ -4,6 +4,7 @@ import type { AgentSession } from "../../session/agent-session";
 import type { ClientBridgePermissionOutcome } from "../../session/client-bridge";
 import type { RpcCommand, RpcResponse, RpcWorkflowGateResponse } from "../rpc/rpc-types";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
+import { createRpcCommandScheduler } from "../shared/agent-wire/command-scheduler";
 import { isRpcCommand } from "../shared/agent-wire/command-validation";
 import {
 	BridgeFrameSequencer,
@@ -231,6 +232,9 @@ function frameTypeForDispatchOutput(obj: RpcResponse | object): BridgeFrameType 
 }
 
 export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (request: Request) => Promise<Response> {
+	const commandScheduler = options.commandDispatcher
+		? createRpcCommandScheduler(options.commandDispatcher)
+		: undefined;
 	return async request => {
 		const endpointMatrix = bridgeEndpointMatrix(options);
 		const url = new URL(request.url);
@@ -368,7 +372,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 				return jsonResponse(403, { error: "scope_denied", scope: scopeForRpcCommand(type) });
 			}
 			try {
-				const response = await options.commandDispatcher(payload);
+				const response = await commandScheduler!.dispatch(payload);
 				pendingResponse?.resolve(response);
 				const cachedRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
 				if (cachedRecord) cachedRecord.pending = false;

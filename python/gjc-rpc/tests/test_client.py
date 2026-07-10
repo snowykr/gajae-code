@@ -265,6 +265,15 @@ FAKE_SERVER = textwrap.dedent(
             model_provider = command["provider"]
             model_id = command["modelId"]
             respond(request_id, "set_model", model_info(model_id, model_provider))
+        elif command_type == "set_default_model_selection":
+            model_provider = command["provider"]
+            model_id = command["modelId"]
+            thinking_level = command["thinkingLevel"]
+            respond(
+                request_id,
+                "set_default_model_selection",
+                {"provider": model_provider, "modelId": model_id, "thinkingLevel": thinking_level},
+            )
         elif command_type == "cycle_model":
             model_id = "claude-sonnet-4-6" if model_id == "claude-sonnet-4-5" else "claude-sonnet-4-5"
             respond(request_id, "cycle_model", {"model": model_info(model_id, model_provider), "thinkingLevel": thinking_level, "isScoped": False})
@@ -655,6 +664,29 @@ BROKEN_STARTUP_SERVER = textwrap.dedent(
     sys.stdout.flush()
     """
 )
+OLD_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+    for raw_line in sys.stdin:
+        request = json.loads(raw_line)
+        command = request["type"]
+        print(
+            json.dumps(
+                {
+                    "id": request.get("id"),
+                    "type": "response",
+                    "command": command,
+                    "success": False,
+                    "error": f"Unknown command: {command}",
+                }
+            ),
+            flush=True,
+        )
+    """
+)
 
 
 class RpcClientTests(unittest.TestCase):
@@ -860,6 +892,22 @@ class RpcClientTests(unittest.TestCase):
 
             state = client.get_state()
             self.assertEqual(state.todo_phases[0].tasks[1].content, "Exercise edits")
+
+    def test_default_model_selection_preserves_correlated_server_error(self) -> None:
+        with self.make_client(OLD_SERVER) as client:
+            with self.assertRaises(RpcCommandError) as raised:
+                client.set_default_model_selection("anthropic", "claude-sonnet-4-6", "high")
+
+        self.assertEqual(raised.exception.command, "set_default_model_selection")
+        self.assertEqual(raised.exception.error, "Unknown command: set_default_model_selection")
+
+    def test_default_model_selection_returns_normalized_concrete_result(self) -> None:
+        with self.make_client() as client:
+            selection = client.set_default_model_selection("anthropic", "claude-sonnet-4-6", "high")
+
+        self.assertEqual(selection.provider, "anthropic")
+        self.assertEqual(selection.model_id, "claude-sonnet-4-6")
+        self.assertEqual(selection.thinking_level, "high")
 
     def test_model_mode_and_session_commands(self) -> None:
         with self.make_client() as client:

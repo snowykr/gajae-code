@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
@@ -337,5 +337,22 @@ describe("AgentSession role model thinking behavior", () => {
 		};
 		await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow("durable save failed");
 		sessionSettings.flushOrThrow = flushOrThrow;
+	});
+	it("rejects a cwd-disabled durable default before mutating the session", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+
+		sessionSettings.override("disabledProviders", ["anthropic"]);
+		const setModelSpy = spyOn(session, "setModel");
+		await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow(
+			"Model unavailable for default selection",
+		);
+		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(session.model).toBe(initialModel);
 	});
 });

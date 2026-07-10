@@ -14,6 +14,7 @@ from gjc_rpc import (
     NoticeEvent,
     SessionState,
     SubagentSteerMessageEvent,
+    ResolvedModelSelection,
     ThinkingLevelChangedEvent,
     ToolExecutionStartEvent,
     UnknownNotification,
@@ -25,6 +26,7 @@ from gjc_rpc import (
     assistant_text_with_thinking,
     parse_notification,
     parse_session_state,
+    parse_resolved_model_selection,
     parse_workflow_gate,
     parse_workflow_gate_event,
 )
@@ -43,6 +45,27 @@ def _wrapped_event(event: dict) -> dict:
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_resolved_model_selection_is_strict_and_immutable(self) -> None:
+        result = parse_resolved_model_selection(
+            {"provider": "anthropic", "modelId": "claude-sonnet-4-5", "thinkingLevel": "high"}
+        )
+
+        self.assertIsInstance(result, ResolvedModelSelection)
+        self.assertEqual(result.provider, "anthropic")
+        self.assertEqual(result.model_id, "claude-sonnet-4-5")
+        self.assertEqual(result.thinking_level, "high")
+
+        with self.assertRaises((AttributeError, TypeError)):
+            result.thinking_level = "inherit"  # type: ignore[misc]
+
+        with self.assertRaises(ValueError):
+            parse_resolved_model_selection(
+                {"provider": "anthropic", "modelId": "claude-sonnet-4-5", "thinkingLevel": "inherit"}
+            )
+
+        with self.assertRaises(ValueError):
+            parse_resolved_model_selection({"provider": "anthropic", "modelId": "claude-sonnet-4-5"})
+
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
             {

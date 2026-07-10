@@ -985,22 +985,21 @@ export async function resolveModelScope(
 
 /**
  * Resolve the set of models a session is allowed to use, given the active
- * settings. Starts from `modelRegistry.getAvailable()` (so disabled providers
- * and providers without credentials are already filtered out) and, when
- * `enabledModels` is configured for the current path scope, further restricts
- * the result to models matching those patterns.
+ * settings. Starts from the registry's broadly available models, then applies
+ * the cwd-scoped provider deny-list and optional model allow-list.
  *
- * Returns the unfiltered available list when `enabledModels` is empty.
- * Returns an empty list when `enabledModels` is configured but no available
- * model matches any pattern — callers MUST treat this as "no usable model"
- * rather than falling back to the global default (see issue #1022).
+ * Returns the unfiltered available list when no cwd-scoped restrictions are
+ * configured. Returns an empty list when a configured restriction excludes every
+ * available model — callers MUST treat this as "no usable model" rather than
+ * falling back to the global default (see issue #1022).
  */
 export async function resolveAllowedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getCanonicalVariants">,
 	settings: Settings | undefined,
 	preferences?: ModelMatchPreferences,
 ): Promise<Model<Api>[]> {
-	const available = modelRegistry.getAvailable();
+	const disabledProviders = new Set(settings?.get("disabledProviders") ?? []);
+	const available = modelRegistry.getAvailable().filter(model => !disabledProviders.has(model.provider));
 	const patterns = settings?.get("enabledModels");
 	if (!patterns || patterns.length === 0) {
 		return available;

@@ -374,6 +374,19 @@ export class Settings {
 		}
 	}
 
+	async flushOrThrow(): Promise<void> {
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
+		}
+		if (this.#savePromise) {
+			await this.#savePromise;
+		}
+		if (this.#modified.size > 0) {
+			await this.#saveNow(true);
+		}
+	}
+
 	async cloneForCwd(cwd: string): Promise<Settings> {
 		const cloned = new Settings({
 			cwd,
@@ -817,7 +830,7 @@ export class Settings {
 		}, 100);
 	}
 
-	async #saveNow(): Promise<void> {
+	async #saveNow(throwOnError = false): Promise<void> {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
@@ -828,17 +841,23 @@ export class Settings {
 			await withFileLock(configPath, async () => {
 				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
-
-				// Apply only our modified paths
 				for (const modPath of modifiedPaths) {
+					// Apply only our modified paths
 					const segments = modPath.split(".");
 					const value = getByPath(this.#global, segments);
 					setByPath(current, segments, value);
 				}
-
-				// Update our global with any external changes we preserved
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				// Update our global with any external changes we preserved
+				const tempPath = `${configPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+				try {
+					await Bun.write(tempPath, YAML.stringify(this.#global, null, 2));
+					await fs.promises.rename(tempPath, configPath);
+				} finally {
+					try {
+						await fs.promises.unlink(tempPath);
+					} catch {}
+				}
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
@@ -846,6 +865,7 @@ export class Settings {
 			for (const p of modifiedPaths) {
 				this.#modified.add(p);
 			}
+			if (throwOnError) throw error;
 		}
 
 		this.#rebuildMerged();

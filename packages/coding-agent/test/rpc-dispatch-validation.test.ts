@@ -91,6 +91,53 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 		}
 	});
 
+	test("rejects an invalid thinking level with a correlated error", async () => {
+		const res = await dispatchRpcCommand(
+			{ id: "t1", type: "set_thinking_level", level: "BOGUS" } as unknown as RpcCommand,
+			ctx(),
+		);
+		expect(res.success).toBe(false);
+		expect(res.id).toBe("t1");
+		expect(res.command).toBe("set_thinking_level");
+	});
+
+	test("rejects an invalid steering mode with a correlated error", async () => {
+		const res = await dispatchRpcCommand(
+			{ id: "s1", type: "set_steering_mode", mode: "BOGUS" } as unknown as RpcCommand,
+			ctx(),
+		);
+		expect(res.success).toBe(false);
+		expect(res.id).toBe("s1");
+		expect(res.command).toBe("set_steering_mode");
+	});
+
+	test("rejects an invalid interrupt mode with a correlated error", async () => {
+		const res = await dispatchRpcCommand(
+			{ id: "i1", type: "set_interrupt_mode", mode: 123 } as unknown as RpcCommand,
+			ctx(),
+		);
+		expect(res.success).toBe(false);
+		expect(res.id).toBe("i1");
+		expect(res.command).toBe("set_interrupt_mode");
+	});
+
+	test("correlates handler exceptions to the request id and command", async () => {
+		const res = await dispatchRpcCommand({ id: "n1", type: "set_session_name" } as unknown as RpcCommand, ctx());
+		expect(res.success).toBe(false);
+		expect(res.id).toBe("n1");
+		expect(res.command).toBe("set_session_name");
+		expect(res.command).not.toBe("parse");
+	});
+
+	test("preserves the caller request id for unknown commands", async () => {
+		const res = await dispatchRpcCommand(
+			{ id: "u1", type: "totally_unknown_command" } as unknown as RpcCommand,
+			ctx(),
+		);
+		expect(res.success).toBe(false);
+		expect(res.id).toBe("u1");
+		expect(res.command).toBe("totally_unknown_command");
+	});
 	test("applies a valid thinking level", async () => {
 		let applied: unknown;
 		const res = await dispatchRpcCommand(
