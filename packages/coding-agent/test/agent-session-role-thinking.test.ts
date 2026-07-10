@@ -280,6 +280,20 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
+	it("persists the requested default thinking level even when the session is already at that level", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}:high` },
+		});
+
+		sessionSettings.set("defaultThinkingLevel", Effort.Low);
+		session.setThinkingLevel(Effort.High, true);
+
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionSettings.get("defaultThinkingLevel")).toBe(Effort.High);
+	});
 	it("persists the default model selection with concrete off thinking at the flush boundary", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
@@ -395,6 +409,7 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(savedSettings.modelRoles?.default).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
 		expect(savedSettings.defaultThinkingLevel).toBe("off");
 		expect(session.model).toEqual(selectedModel);
+		expect(session.thinkingLevel).toBe("off");
 	});
 	it("rejects a cwd-disabled durable default before mutating the session", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

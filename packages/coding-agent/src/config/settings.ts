@@ -345,7 +345,7 @@ export class Settings {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		await this.#startSave(true, () => this.#commitDurableNow(updates));
+		await this.#startSave({ throwOnError: true }, () => this.#commitDurableNow(updates));
 	}
 
 	/**
@@ -382,13 +382,21 @@ export class Settings {
 			this.#saveTimer = undefined;
 		}
 		if (this.#savePromise) {
-			await this.#savePromise;
+			try {
+				await this.#savePromise;
+			} catch {}
 		}
 		if (this.#modified.size > 0) {
 			await this.#startSave();
 		}
 	}
 
+	/**
+	 * Like {@link flush}, but rejects if the durable save fails instead of
+	 * swallowing the error. Use where the caller must confirm persistence before
+	 * reporting success (e.g. the Telegram `/rich` toggle). In-memory instances
+	 * ({@link isolated}) short-circuit in {@link #saveNow} and never throw.
+	 */
 	async flushOrThrow(): Promise<void> {
 		if (this.#saveTimer) {
 			clearTimeout(this.#saveTimer);
@@ -398,7 +406,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#startSave(true);
+			await this.#startSave({ throwOnError: true });
 		}
 	}
 
@@ -845,9 +853,12 @@ export class Settings {
 		}, 100);
 	}
 
-	#startSave(throwOnError = false, task: (() => Promise<void>) | undefined = undefined): Promise<void> {
+	#startSave(
+		options: { throwOnError?: boolean } = {},
+		task: (() => Promise<void>) | undefined = undefined,
+	): Promise<void> {
 		const previousSave = this.#savePromise ?? Promise.resolve();
-		const savePromise = previousSave.then(() => (task ? task() : this.#saveNow(throwOnError)));
+		const savePromise = previousSave.catch(() => undefined).then(() => (task ? task() : this.#saveNow(options)));
 		this.#savePromise = savePromise;
 		savePromise.then(
 			() => {
@@ -922,7 +933,7 @@ export class Settings {
 		}
 	}
 
-	async #saveNow(throwOnError = false): Promise<void> {
+	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
@@ -939,12 +950,12 @@ export class Settings {
 					const value = getByPath(this.#global, segments);
 					setByPath(current, segments, value);
 				}
-				this.#global = current;
 				// Update our global with any external changes we preserved
 				const tempPath = `${configPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
 				try {
-					await Bun.write(tempPath, YAML.stringify(this.#global, null, 2));
+					await Bun.write(tempPath, YAML.stringify(current, null, 2));
 					await fs.promises.rename(tempPath, configPath);
+					this.#global = current;
 				} finally {
 					try {
 						await fs.promises.unlink(tempPath);
@@ -953,15 +964,14 @@ export class Settings {
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Keep ordinary background/flush saves retryable. An explicit
-			// durability acknowledgement must reject without leaving its
-			// failed selection queued for a later flush.
-			if (!throwOnError) {
-				for (const p of modifiedPaths) {
-					this.#modified.add(p);
-				}
+			// Re-add failed paths for retry, including explicit durability barriers.
+			for (const p of modifiedPaths) {
+				this.#modified.add(p);
 			}
-			if (throwOnError) throw error;
+			if (options.throwOnError) {
+				this.#rebuildMerged();
+				throw error;
+			}
 		}
 
 		this.#rebuildMerged();

@@ -238,6 +238,13 @@ describe("Settings", () => {
 		});
 	});
 	describe("durable save barriers", () => {
+		it("preserves the high default while accepting off as a configured level", () => {
+			const settings = Settings.isolated();
+
+			expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
+			settings.set("defaultThinkingLevel", "off");
+			expect(settings.get("defaultThinkingLevel")).toBe("off");
+		});
 		it("persists off as an explicit default thinking level", async () => {
 			await writeSettings({ defaultThinkingLevel: Effort.High });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -263,20 +270,22 @@ describe("Settings", () => {
 			expect(freshSettings.get("defaultThinkingLevel")).toBe(Effort.Low);
 			expect(freshSettings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-6:low");
 		});
-		it("does not retry an explicitly rejected durability save", async () => {
+		it("keeps an explicitly rejected durability save retryable", async () => {
 			await writeSettings({ defaultThinkingLevel: Effort.High });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			settings.set("defaultThinkingLevel", Effort.Low);
 
-			const writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
-				throw new Error("durable save failed");
+			const realWrite = Bun.write.bind(Bun);
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (String(target).endsWith(".tmp")) throw new Error("durable save failed");
+				return realWrite(String(target), String(data));
 			});
 			await expect(settings.flushOrThrow()).rejects.toThrow("durable save failed");
 			writeSpy.mockRestore();
 
 			await settings.flush();
 			const savedSettings = await readSettings();
-			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
+			expect(savedSettings.defaultThinkingLevel).toBe(Effort.Low);
 		});
 
 		it("waits for an in-flight debounced save before acknowledging the latest value", async () => {

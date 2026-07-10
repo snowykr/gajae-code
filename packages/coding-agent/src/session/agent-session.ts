@@ -6822,10 +6822,14 @@ export class AgentSession {
 		const { model } = prepared;
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
-		this.sessionManager.appendModelChange(
-			`${model.provider}/${model.id}`,
-			prepared.persistAsSessionDefault ? "default" : "temporary",
-		);
+		try {
+			this.sessionManager.appendModelChange(
+				`${model.provider}/${model.id}`,
+				prepared.persistAsSessionDefault ? "default" : "temporary",
+			);
+		} catch (error) {
+			logger.warn("Session: prepared model log append failed", { error: String(error) });
+		}
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
 		// Apply explicit thinking level if given; otherwise prefer the model's
@@ -7048,7 +7052,7 @@ export class AgentSession {
 
 	/**
 	 * Set thinking level.
-	 * Saves the effective metadata-clamped level to session and settings only if it changes.
+	 * Saves the effective metadata-clamped level to the session, and to settings when requested.
 	 */
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
@@ -7057,11 +7061,12 @@ export class AgentSession {
 		this.#thinkingLevel = effectiveLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
 
+		if (persist && effectiveLevel !== undefined) {
+			this.settings.set("defaultThinkingLevel", effectiveLevel);
+		}
+
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (persist && effectiveLevel !== undefined) {
-				this.settings.set("defaultThinkingLevel", effectiveLevel as Effort);
-			}
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
