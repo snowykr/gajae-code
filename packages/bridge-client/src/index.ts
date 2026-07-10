@@ -113,16 +113,15 @@ function isResolvedModelSelection(value: unknown): value is BridgeResolvedModelS
 }
 
 function parseDefaultModelSelectionResponse(response: unknown): BridgeResolvedModelSelection {
-	if (
-		!isRecord(response) ||
-		response.type !== "response" ||
-		response.command !== "set_default_model_selection" ||
-		response.success !== true ||
-		!isResolvedModelSelection(response.data)
-	) {
+	if (!isRecord(response) || response.type !== "response" || response.command !== "set_default_model_selection") {
 		throw new Error("Bridge returned a malformed set_default_model_selection response");
 	}
-	return response.data;
+	if (response.success === false) {
+		if (typeof response.error === "string") throw new Error(response.error);
+		if (isRecord(response.error)) throw new Error(JSON.stringify(response.error));
+	}
+	if (response.success === true && isResolvedModelSelection(response.data)) return response.data;
+	throw new Error("Bridge returned a malformed set_default_model_selection response");
 }
 
 function parseBridgeErrorDetail(body: string): string | undefined {

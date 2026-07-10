@@ -154,6 +154,40 @@ describe("BridgeClient", () => {
 		await expect(selection).rejects.toThrow("Bridge request failed: 400 (invalid_command)");
 	});
 
+	it.each([
+		["string", "Model is unavailable", "Model is unavailable"],
+		[
+			"structured",
+			{ code: "invalid_model", message: "Model is unavailable" },
+			'{"code":"invalid_model","message":"Model is unavailable"}',
+		],
+	] as const)("preserves a correlated %s command error in an HTTP-success response", async (_kind, error, detail) => {
+		// Given: the bridge transported a valid failed-command envelope over HTTP 200.
+		const client = new BridgeClient({
+			baseUrl: "https://bridge.test",
+			token: "secret",
+			fetch: async () =>
+				new Response(
+					JSON.stringify({
+						id: "request-17",
+						type: "response",
+						command: "set_default_model_selection",
+						success: false,
+						error,
+					}),
+					{ status: 200 },
+				),
+		});
+
+		// When: the typed helper receives the correlated command failure.
+		const selection = client.setDefaultModelSelection("sess-1", "openai", "gpt-4o", "max", {
+			id: "request-17",
+		});
+
+		// Then: the explicit server diagnostic is preserved instead of reported as malformed success data.
+		await expect(selection).rejects.toThrow(detail);
+	});
+
 	it("sends controller claim and UI response requests", async () => {
 		const seen: Array<{ url: string; headers: Record<string, string>; body: string | null }> = [];
 		const client = new BridgeClient({
