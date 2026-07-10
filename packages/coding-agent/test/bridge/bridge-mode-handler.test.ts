@@ -28,6 +28,22 @@ type HandshakeJson = {
 	};
 };
 
+function deferredRequestBody(): {
+	readonly stream: ReadableStream<Uint8Array>;
+	readonly resolve: (body: string) => void;
+} {
+	const body = Promise.withResolvers<string>();
+	return {
+		stream: new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				controller.enqueue(new TextEncoder().encode(await body.promise));
+				controller.close();
+			},
+		}),
+		resolve: body.resolve,
+	};
+}
+
 describe("bridge mode fetch handler", () => {
 	it("serves health without auth", async () => {
 		const handle = createBridgeFetchHandler({ sessionId: "sess-1", token: "secret" });
@@ -273,8 +289,11 @@ describe("bridge mode fetch handler", () => {
 		expect(await first.json()).toEqual({ id: "req-1", type: "response", command: "prompt", success: true });
 	});
 
-	it("preserves mutation arrival order across distinct idempotency keys", async () => {
+	it("preserves mutation arrival order when the earlier request body is slow", async () => {
+		const firstBody = deferredRequestBody();
 		const releaseFirst = Promise.withResolvers<void>();
+		const firstStarted = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
 		const order: string[] = [];
 		const handle = createBridgeFetchHandler({
 			sessionId: "sess-1",
@@ -284,7 +303,11 @@ describe("bridge mode fetch handler", () => {
 			idempotencyCache: new Map(),
 			commandDispatcher: async command => {
 				order.push(`start:${command.type}`);
-				if (command.type === "set_model") await releaseFirst.promise;
+				if (command.type === "set_model") {
+					firstStarted.resolve();
+					await releaseFirst.promise;
+				}
+				if (command.type === "set_thinking_level") secondStarted.resolve();
 				order.push(`end:${command.type}`);
 				return rpcSuccess(command.id, command.type);
 			},
@@ -293,7 +316,7 @@ describe("bridge mode fetch handler", () => {
 			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
 				method: "POST",
 				headers: { Authorization: "Bearer secret", "Idempotency-Key": "model-1" },
-				body: JSON.stringify({ id: "model-1", type: "set_model", provider: "p", modelId: "m" }),
+				body: firstBody.stream,
 			}),
 		);
 		const second = handle(
@@ -303,13 +326,154 @@ describe("bridge mode fetch handler", () => {
 				body: JSON.stringify({ id: "thinking-1", type: "set_thinking_level", level: "high" }),
 			}),
 		);
-		await Bun.sleep(1);
 
+		expect(await Promise.race([secondStarted.promise.then(() => "started"), Promise.resolve("pending")])).toBe(
+			"pending",
+		);
+		expect(order).toEqual([]);
+		firstBody.resolve(JSON.stringify({ id: "model-1", type: "set_model", provider: "p", modelId: "m" }));
+		await firstStarted.promise;
 		expect(order).toEqual(["start:set_model"]);
 		releaseFirst.resolve();
 		expect((await first).status).toBe(200);
 		expect((await second).status).toBe(200);
 		expect(order).toEqual(["start:set_model", "end:set_model", "start:set_thinking_level", "end:set_thinking_level"]);
+	});
+
+	it("holds later mutations until a slow invalid body releases its reservation", async () => {
+		const invalidBody = deferredRequestBody();
+		const dispatched = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model"],
+			endpointMatrix: { commands: true },
+			commandDispatcher: async command => {
+				calls.push(command.id ?? "missing-id");
+				dispatched.resolve();
+				return rpcSuccess(command.id ?? "missing-id", command.type);
+			},
+		});
+		const invalid = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: invalidBody.stream,
+			}),
+		);
+		const later = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: "thinking-1", type: "set_thinking_level", level: "high" }),
+			}),
+		);
+
+		expect(await Promise.race([dispatched.promise.then(() => "started"), Promise.resolve("pending")])).toBe(
+			"pending",
+		);
+		expect(calls).toEqual([]);
+		invalidBody.resolve("{");
+		expect((await invalid).status).toBe(400);
+		expect((await later).status).toBe(200);
+	});
+
+	it("keeps a fast read independent without cutting the mutation reservation chain", async () => {
+		const slowMutationBody = deferredRequestBody();
+		const fastReadStarted = Promise.withResolvers<void>();
+		const laterMutationStarted = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model", "message:read"],
+			endpointMatrix: { commands: true },
+			commandDispatcher: async command => {
+				calls.push(command.id ?? "missing-id");
+				if (command.type === "get_state") fastReadStarted.resolve();
+				if (command.type === "set_thinking_level") laterMutationStarted.resolve();
+				return rpcSuccess(command.id ?? "missing-id", command.type);
+			},
+		});
+		const mutation = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: slowMutationBody.stream,
+			}),
+		);
+		const fastRead = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: "read-1", type: "get_state" }),
+			}),
+		);
+		const laterMutation = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: "thinking-1", type: "set_thinking_level", level: "high" }),
+			}),
+		);
+
+		await fastReadStarted.promise;
+		expect((await fastRead).status).toBe(200);
+		expect(await Promise.race([laterMutationStarted.promise.then(() => "started"), Promise.resolve("pending")])).toBe(
+			"pending",
+		);
+		expect(calls).toEqual(["read-1"]);
+		slowMutationBody.resolve(JSON.stringify({ id: "model-1", type: "set_model", provider: "p", modelId: "m" }));
+		expect((await mutation).status).toBe(200);
+		expect((await laterMutation).status).toBe(200);
+		expect(calls).toEqual(["read-1", "model-1", "thinking-1"]);
+	});
+
+	it("releases invalid command, denied scope, replay, and rejected dispatcher reservations", async () => {
+		const releaseReplayOwner = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model"],
+			endpointMatrix: { commands: true },
+			idempotencyCache: new Map(),
+			commandDispatcher: async command => {
+				calls.push(command.id ?? "missing-id");
+				if (command.id === "owner") await releaseReplayOwner.promise;
+				if (command.id === "rejected") throw new Error("dispatcher rejected");
+				return rpcSuccess(command.id ?? "missing-id", command.type);
+			},
+		});
+		const request = (body: object, idempotencyKey?: string) =>
+			handle(
+				new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+					method: "POST",
+					headers: {
+						Authorization: "Bearer secret",
+						...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+					},
+					body: JSON.stringify(body),
+				}),
+			);
+
+		const invalid = await request({ id: "invalid", type: "set_model" });
+		const denied = await request({ id: "denied", type: "bash", command: "echo denied" });
+		const ownerBody = { id: "owner", type: "set_model", provider: "p", modelId: "m" };
+		const owner = request(ownerBody, "shared-key");
+		const replay = request(ownerBody, "shared-key");
+		const rejected = request({ id: "rejected", type: "set_thinking_level", level: "high" });
+		const later = request({ id: "later", type: "set_thinking_level", level: "low" });
+		releaseReplayOwner.resolve();
+
+		expect(invalid.status).toBe(400);
+		expect(denied.status).toBe(403);
+		expect((await owner).status).toBe(200);
+		expect((await replay).status).toBe(200);
+		expect((await rejected.catch(error => error)).message).toBe("dispatcher rejected");
+		expect((await later).status).toBe(200);
+		expect(calls).toEqual(["owner", "rejected", "later"]);
 	});
 
 	it("rejects command scopes before dispatch", async () => {

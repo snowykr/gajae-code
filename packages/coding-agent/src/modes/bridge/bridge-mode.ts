@@ -4,7 +4,7 @@ import type { AgentSession } from "../../session/agent-session";
 import type { ClientBridgePermissionOutcome } from "../../session/client-bridge";
 import type { RpcCommand, RpcResponse, RpcWorkflowGateResponse } from "../rpc/rpc-types";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
-import { createRpcCommandScheduler } from "../shared/agent-wire/command-scheduler";
+import { createRpcCommandScheduler, isFastLaneRpcCommand } from "../shared/agent-wire/command-scheduler";
 import { isRpcCommand } from "../shared/agent-wire/command-validation";
 import {
 	BridgeFrameSequencer,
@@ -235,6 +235,13 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 	const commandScheduler = options.commandDispatcher
 		? createRpcCommandScheduler(options.commandDispatcher)
 		: undefined;
+	let commandReservationTail = Promise.resolve();
+	const reserveCommandOrder = () => {
+		const preceding = commandReservationTail;
+		const reservation = Promise.withResolvers<void>();
+		commandReservationTail = preceding.then(() => reservation.promise);
+		return { preceding, release: reservation.resolve };
+	};
 	return async request => {
 		const endpointMatrix = bridgeEndpointMatrix(options);
 		const url = new URL(request.url);
@@ -320,6 +327,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 		if (request.method === "POST" && url.pathname === `/v1/sessions/${options.sessionId}/commands`) {
 			if (!endpointMatrix.commands) return disabledEndpointResponse("commands");
 			if (!commandScheduler) return jsonResponse(503, { error: "commands_unavailable" });
+			const reservation = reserveCommandOrder();
 			const idempotencyKey = request.headers.get("Idempotency-Key") ?? undefined;
 			const existingRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
 			let body = "";
@@ -332,7 +340,10 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 						route: url.pathname,
 						body,
 					});
-					if (cached) return await cached;
+					if (cached) {
+						reservation.release();
+						return await cached;
+					}
 				} else {
 					const bodyPromise = request.text();
 					pendingResponse = Promise.withResolvers<unknown>();
@@ -349,6 +360,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			} catch {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
 				pendingResponse?.reject(new Error("invalid_json"));
+				reservation.release();
 				return jsonResponse(400, { error: "invalid_json" });
 			}
 			const type =
@@ -358,20 +370,25 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			if (!isRpcCommandType(type)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
 				pendingResponse?.reject(new Error("invalid_command"));
+				reservation.release();
 				return jsonResponse(400, { error: "invalid_command" });
 			}
 			if (!isRpcCommand(payload)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
 				pendingResponse?.reject(new Error("invalid_command"));
+				reservation.release();
 				return jsonResponse(400, { error: "invalid_command" });
 			}
 			const scopes = new Set(options.commandScopes ?? DEFAULT_BRIDGE_SCOPES);
 			if (!isRpcCommandAllowed(type, scopes)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
 				pendingResponse?.reject(new Error("scope_denied"));
+				reservation.release();
 				return jsonResponse(403, { error: "scope_denied", scope: scopeForRpcCommand(type) });
 			}
 			try {
+				if (isFastLaneRpcCommand(payload.type)) reservation.release();
+				else await reservation.preceding;
 				const response = await commandScheduler.dispatch(payload);
 				pendingResponse?.resolve(response);
 				const cachedRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
@@ -381,6 +398,8 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
 				pendingResponse?.reject(err);
 				throw err;
+			} finally {
+				reservation.release();
 			}
 		}
 		if (request.method === "POST" && url.pathname === `/v1/sessions/${options.sessionId}/control:claim`) {
