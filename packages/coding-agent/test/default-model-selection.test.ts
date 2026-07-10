@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
@@ -8,6 +9,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 
 describe("durable default model selection", () => {
 	let tempDir: TempDir;
@@ -31,9 +33,11 @@ describe("durable default model selection", () => {
 		return result;
 	}
 
-	async function createSession(settings: Settings): Promise<AgentSession> {
+	async function createSession(settings: Settings, initializeDefault: boolean = true): Promise<AgentSession> {
 		const initialModel = model("claude-sonnet-4-5");
-		settings.setModelRole("default", `${initialModel.provider}/${initialModel.id}:high`);
+		if (initializeDefault) {
+			settings.setModelRole("default", `${initialModel.provider}/${initialModel.id}:high`);
+		}
 		const agent = new Agent({
 			initialState: {
 				model: initialModel,
@@ -90,8 +94,10 @@ describe("durable default model selection", () => {
 		const settings = await Settings.init({ cwd: tempDir.path(), agentDir: tempDir.path() });
 		const activeSession = await createSession(settings);
 		await settings.flushOrThrow();
-		const writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
-			throw new Error("forced durable write failure");
+		const realOpen = fs.promises.open;
+		const writeSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+			if (String(file).endsWith(".tmp")) throw new Error("forced durable write failure");
+			return realOpen(file, flags, mode);
 		});
 
 		try {
@@ -149,5 +155,68 @@ describe("durable default model selection", () => {
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(activeSession.getActiveModelProfile()).toBeUndefined();
 		expect(settings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}:off`);
+	});
+
+	it("materializes only trusted bindings from an active runtime profile", async () => {
+		// Given
+		const settings = Settings.isolated();
+		settings.set("task.agentModelOverrides", { critic: "global/critic" });
+		const activeSession = await createSession(settings);
+		settings.override("task.agentModelOverrides", {
+			executor: "profile/executor:medium",
+			repositoryOnly: "repository/poison",
+		});
+		activeSession.setActiveModelProfile("codex-medium");
+		const selected = model("claude-sonnet-4-6");
+
+		// When
+		await activeSession.setDefaultModelSelection(selected, Effort.Low);
+
+		// Then
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			critic: "global/critic",
+			executor: "profile/executor:medium",
+		});
+		expect(activeSession.getActiveModelProfile()).toBeUndefined();
+	});
+
+	it("does not materialize repository profile settings into the global default", async () => {
+		// Given
+		const projectDir = path.join(tempDir.path(), "project");
+		const otherDir = path.join(tempDir.path(), "other");
+		const agentDir = path.join(tempDir.path(), "agent");
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.mkdir(otherDir, { recursive: true });
+		await fs.promises.mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: "global/smol" },
+				modelProfile: { default: "global-profile" },
+				task: { agentModelOverrides: { critic: "global/critic" } },
+			}),
+		);
+		await Bun.write(
+			path.join(projectDir, ".gjc", "settings.json"),
+			JSON.stringify({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5:high", smol: "repository/smol" },
+				modelProfile: { default: "repository-profile" },
+				task: { agentModelOverrides: { executor: "repository/executor" } },
+			}),
+		);
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const activeSession = await createSession(settings, false);
+		const selected = model("claude-sonnet-4-6");
+
+		// When
+		await activeSession.setDefaultModelSelection(selected, Effort.Low);
+		resetSettingsForTest();
+		const freshSettings = await Settings.init({ cwd: otherDir, agentDir });
+
+		// Then
+		expect(freshSettings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}:low`);
+		expect(freshSettings.getModelRole("smol")).toBe("global/smol");
+		expect(freshSettings.get("task.agentModelOverrides")).toEqual({ critic: "global/critic" });
+		expect(freshSettings.get("modelProfile.default")).toBe("global-profile");
 	});
 });

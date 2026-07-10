@@ -147,6 +147,45 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		await session.dispose();
 	});
 
+	test("restores thinking from an atomic default model tuple before the global fallback", async () => {
+		// Given
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange("runtime-provider/runtime-reasoning-model", "default", {
+			thinkingLevel: Effort.Low,
+		});
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.High });
+		settings.setModelRole("default", "runtime-provider/runtime-reasoning-model:high");
+
+		// When
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings,
+			modelRegistry,
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			toolNames: [],
+			rules: [],
+		});
+
+		// Then
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-reasoning-model");
+			expect(session.thinkingLevel).toBe(Effort.Low);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("selects the settings default model without synchronously validating auth", async () => {
 		const defaultModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!defaultModel) {

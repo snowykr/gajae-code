@@ -137,6 +137,7 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
+import { resolveProfileBindings } from "../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -6877,12 +6878,26 @@ export class AgentSession {
 
 		const previousEditMode = this.#resolveActiveEditMode();
 		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);
-		const activeProfile = this.getActiveModelProfile() ?? this.settings.get("modelProfile.default");
-		const modelRoles = {
-			...(activeProfile ? this.settings.get("modelRoles") : (this.settings.getGlobal("modelRoles") ?? {})),
-			default: selector,
-		};
-		const agentModelOverrides = { ...this.settings.get("task.agentModelOverrides") };
+		const activeProfile = this.getActiveModelProfile();
+		const modelRoles = { ...(this.settings.getGlobal("modelRoles") ?? {}) };
+		const agentModelOverrides = { ...(this.settings.getGlobal("task.agentModelOverrides") ?? {}) };
+		if (activeProfile) {
+			const profile = this.#modelRegistry.getModelProfile(activeProfile);
+			if (profile) {
+				const bindings = resolveProfileBindings(profile);
+				const effectiveModelRoles = this.settings.get("modelRoles");
+				const effectiveAgentModelOverrides = this.settings.get("task.agentModelOverrides");
+				for (const role of Object.keys(bindings.modelRoles)) {
+					const value = effectiveModelRoles[role];
+					if (value !== undefined) modelRoles[role] = value;
+				}
+				for (const role of Object.keys(bindings.agentModelOverrides)) {
+					const value = effectiveAgentModelOverrides[role];
+					if (value !== undefined) agentModelOverrides[role] = value;
+				}
+			}
+		}
+		modelRoles.default = selector;
 		await this.settings.commitDurable({
 			defaultThinkingLevel: effectiveLevel,
 			modelRoles,
@@ -10911,7 +10926,15 @@ export class AgentSession {
 				}
 			}
 
-			const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
+			const hasPersistedThinkingLevel = this.sessionManager
+				.getBranch()
+				.some(
+					entry =>
+						entry.type === "thinking_level_change" ||
+						(entry.type === "model_change" &&
+							(entry.role ?? "default") === "default" &&
+							entry.thinkingLevel !== undefined),
+				);
 			const hasServiceTierEntry = this.sessionManager
 				.getBranch()
 				.some(entry => entry.type === "service_tier_change");
@@ -10919,7 +10942,9 @@ export class AgentSession {
 			const configuredServiceTier = this.settings.get("serviceTier");
 			const nextThinkingLevel = resolveThinkingLevelForModel(
 				this.model,
-				hasThinkingEntry ? (sessionContext.thinkingLevel as ThinkingLevel | undefined) : defaultThinkingLevel,
+				hasPersistedThinkingLevel
+					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+					: defaultThinkingLevel,
 			);
 			this.#thinkingLevel = nextThinkingLevel;
 			this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));

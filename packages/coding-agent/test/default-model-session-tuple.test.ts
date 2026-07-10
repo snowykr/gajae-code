@@ -172,6 +172,27 @@ describe("default model session tuple", () => {
 		expectTuple(context, { model: "anthropic/legacy-model", thinkingLevel: Effort.High });
 	});
 
+	it("restores atomic tuple thinking when switching to another persisted session", async () => {
+		// Given
+		const selected = bundledModel("claude-sonnet-4-6");
+		const target = SessionManager.create(tempDir.path(), tempDir.path());
+		target.appendModelChange(`${selected.provider}/${selected.id}`, "default", {
+			thinkingLevel: Effort.Low,
+		});
+		await target.ensureOnDisk();
+		const targetFile = target.getSessionFile();
+		if (!targetFile) throw new Error("Expected target session file");
+		await target.close();
+		const activeSession = createSession(Settings.isolated({ defaultThinkingLevel: Effort.High }));
+
+		// When
+		await activeSession.switchSession(targetFile);
+
+		// Then
+		expect(activeSession.model).toEqual(selected);
+		expect(activeSession.thinkingLevel).toBe(Effort.Low);
+	});
+
 	it("preserves set_model durable default-role setter semantics", async () => {
 		// Given
 		const settings = Settings.isolated();

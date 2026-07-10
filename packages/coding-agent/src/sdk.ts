@@ -1057,7 +1057,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	);
 	const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
 	const hasExistingSession = existingBranch.length > 0;
-	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
+	const hasPersistedThinkingLevel = existingBranch.some(
+		entry =>
+			entry.type === "thinking_level_change" ||
+			(entry.type === "model_change" &&
+				(entry.role ?? "default") === "default" &&
+				entry.thinkingLevel !== undefined),
+	);
 	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
 	const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -1112,11 +1118,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let thinkingLevelFromSchemaDefault = false;
 
 	// If session has data and includes a thinking entry, restore it
-	if (thinkingLevel === undefined && hasExistingSession && hasThinkingEntry) {
+	if (thinkingLevel === undefined && hasExistingSession && hasPersistedThinkingLevel) {
 		thinkingLevel = parseThinkingLevel(existingSession.thinkingLevel);
 	}
 
-	if (thinkingLevel === undefined && !hasExplicitModel && !hasThinkingEntry && defaultRoleSpec.explicitThinkingLevel) {
+	if (
+		thinkingLevel === undefined &&
+		!hasExplicitModel &&
+		!hasPersistedThinkingLevel &&
+		defaultRoleSpec.explicitThinkingLevel
+	) {
 		thinkingLevel = defaultRoleSpec.thinkingLevel;
 	}
 
