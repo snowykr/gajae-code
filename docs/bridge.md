@@ -247,9 +247,13 @@ explicitly enabled.
 When the dormant command endpoint is enabled for an internal deployment,
 `setDefaultModelSelection(sessionId, provider, modelId, thinkingLevel)` sends
 the same atomic durable operation as RPC. It requires the `model` scope and a
-concrete reasoning level. The command route reserves mutation order when each
-authenticated request arrives, before reading its body, so differently sized
-requests and different idempotency keys cannot reorder admitted mutations.
+concrete reasoning level. It rejects before any live or durable mutation when
+project `.gjc` settings own `modelProfile.default` or `modelRoles.default`,
+because those project defaults remain authoritative on restart; user-global
+and runtime-activated profiles remain supported. The command route reserves
+mutation order when each authenticated request arrives, before reading its
+body, so differently sized requests and different idempotency keys cannot
+reorder admitted mutations.
 The helper returns the canonical `BridgeResolvedModelSelection`, including the
 mandatory `durability` value from the RPC result. `confirmed` means the renamed
 settings entry was parent-directory-fsynced; `unknown` means the rename and live

@@ -152,6 +152,12 @@ working directory, including path-scoped `enabledModels` rules, and requires
 configured credentials for the selected provider. `inherit` is not accepted
 because the persisted selection must be unambiguous across restarts.
 
+The command rejects before any live or durable mutation when project `.gjc`
+settings own `modelProfile.default` or `modelRoles.default`. Those project
+defaults remain authoritative on restart and cannot be superseded by a
+user-global default commit. User-global and runtime-activated profiles remain
+supported and are materialized normally.
+
 On success the response returns the exact committed tuple:
 
 ```json

@@ -89,7 +89,11 @@ The reasoning level must be concrete (`off`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, or `max`); `inherit` is intentionally rejected. Model admission
 uses the effective scope for the client's working directory, including
 path-scoped `enabledModels`, and requires configured provider credentials. The
-call returns a typed `ResolvedModelSelection` only after the settings replacement
+call raises `RpcCommandError` before changing live or durable state when project
+`.gjc` settings own `modelProfile.default` or `modelRoles.default`, because
+those project defaults remain authoritative on restart. User-global and
+runtime-activated profiles remain supported. The call returns a typed
+`ResolvedModelSelection` only after the settings replacement
 completes and the tuple is active. Its mandatory `durability` is `"confirmed"`
 when the renamed config was parent-directory-fsynced or `"unknown"` when rename
 and live publication completed but crash durability could not be confirmed. A
