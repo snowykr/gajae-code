@@ -698,6 +698,9 @@ export function buildSessionContext(
 					hasExplicitDefaultModel = true;
 				}
 			}
+			if (entry.thinkingLevel !== undefined) {
+				thinkingLevel = entry.thinkingLevel ?? "off";
+			}
 		} else if (entry.type === "service_tier_change") {
 			serviceTier = entry.serviceTier ?? undefined;
 		} else if (entry.type === "message" && entry.message.role === "assistant") {

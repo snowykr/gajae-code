@@ -27,7 +27,6 @@ import {
 	type AgentState,
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
-	type ResolvedThinkingLevel,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -60,6 +59,7 @@ import {
 	pruneToolOutputs,
 	shouldRunMaintenancePrune,
 } from "@gajae-code/agent-core/compaction/pruning";
+import type { ResolvedThinkingLevel } from "@gajae-code/agent-core/thinking";
 import type {
 	AssistantMessage,
 	Context,
@@ -6908,15 +6908,13 @@ export class AgentSession {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		try {
-			this.setThinkingLevel(effectiveLevel);
+			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default", {
+				thinkingLevel: effectiveLevel,
+			});
 		} catch (error) {
-			logger.warn("Session: default thinking log append failed", { error: String(error) });
+			logger.warn("Session: default model tuple log append failed", { error: String(error) });
 		}
-		try {
-			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
-		} catch (error) {
-			logger.warn("Session: default model log append failed", { error: String(error) });
-		}
+		this.#applyThinkingLevel(effectiveLevel, false);
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode).catch(error => {
 			logger.warn("Session: default model edit-mode sync failed", { error: String(error) });
@@ -7171,17 +7169,22 @@ export class AgentSession {
 	 */
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
-		const isChanging = effectiveLevel !== this.#thinkingLevel;
-
-		this.#thinkingLevel = effectiveLevel;
-		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
+		this.#applyThinkingLevel(effectiveLevel, true);
 
 		if (persist && effectiveLevel !== undefined) {
 			this.settings.set("defaultThinkingLevel", effectiveLevel);
 		}
+	}
+
+	#applyThinkingLevel(effectiveLevel: ResolvedThinkingLevel | undefined, appendSessionEntry: boolean): void {
+		const isChanging = effectiveLevel !== this.#thinkingLevel;
+		this.#thinkingLevel = effectiveLevel;
+		this.agent.setThinkingLevel(toReasoningEffort(effectiveLevel));
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			if (appendSessionEntry) {
+				this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			}
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
