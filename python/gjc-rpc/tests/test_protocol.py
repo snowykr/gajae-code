@@ -45,19 +45,40 @@ def _wrapped_event(event: dict) -> dict:
 
 
 class ProtocolParsingTests(unittest.TestCase):
-    def test_parse_resolved_model_selection_rejects_inherit(self) -> None:
+    def test_parse_resolved_model_selection_returns_canonical_fields(self) -> None:
+        # Given: a successful response with the canonical wire field names.
+        # When: the response crosses the protocol boundary.
         result = parse_resolved_model_selection(
             {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "high"}
         )
 
+        # Then: callers receive a concrete, typed selection.
         self.assertIsInstance(result, ResolvedModelSelection)
         self.assertEqual(result.provider, "anthropic")
         self.assertEqual(result.model_id, "claude-sonnet-4-6")
         self.assertEqual(result.thinking_level, "high")
+
+    def test_parse_resolved_model_selection_rejects_noncanonical_or_malformed_fields(self) -> None:
+        # Given: success payloads that omit or corrupt one canonical field.
+        malformed_payloads = (
+            {"provider": "anthropic", "model_id": "claude-sonnet-4-6", "thinkingLevel": "high"},
+            {"provider": 7, "modelId": "claude-sonnet-4-6", "thinkingLevel": "high"},
+            {"provider": "anthropic", "modelId": 7, "thinkingLevel": "high"},
+            {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "inherit"},
+        )
+
+        # When/Then: each malformed success is rejected at the protocol boundary.
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                parse_resolved_model_selection(payload)
+
+    def test_parse_resolved_model_selection_rejects_missing_thinking_level(self) -> None:
+        # Given: an otherwise valid success payload without its resolved thinking level.
+        payload = {"provider": "anthropic", "modelId": "claude-sonnet-4-6"}
+
+        # When/Then: parsing rejects the incomplete success response.
         with self.assertRaises(ValueError):
-            parse_resolved_model_selection(
-                {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "inherit"}
-            )
+            parse_resolved_model_selection(payload)
 
     def test_parse_session_state(self) -> None:
         state = parse_session_state(

@@ -546,6 +546,52 @@ IDLESS_ERROR_SERVER = textwrap.dedent(
     """
 )
 
+DEFAULT_SELECTION_COMPAT_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    print(json.dumps({"type": "ready"}), flush=True)
+
+    for raw_line in sys.stdin:
+        command = json.loads(raw_line)
+        request_id = command.get("id")
+        command_type = command["type"]
+        if command_type == "set_host_tools":
+            response = {
+                "id": request_id,
+                "type": "response",
+                "command": command_type,
+                "success": True,
+                "data": {"toolNames": []},
+            }
+            print(json.dumps(response), flush=True)
+            continue
+        if command.get("modelId") == "malformed-success":
+            response = {
+                "id": request_id,
+                "type": "response",
+                "command": command_type,
+                "success": True,
+                "data": {
+                    "provider": command["provider"],
+                    "modelId": 7,
+                    "thinkingLevel": command["thinkingLevel"],
+                },
+            }
+            print(json.dumps(response), flush=True)
+            continue
+        response = {
+            "id": request_id,
+            "type": "response",
+            "command": command_type,
+            "success": False,
+            "error": "unsupported command: set_default_model_selection (server protocol v1)",
+        }
+        print(json.dumps(response), flush=True)
+    """
+)
+
 LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
     """
     import json
@@ -677,6 +723,27 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(selection.provider, "anthropic")
         self.assertEqual(selection.model_id, "claude-sonnet-4-6")
         self.assertEqual(selection.thinking_level, "high")
+
+    def test_default_model_selection_rejects_a_malformed_success_response(self) -> None:
+        # Given: a server that reports success with a non-string modelId.
+        with self.make_client(server=DEFAULT_SELECTION_COMPAT_SERVER) as client:
+            # When/Then: the typed client rejects the malformed success.
+            with self.assertRaises(ValueError):
+                client.set_default_model_selection("anthropic", "malformed-success", "high")
+
+    def test_default_model_selection_preserves_an_old_server_error(self) -> None:
+        # Given: a protocol-v1 server that does not implement the new command.
+        with self.make_client(server=DEFAULT_SELECTION_COMPAT_SERVER) as client:
+            # When: the caller requests an atomic default selection update.
+            with self.assertRaises(RpcCommandError) as ctx:
+                client.set_default_model_selection("anthropic", "claude-sonnet-4-6", "high")
+
+        # Then: the original command and remote error reach the caller unchanged.
+        self.assertEqual(ctx.exception.command, "set_default_model_selection")
+        self.assertEqual(
+            ctx.exception.error,
+            "unsupported command: set_default_model_selection (server protocol v1)",
+        )
 
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
