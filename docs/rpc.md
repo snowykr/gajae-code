@@ -91,6 +91,9 @@ Important edge behavior from runtime:
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
+- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel: ThinkingLevel }`
+This ordered model-scoped command changes the durable default selection. Its successful response is `{ provider, modelId, thinkingLevel }`, with an effective concrete thinking level (never `"inherit"` or omitted). The existing `set_thinking_level` command remains session-scoped and is not a durable-default update. Accepted input levels are `off|minimal|low|medium|high|xhigh|max`; `inherit` is rejected, not normalized. Model-specific values may be clamped.
+The normalized tuple applies to the active session and is returned under the successful response's `data` field. A durable flush failure returns an error response without a success acknowledgement.
 - `{ id?, type: "cycle_model" }`
 - `{ id?, type: "get_available_models" }`
 
@@ -142,6 +145,7 @@ All command results use `RpcResponse`:
 - Failure: `{ id?, type: "response", command: string, success: false, error: string | object }`; typed control-plane failures use object-valued errors such as `{ "code": "scope_denied", ... }`.
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
+For `set_default_model_selection`, the successful `data` payload is the normalized durable selection `{ provider: string, modelId: string, thinkingLevel: ResolvedThinkingLevel }`; the server persists it before acknowledging success.
 
 
 By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.
@@ -150,7 +154,7 @@ By default, `get_state` omits large static fields. Request `include: ["tools"]` 
 ```json
 {
   "model": { "provider": "...", "id": "..." },
-  "thinkingLevel": "off|minimal|low|medium|high|xhigh",
+  "thinkingLevel": "off|minimal|low|medium|high|xhigh|max",
   "isStreaming": false,
   "isCompacting": false,
   "steeringMode": "all|one-at-a-time",

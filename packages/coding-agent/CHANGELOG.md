@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added the additive `set_default_model_selection` RPC command, which applies a concrete normalized model+reasoning tuple to the active session and durably persists it for future sessions; the existing session-only `set_thinking_level` behavior is unchanged.
+
+## [0.9.6] - 2026-07-10
 ### Changed
 
 - Moved the `codex-eco`/`codex-medium`/`codex-pro` presets and the `opus-codex`/`codex-opencodego`/`fable-opus-codex` combo presets from `gpt-5.5` onto the GPT-5.6 tier family: Sol drives `default` and `architect` on every codex preset (eco `sol:medium`, medium `sol:high`, pro `sol:xhigh`/`sol:max`), with Luna/Terra covering the lighter executor/planner/critic roles by tier.

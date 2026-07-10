@@ -27,6 +27,7 @@ import {
 	type AgentState,
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
+	type ResolvedThinkingLevel,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -6793,7 +6794,7 @@ export class AgentSession {
 	async setModel(
 		model: Model,
 		role: string = "default",
-		options?: { selector?: string; thinkingLevel?: ThinkingLevel },
+		options?: { selector?: string; thinkingLevel?: ThinkingLevel; persistThinkingLevel?: boolean },
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
@@ -6812,8 +6813,36 @@ export class AgentSession {
 
 		// Apply the explicitly selected thinking level when the selector supplies one;
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
-		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
+		this.setThinkingLevel(
+			options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel,
+			options?.persistThinkingLevel === true,
+		);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+	/**
+	 * Set the durable default model and its effective thinking level.
+	 */
+	async setDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel,
+	): Promise<{ provider: string; modelId: string; thinkingLevel: ResolvedThinkingLevel }> {
+		if (thinkingLevel === ThinkingLevel.Inherit) {
+			throw new Error("Thinking level inherit is not valid for a default model selection");
+		}
+
+		const effectiveLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+		if (effectiveLevel === undefined) {
+			throw new Error(`Thinking level ${thinkingLevel} is not supported by ${model.provider}/${model.id}`);
+		}
+
+		await this.setModel(model, "default", { thinkingLevel: effectiveLevel, persistThinkingLevel: true });
+		await this.settings.flushOrThrow();
+
+		return {
+			provider: model.provider,
+			modelId: model.id,
+			thinkingLevel: effectiveLevel,
+		};
 	}
 
 	setActiveModelProfile(name: string | undefined): void {

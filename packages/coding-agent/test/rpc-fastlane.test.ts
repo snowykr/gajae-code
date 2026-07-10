@@ -45,6 +45,7 @@ const ORDERED_COMMANDS: RpcCommand["type"][] = [
 	"handoff",
 	"login",
 	"set_model",
+	"set_default_model_selection",
 	"cycle_model",
 	"set_todos",
 	"set_session_name",
@@ -88,6 +89,11 @@ describe("RPC fast-lane classification (#606, issue 13)", () => {
 		expect(RPC_SAFE_READ_CONTROL_COMMANDS.has("set_model")).toBe(false);
 		expect(RPC_SAFE_READ_CONTROL_COMMANDS.has("cycle_model")).toBe(false);
 		expect(RPC_SAFE_READ_CONTROL_COMMANDS.has("set_todos")).toBe(false);
+	});
+
+	test("set_default_model_selection stays ordered and is not a safe read", () => {
+		expect(RPC_SAFE_READ_CONTROL_COMMANDS.has("set_default_model_selection")).toBe(false);
+		expect(isFastLaneRpcCommand("set_default_model_selection")).toBe(false);
 	});
 
 	test("mutating mode/config setters stay ordered (#618 causal-order regression)", () => {

@@ -1,4 +1,4 @@
-import type { BridgeClientCommand, BridgeCommandHelpers, BridgeCommandOptions } from "./commands";
+import type { BridgeClientCommand, BridgeCommandHelpers, BridgeCommandOptions, BridgeThinkingLevel } from "./commands";
 import type { BridgeFrame } from "./reference-consumer";
 
 export * from "./commands";
@@ -270,6 +270,21 @@ export class BridgeClient implements BridgeCommandHelpers {
 		options: BridgeCommandOptions = {},
 	): Promise<unknown> {
 		return this.#command("set_model", sessionId, { provider, modelId }, options, "set-model");
+	}
+	setDefaultModelSelection(
+		sessionId: string,
+		provider: string,
+		modelId: string,
+		thinkingLevel: BridgeThinkingLevel,
+		options: BridgeCommandOptions = {},
+	): Promise<unknown> {
+		return this.#command(
+			"set_default_model_selection",
+			sessionId,
+			{ provider, modelId, thinkingLevel },
+			options,
+			"set-default-model-selection",
+		);
 	}
 
 	cycleModel(sessionId: string, options: BridgeCommandOptions = {}): Promise<unknown> {
