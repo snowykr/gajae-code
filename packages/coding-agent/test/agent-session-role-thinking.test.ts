@@ -305,6 +305,23 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(flushedDefaultThinkingLevel).toBe("off");
 		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
 	});
+	it("materializes an active model profile before persisting a default selection", async () => {
+		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		await createSession({
+			initialModelId: initialModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+		});
+		sessionSettings.set("modelProfile.default", "managed-profile");
+		session.setActiveModelProfile("managed-profile");
+
+		await session.setDefaultModelSelection(selectedModel, "off");
+
+		expect(sessionSettings.get("modelProfile.default")).toBeUndefined();
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(sessionSettings.getModelRole("default")).toBe(`${selectedModel.provider}/${selectedModel.id}:off`);
+	});
 
 	it("does not report success when durable default selection save fails", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
