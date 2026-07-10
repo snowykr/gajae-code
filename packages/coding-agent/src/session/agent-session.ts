@@ -137,6 +137,7 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
+import { materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -6836,6 +6837,12 @@ export class AgentSession {
 		}
 
 		await this.setModel(model, "default", { thinkingLevel: effectiveLevel, persistThinkingLevel: true });
+		materializeActiveModelProfileAssignment({
+			session: this,
+			settings: this.settings,
+			role: "default",
+			selector: this.#formatRoleModelValue("default", model, undefined, effectiveLevel),
+		});
 		await this.settings.flushOrThrow();
 
 		return {
