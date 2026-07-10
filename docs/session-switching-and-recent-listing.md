@@ -172,7 +172,7 @@ Lifecycle/state transition:
 14. close provider sessions when switching to a different session or when same-session reload changed replay messages
 15. restore default model from `sessionContext.models.default` if available and present in model registry
 16. restore thinking level and service tier:
-    - thinking uses persisted `thinking_level_change`, otherwise the configured default clamped to model capability
+    - thinking uses the latest persisted value in replay order, from either the default-role `model_change.thinkingLevel` atomic tuple or a legacy `thinking_level_change`; if neither is present, it uses the configured default clamped to model capability
     - service tier uses persisted `service_tier_change`, otherwise the configured `serviceTier` setting (`"none"` becomes unset)
 17. reconnect agent listeners and return `true`
 
