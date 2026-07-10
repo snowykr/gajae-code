@@ -47,7 +47,12 @@ process.stdin.on("data", chunk => {
 
 describe("RpcClient default model selection response boundary", () => {
 	it("returns a canonical resolved selection when the server response is valid", async () => {
-		const resolved = { provider: "openai", modelId: "gpt-5.1", thinkingLevel: Effort.High };
+		const resolved = {
+			provider: "openai",
+			modelId: "gpt-5.1",
+			thinkingLevel: Effort.High,
+			durability: "confirmed",
+		} as const;
 
 		await withFakeServer({ set_default_model_selection: { success: true, data: resolved } }, async client => {
 			const result = await client.setDefaultModelSelection({
@@ -61,18 +66,38 @@ describe("RpcClient default model selection response boundary", () => {
 	});
 
 	it.each([
-		["missing provider", { modelId: "gpt-5.1", thinkingLevel: "high" }],
-		["wrong provider type", { provider: 7, modelId: "gpt-5.1", thinkingLevel: "high" }],
-		["empty provider", { provider: "", modelId: "gpt-5.1", thinkingLevel: "high" }],
-		["whitespace-only provider", { provider: "   ", modelId: "gpt-5.1", thinkingLevel: "high" }],
-		["missing modelId", { provider: "openai", thinkingLevel: "high" }],
-		["wrong modelId type", { provider: "openai", modelId: false, thinkingLevel: "high" }],
-		["empty modelId", { provider: "openai", modelId: "", thinkingLevel: "high" }],
-		["whitespace-only modelId", { provider: "openai", modelId: "   ", thinkingLevel: "high" }],
-		["missing thinkingLevel", { provider: "openai", modelId: "gpt-5.1" }],
-		["wrong thinkingLevel type", { provider: "openai", modelId: "gpt-5.1", thinkingLevel: 1 }],
-		["unsupported thinkingLevel", { provider: "openai", modelId: "gpt-5.1", thinkingLevel: "turbo" }],
-		["unresolved thinkingLevel", { provider: "openai", modelId: "gpt-5.1", thinkingLevel: "inherit" }],
+		["missing provider", { modelId: "gpt-5.1", thinkingLevel: "high", durability: "confirmed" }],
+		["wrong provider type", { provider: 7, modelId: "gpt-5.1", thinkingLevel: "high", durability: "confirmed" }],
+		["empty provider", { provider: "", modelId: "gpt-5.1", thinkingLevel: "high", durability: "confirmed" }],
+		[
+			"whitespace-only provider",
+			{ provider: "   ", modelId: "gpt-5.1", thinkingLevel: "high", durability: "confirmed" },
+		],
+		["missing modelId", { provider: "openai", thinkingLevel: "high", durability: "confirmed" }],
+		["wrong modelId type", { provider: "openai", modelId: false, thinkingLevel: "high", durability: "confirmed" }],
+		["empty modelId", { provider: "openai", modelId: "", thinkingLevel: "high", durability: "confirmed" }],
+		[
+			"whitespace-only modelId",
+			{ provider: "openai", modelId: "   ", thinkingLevel: "high", durability: "confirmed" },
+		],
+		["missing thinkingLevel", { provider: "openai", modelId: "gpt-5.1", durability: "confirmed" }],
+		[
+			"wrong thinkingLevel type",
+			{ provider: "openai", modelId: "gpt-5.1", thinkingLevel: 1, durability: "confirmed" },
+		],
+		[
+			"unsupported thinkingLevel",
+			{ provider: "openai", modelId: "gpt-5.1", thinkingLevel: "turbo", durability: "confirmed" },
+		],
+		[
+			"unresolved thinkingLevel",
+			{ provider: "openai", modelId: "gpt-5.1", thinkingLevel: "inherit", durability: "confirmed" },
+		],
+		["missing durability", { provider: "openai", modelId: "gpt-5.1", thinkingLevel: "high" }],
+		[
+			"unsupported durability",
+			{ provider: "openai", modelId: "gpt-5.1", thinkingLevel: "high", durability: "maybe" },
+		],
 	] as const)("rejects a %s response", async (_caseName, data) => {
 		await withFakeServer({ set_default_model_selection: { success: true, data } }, async client => {
 			await expect(

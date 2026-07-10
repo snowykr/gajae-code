@@ -5,6 +5,8 @@ import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import type { RpcResponse } from "@gajae-code/coding-agent/modes/rpc/rpc-types";
+import { dispatchRpcCommand } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -67,11 +69,76 @@ describe("durable default model selection", () => {
 
 		const result = await activeSession.setDefaultModelSelection(selected, Effort.Low);
 
-		expect(result).toEqual({ provider: selected.provider, modelId: selected.id, thinkingLevel: Effort.Low });
+		expect(result).toEqual({
+			provider: selected.provider,
+			modelId: selected.id,
+			thinkingLevel: Effort.Low,
+			durability: "confirmed",
+		});
 		expect(activeSession.model).toEqual(selected);
 		expect(activeSession.thinkingLevel).toBe(Effort.Low);
 		expect(settings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}:low`);
 		expect(settings.get("defaultThinkingLevel")).toBe(Effort.Low);
+	});
+
+	it("publishes a coherent tuple with unknown durability after parent fsync fails", async () => {
+		// Given
+		const selected = model("claude-sonnet-4-6");
+		const settings = await Settings.init({ cwd: tempDir.path(), agentDir: tempDir.path() });
+		const activeSession = await createSession(settings);
+		await settings.flushOrThrow();
+		const realOpen = fs.promises.open;
+		const openSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await realOpen(file, flags, mode);
+			if (String(file) === tempDir.path()) {
+				spyOn(handle, "sync").mockRejectedValue(new Error("forced parent fsync failure"));
+			}
+			return handle;
+		});
+
+		// When
+		let result: RpcResponse;
+		try {
+			result = await dispatchRpcCommand(
+				{
+					id: "durability-fault",
+					type: "set_default_model_selection",
+					provider: selected.provider,
+					modelId: selected.id,
+					thinkingLevel: "off",
+				},
+				{
+					session: activeSession,
+					output: () => {},
+					hostToolRegistry: { setTools: () => [] },
+					hostUriRegistry: { setSchemes: () => [] },
+					createUiContext: () => ({ notify: () => {} }),
+				},
+			);
+		} finally {
+			openSpy.mockRestore();
+		}
+
+		// Then
+		expect(result).toEqual({
+			id: "durability-fault",
+			type: "response",
+			command: "set_default_model_selection",
+			success: true,
+			data: {
+				provider: selected.provider,
+				modelId: selected.id,
+				thinkingLevel: "off",
+				durability: "unknown",
+			},
+		});
+		expect(activeSession.model).toEqual(selected);
+		expect(activeSession.thinkingLevel).toBe("off");
+		resetSettingsForTest();
+		const freshSettings = await Settings.init({ cwd: tempDir.path(), agentDir: tempDir.path() });
+		expect(freshSettings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}:off`);
+		expect(freshSettings.get("defaultThinkingLevel")).toBe("off");
+		expect((await fs.promises.readdir(tempDir.path())).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 
 	it("rejects a cwd-disallowed model before mutating live state", async () => {
@@ -130,6 +197,7 @@ describe("durable default model selection", () => {
 				provider: selected.provider,
 				modelId: selected.id,
 				thinkingLevel: "off",
+				durability: "confirmed",
 			});
 		} finally {
 			appendSpy.mockRestore();

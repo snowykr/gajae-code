@@ -250,9 +250,12 @@ the same atomic durable operation as RPC. It requires the `model` scope and a
 concrete reasoning level. The command route reserves mutation order when each
 authenticated request arrives, before reading its body, so differently sized
 requests and different idempotency keys cannot reorder admitted mutations.
-The helper returns the canonical `BridgeResolvedModelSelection`; malformed
-success payloads are rejected, and a legacy server's unsupported-command or
-HTTP failure is surfaced explicitly.
+The helper returns the canonical `BridgeResolvedModelSelection`, including the
+mandatory `durability` value from the RPC result. `confirmed` means the renamed
+settings entry was parent-directory-fsynced; `unknown` means the rename and live
+publication completed but crash durability could not be confirmed. Malformed
+or missing durability values are rejected, and a legacy server's
+unsupported-command or HTTP failure is surfaced explicitly.
 
 `BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth, the `control` scope on the (by-default-disabled) `ui-responses` endpoint, and the current controller owner token; unauthorized owner-token attempts return `403 not_controller` without resolving the gate.
 

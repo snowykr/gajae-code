@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { YAML } from "bun";
 
@@ -94,7 +95,7 @@ describe("durable settings commits", () => {
 		expect((await fs.promises.stat(configPath)).mode & 0o777).toBe(0o600);
 	});
 
-	it("fully writes and file-fsyncs before rename, then parent-fsyncs", async () => {
+	it("reports confirmed after file-fsync, rename, and parent-fsync", async () => {
 		// Given
 		await seed("theme:\n  dark: red-claw\n");
 		const settings = await initialize();
@@ -124,8 +125,9 @@ describe("durable settings commits", () => {
 		});
 
 		// When
+		let outcome: unknown;
 		try {
-			await settings.commitDurable({ defaultThinkingLevel: "low" });
+			outcome = await settings.commitDurable({ defaultThinkingLevel: "low" });
 		} finally {
 			openSpy.mockRestore();
 			renameSpy.mockRestore();
@@ -133,6 +135,36 @@ describe("durable settings commits", () => {
 
 		// Then
 		expect(events).toEqual(["file-fsync", "rename", "parent-fsync"]);
+		expect(outcome).toEqual({ durability: "confirmed" });
+	});
+
+	it("keeps confirmed durability when closing a synced parent handle fails", async () => {
+		// Given
+		await seed("theme:\n  dark: red-claw\n");
+		const settings = await initialize();
+		const realOpen = fs.promises.open;
+		const openSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+			const handle = await realOpen(file, flags, mode);
+			if (String(file) === agentDir) {
+				const realClose = handle.close.bind(handle);
+				spyOn(handle, "close").mockImplementation(async () => {
+					await realClose();
+					throw new Error("forced parent close failure");
+				});
+			}
+			return handle;
+		});
+
+		// When
+		let outcome: unknown;
+		try {
+			outcome = await settings.commitDurable({ defaultThinkingLevel: "low" });
+		} finally {
+			openSpy.mockRestore();
+		}
+
+		// Then
+		expect(outcome).toEqual({ durability: "confirmed" });
 	});
 
 	it("does not follow a hostile temporary-file symlink", async () => {
@@ -182,17 +214,17 @@ describe("durable settings commits", () => {
 		expect(await fs.promises.readFile(configPath, "utf8")).toBe(original);
 	});
 
-	it("does not report false failure after rename when parent fsync fails", async () => {
+	it("reports unknown after rename when parent fsync persistently fails", async () => {
 		// Given
 		await seed("theme:\n  dark: red-claw\n");
 		const settings = await initialize();
 		const realOpen = fs.promises.open;
-		let parentFsyncAttempted = false;
+		let parentFsyncAttempts = 0;
 		const openSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
 			const handle = await realOpen(file, flags, mode);
 			if (String(file) === agentDir) {
 				spyOn(handle, "sync").mockImplementation(async () => {
-					parentFsyncAttempted = true;
+					parentFsyncAttempts += 1;
 					throw new Error("forced parent fsync failure");
 				});
 			}
@@ -200,13 +232,24 @@ describe("durable settings commits", () => {
 		});
 
 		// When / Then
+		let outcome: unknown;
 		try {
-			await expect(settings.commitDurable({ defaultThinkingLevel: "low" })).resolves.toBeUndefined();
+			outcome = await settings.commitDurable({
+				defaultThinkingLevel: "low",
+				modelRoles: { default: "anthropic/claude-sonnet-4-6:low" },
+			});
 		} finally {
 			openSpy.mockRestore();
 		}
-		expect(parentFsyncAttempted).toBe(true);
+		expect(outcome).toEqual({ durability: "unknown" });
+		expect(parentFsyncAttempts).toBeGreaterThan(0);
 		const persisted: unknown = YAML.parse(await fs.promises.readFile(configPath, "utf8"));
-		expect(persisted).toMatchObject({ defaultThinkingLevel: "low" });
+		expect(persisted).toMatchObject({
+			defaultThinkingLevel: "low",
+			modelRoles: { default: "anthropic/claude-sonnet-4-6:low" },
+		});
+		expect(settings.get("defaultThinkingLevel")).toBe(Effort.Low);
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-6:low");
+		expect((await fs.promises.readdir(agentDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 });

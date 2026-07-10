@@ -19,7 +19,9 @@ export type RpcModelSelection = {
 	modelId: string;
 	thinkingLevel: ResolvedThinkingLevel;
 };
-export type RpcResolvedModelSelection = RpcModelSelection;
+export type RpcResolvedModelSelection = RpcModelSelection & {
+	durability: "confirmed" | "unknown";
+};
 
 // ============================================================================
 // RPC Commands (stdin)

@@ -150,7 +150,7 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
-import type { Settings, SkillsSettings } from "../config/settings";
+import type { DurableSettingsCommitOutcome, Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
@@ -6859,7 +6859,12 @@ export class AgentSession {
 	async setDefaultModelSelection(
 		model: Model,
 		thinkingLevel: ResolvedThinkingLevel,
-	): Promise<{ provider: string; modelId: string; thinkingLevel: ResolvedThinkingLevel }> {
+	): Promise<{
+		provider: string;
+		modelId: string;
+		thinkingLevel: ResolvedThinkingLevel;
+		durability: DurableSettingsCommitOutcome["durability"];
+	}> {
 		const effectiveLevel = resolveThinkingLevelForModel(model, thinkingLevel);
 		if (effectiveLevel === undefined) {
 			throw new Error(`Thinking level ${thinkingLevel} is not supported by ${model.provider}/${model.id}`);
@@ -6898,7 +6903,7 @@ export class AgentSession {
 			}
 		}
 		modelRoles.default = selector;
-		await this.settings.commitDurable({
+		const commitOutcome = await this.settings.commitDurable({
 			defaultThinkingLevel: effectiveLevel,
 			modelRoles,
 			...(activeProfile
@@ -6935,7 +6940,12 @@ export class AgentSession {
 			logger.warn("Session: default model edit-mode sync failed", { error: String(error) });
 		});
 
-		return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+		return {
+			provider: model.provider,
+			modelId: model.id,
+			thinkingLevel: effectiveLevel,
+			durability: commitOutcome.durability,
+		};
 	}
 
 	setActiveModelProfile(name: string | undefined): void {

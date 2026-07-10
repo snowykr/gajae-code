@@ -74,6 +74,7 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 					provider: model.provider,
 					modelId: model.id,
 					thinkingLevel: "off",
+					durability: "confirmed",
 				}),
 			}),
 		);
@@ -82,7 +83,12 @@ describe("dispatchRpcCommand validation + error correlation", () => {
 			type: "response",
 			command: "set_default_model_selection",
 			success: true,
-			data: { provider: model.provider, modelId: model.id, thinkingLevel: "off" },
+			data: {
+				provider: model.provider,
+				modelId: model.id,
+				thinkingLevel: "off",
+				durability: "confirmed",
+			},
 		});
 	});
 

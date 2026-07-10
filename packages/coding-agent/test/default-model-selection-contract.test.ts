@@ -18,7 +18,12 @@ type SelectionFixture = {
 
 const fixture = {
 	requested: { provider: "anthropic", modelId: "claude-sonnet-4-6", thinkingLevel: "off" },
-	resolved: { provider: "anthropic", modelId: "claude-sonnet-4-6", thinkingLevel: "off" },
+	resolved: {
+		provider: "anthropic",
+		modelId: "claude-sonnet-4-6",
+		thinkingLevel: "off",
+		durability: "confirmed",
+	},
 } satisfies SelectionFixture;
 
 function dispatchContext(): RpcCommandDispatchContext {
@@ -93,7 +98,11 @@ describe("default model selection cross-surface contract", () => {
 
 	it("rejects a malformed successful response at the TypeScript boundary", async () => {
 		// Given a nominally successful wire response without a resolved thinking level.
-		const malformedSuccess = { provider: "anthropic", modelId: "claude-sonnet-4-6" };
+		const malformedSuccess = {
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-6",
+			thinkingLevel: "off",
+		};
 
 		// When/Then the typed client parses the untrusted success payload.
 		await withResponse(malformedSuccess, async client => {

@@ -51,7 +51,8 @@ describe("bridge default-model-selection conformance", () => {
 			provider: model.provider,
 			modelId: model.id,
 			thinkingLevel: ThinkingLevel.High,
-		};
+			durability: "confirmed",
+		} as const;
 		const handle = createBridgeFetchHandler({
 			sessionId: SESSION_ID,
 			token: "secret",
@@ -115,7 +116,7 @@ describe("bridge default-model-selection conformance", () => {
 				getAvailableModels: () => [firstModel, secondModel],
 				setDefaultModelSelection: async (model, thinkingLevel) => {
 					applied.push(model.id);
-					return { provider: model.provider, modelId: model.id, thinkingLevel };
+					return { provider: model.provider, modelId: model.id, thinkingLevel, durability: "confirmed" };
 				},
 			}),
 		});
@@ -164,12 +165,18 @@ describe("bridge default-model-selection conformance", () => {
 			id: "earlier",
 			command: "set_default_model_selection",
 			success: true,
-			data: { provider: firstModel.provider, modelId: firstModel.id, thinkingLevel: "low" },
+			data: {
+				provider: firstModel.provider,
+				modelId: firstModel.id,
+				thinkingLevel: "low",
+				durability: "confirmed",
+			},
 		});
 		expect(laterTyped).toEqual({
 			provider: secondModel.provider,
 			modelId: secondModel.id,
 			thinkingLevel: "max",
+			durability: "confirmed",
 		});
 	});
 

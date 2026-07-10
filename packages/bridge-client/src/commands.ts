@@ -47,6 +47,7 @@ export type BridgeResolvedModelSelection = {
 	readonly provider: string;
 	readonly modelId: string;
 	readonly thinkingLevel: BridgeThinkingLevel;
+	readonly durability: "confirmed" | "unknown";
 };
 
 export type BridgeClientCommand<TType extends BridgeClientCommandType = BridgeClientCommandType> = {

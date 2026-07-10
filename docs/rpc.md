@@ -163,7 +163,8 @@ On success the response returns the exact committed tuple:
   "data": {
     "provider": "anthropic",
     "modelId": "claude-sonnet-4-6",
-    "thinkingLevel": "high"
+    "thinkingLevel": "high",
+    "durability": "confirmed"
   }
 }
 ```
@@ -175,13 +176,17 @@ and the next process start still agree.
 The settings commit preserves unrelated configuration, including credential
 fields, by writing an exclusively created mode-`0600` temporary sibling,
 fsyncing that file before atomic rename, and requesting a parent-directory fsync
-afterward. These steps define the replacement boundary; they do not guarantee
-survival across every filesystem or machine crash.
+afterward. `durability` is `"confirmed"` when that directory sync completes. If
+the rename succeeds but opening or syncing the parent directory fails, the
+renamed tuple remains authoritative and is published to the live session, while
+the successful response reports `"unknown"` because crash/power-loss durability
+could not be confirmed. Both values are mandatory; typed clients reject a
+missing or unrecognized status.
 
 The existing commands are unchanged: `set_model` continues to activate the
 model and persist the default model-role selection, while `set_thinking_level`
 remains session-scoped. TypeScript `setDefaultModelSelection()` returns the
-canonical `RpcResolvedModelSelection`. It rejects malformed success payloads,
+canonical `RpcResolvedModelSelection`, including its `durability` status. It rejects malformed success payloads,
 and an older server that does not support the command surfaces its explicit
 command failure instead of being treated as success.
 

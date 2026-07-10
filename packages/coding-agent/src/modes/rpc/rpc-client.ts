@@ -645,7 +645,10 @@ export class RpcClient {
 		if (thinkingLevel === undefined || thinkingLevel === "inherit") {
 			throw new Error("Invalid set_default_model_selection response");
 		}
-		return { provider: data.provider, modelId: data.modelId, thinkingLevel };
+		if (data.durability !== "confirmed" && data.durability !== "unknown") {
+			throw new Error("Invalid set_default_model_selection response");
+		}
+		return { provider: data.provider, modelId: data.modelId, thinkingLevel, durability: data.durability };
 	}
 
 	/**

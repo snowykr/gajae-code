@@ -71,6 +71,7 @@ export interface SettingsOptions {
 }
 
 export type DurableSettingsUpdate = Readonly<Partial<Record<SettingPath, unknown>>>;
+export type DurableSettingsCommitOutcome = Readonly<{ durability: "confirmed" | "unknown" }>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
@@ -344,12 +345,12 @@ export class Settings {
 	 * in-memory view. Ordinary dirty paths are included in the same serialized
 	 * write and remain retryable if the candidate cannot be committed.
 	 */
-	async commitDurable(updates: DurableSettingsUpdate): Promise<void> {
+	async commitDurable(updates: DurableSettingsUpdate): Promise<DurableSettingsCommitOutcome> {
 		if (this.#saveTimer) {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		await this.#startSave(() => this.#commitDurableNow(updates));
+		return this.#startSave(() => this.#commitDurableNow(updates));
 	}
 
 	/**
@@ -853,9 +854,10 @@ export class Settings {
 		}, 100);
 	}
 
-	#startSave(task: () => Promise<void>): Promise<void> {
+	#startSave<T>(task: () => Promise<T>): Promise<T> {
 		const previousSave = this.#savePromise ?? Promise.resolve();
-		const savePromise = previousSave.catch(() => undefined).then(task);
+		const taskPromise = previousSave.catch(() => undefined).then(task);
+		const savePromise = taskPromise.then(() => undefined);
 		this.#savePromise = savePromise;
 		savePromise.then(
 			() => {
@@ -865,10 +867,10 @@ export class Settings {
 				if (this.#savePromise === savePromise) this.#savePromise = undefined;
 			},
 		);
-		return savePromise;
+		return taskPromise;
 	}
 
-	async #commitDurableNow(updates: DurableSettingsUpdate): Promise<void> {
+	async #commitDurableNow(updates: DurableSettingsUpdate): Promise<DurableSettingsCommitOutcome> {
 		const modifiedPaths = [...this.#modified];
 		this.#modified.clear();
 		const candidateEntries = Object.entries(updates);
@@ -877,12 +879,13 @@ export class Settings {
 				setByPath(this.#global, settingPath.split("."), value);
 			}
 			this.#rebuildMerged();
-			return;
+			return { durability: "confirmed" };
 		}
 
 		const configPath = this.#configPath;
 		let committed: RawSettings = {};
 		let linearized = false;
+		let durability: DurableSettingsCommitOutcome["durability"] = "confirmed";
 		try {
 			await withFileLock(configPath, async () => {
 				committed = await this.#loadYaml(configPath);
@@ -905,11 +908,23 @@ export class Settings {
 					await fs.promises.rename(tempPath, configPath);
 					linearized = true;
 
-					const parentHandle = await fs.promises.open(path.dirname(configPath), "r");
+					let parentHandle: fs.promises.FileHandle | undefined;
 					try {
+						parentHandle = await fs.promises.open(path.dirname(configPath), "r");
 						await parentHandle.sync();
+					} catch (error) {
+						durability = "unknown";
+						logger.warn("Settings: committed config directory sync failed", { error: String(error) });
 					} finally {
-						await parentHandle.close();
+						if (parentHandle) {
+							try {
+								await parentHandle.close();
+							} catch (error) {
+								logger.warn("Settings: committed config directory handle close failed", {
+									error: String(error),
+								});
+							}
+						}
 					}
 				} finally {
 					try {
@@ -935,6 +950,7 @@ export class Settings {
 		this.#global = committed;
 		this.#rebuildMerged();
 		if (concurrentPaths.length > 0) this.#queueSave();
+		return { durability };
 	}
 
 	async #saveNow(options: { throwOnError?: boolean } = {}): Promise<void> {

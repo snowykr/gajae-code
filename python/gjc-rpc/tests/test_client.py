@@ -272,7 +272,12 @@ FAKE_SERVER = textwrap.dedent(
             respond(
                 request_id,
                 "set_default_model_selection",
-                {"provider": model_provider, "modelId": model_id, "thinkingLevel": thinking_level},
+                {
+                    "provider": model_provider,
+                    "modelId": model_id,
+                    "thinkingLevel": thinking_level,
+                    "durability": "confirmed",
+                },
             )
         elif command_type == "cycle_model":
             model_id = "claude-sonnet-4-6" if model_id == "claude-sonnet-4-5" else "claude-sonnet-4-5"
@@ -723,6 +728,7 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(selection.provider, "anthropic")
         self.assertEqual(selection.model_id, "claude-sonnet-4-6")
         self.assertEqual(selection.thinking_level, "high")
+        self.assertEqual(selection.durability, "confirmed")
 
     def test_default_model_selection_rejects_a_malformed_success_response(self) -> None:
         # Given: a server that reports success with a non-string modelId.

@@ -85,7 +85,7 @@ describe("BridgeClient", () => {
 						type: "response",
 						command: "set_default_model_selection",
 						success: true,
-						data: { provider: "openai", modelId: "gpt-4o", thinkingLevel: "max" },
+						data: { provider: "openai", modelId: "gpt-4o", thinkingLevel: "max", durability: "unknown" },
 					}),
 					{ status: 200 },
 				);
@@ -101,7 +101,12 @@ describe("BridgeClient", () => {
 		);
 
 		// Then: it returns only the validated canonical selection and sends the durable command.
-		expect(selection).toEqual({ provider: "openai", modelId: "gpt-4o", thinkingLevel: "max" });
+		expect(selection).toEqual({
+			provider: "openai",
+			modelId: "gpt-4o",
+			thinkingLevel: "max",
+			durability: "unknown",
+		});
 		expect(body).toEqual({
 			type: "set_default_model_selection",
 			provider: "openai",
@@ -111,10 +116,12 @@ describe("BridgeClient", () => {
 	});
 
 	it.each([
-		{ provider: "", modelId: "gpt-4o", thinkingLevel: "max" },
-		{ provider: "openai", modelId: "", thinkingLevel: "max" },
-		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "inherit" },
-		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "bogus" },
+		{ provider: "", modelId: "gpt-4o", thinkingLevel: "max", durability: "confirmed" },
+		{ provider: "openai", modelId: "", thinkingLevel: "max", durability: "confirmed" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "inherit", durability: "confirmed" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "bogus", durability: "confirmed" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "max" },
+		{ provider: "openai", modelId: "gpt-4o", thinkingLevel: "max", durability: "maybe" },
 	])("rejects malformed default selection success data: %j", async malformedData => {
 		// Given: an HTTP-success response whose selection data violates the public contract.
 		const client = new BridgeClient({

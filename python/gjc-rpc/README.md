@@ -82,7 +82,7 @@ selection = client.set_default_model_selection(
     "claude-sonnet-4-6",
     "high",
 )
-print(selection.provider, selection.model_id, selection.thinking_level)
+print(selection.provider, selection.model_id, selection.thinking_level, selection.durability)
 ```
 
 The reasoning level must be concrete (`off`, `minimal`, `low`, `medium`,
@@ -90,9 +90,12 @@ The reasoning level must be concrete (`off`, `minimal`, `low`, `medium`,
 uses the effective scope for the client's working directory, including
 path-scoped `enabledModels`, and requires configured provider credentials. The
 call returns a typed `ResolvedModelSelection` only after the settings replacement
-completes and the tuple is active. A malformed success payload raises
-`ValueError`; an older server's unsupported-command response remains an explicit
-`RpcCommandError`.
+completes and the tuple is active. Its mandatory `durability` is `"confirmed"`
+when the renamed config was parent-directory-fsynced or `"unknown"` when rename
+and live publication completed but crash durability could not be confirmed. A
+malformed success payload, including a missing or invalid durability value,
+raises `ValueError`; an older server's unsupported-command response remains an
+explicit `RpcCommandError`.
 
 By default the client runs:
 

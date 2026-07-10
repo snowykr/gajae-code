@@ -104,7 +104,8 @@ describe("RpcClient UDS transport", () => {
 	test("persists default model selection across a real UDS restart", async () => {
 		// Given
 		const socketPath = path.join(workspace, "default-selection-restart.sock");
-		const canonical = { provider: "rpc-test", modelId: "model-b", thinkingLevel: "off" } as const;
+		const requested = { provider: "rpc-test", modelId: "model-b", thinkingLevel: "off" } as const;
+		const resolved = { ...requested, durability: "confirmed" } as const;
 		const configPath = path.join(agentDir, "config.yml");
 
 		// When
@@ -114,7 +115,7 @@ describe("RpcClient UDS transport", () => {
 			const client = new RpcClient({ transport: "uds", socketPath });
 			try {
 				await client.start();
-				await expect(client.setDefaultModelSelection(canonical)).resolves.toEqual(canonical);
+				await expect(client.setDefaultModelSelection(requested)).resolves.toEqual(resolved);
 			} finally {
 				client.stop();
 			}
@@ -137,10 +138,10 @@ describe("RpcClient UDS transport", () => {
 					provider: state.model?.provider,
 					modelId: state.model?.id,
 					thinkingLevel: state.thinkingLevel,
-				}).toEqual(canonical);
+				}).toEqual(requested);
 				const config = Bun.YAML.parse(await readFile(configPath, "utf8"));
 				expect(config).toMatchObject({
-					defaultThinkingLevel: canonical.thinkingLevel,
+					defaultThinkingLevel: requested.thinkingLevel,
 					modelRoles: { default: "rpc-test/model-b:off" },
 				});
 				expect((await stat(configPath)).mode & 0o777).toBe(0o600);
@@ -191,7 +192,12 @@ describe("RpcClient UDS transport", () => {
 					modelId: "rpc-test-model",
 					thinkingLevel: "off",
 				}),
-			).resolves.toEqual({ provider: "rpc-test", modelId: "rpc-test-model", thinkingLevel: "off" });
+			).resolves.toEqual({
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "off",
+				durability: "confirmed",
+			});
 			expect((await client.getState()).thinkingLevel).toBe("off");
 			expect(Array.isArray(await client.getPendingWorkflowGates())).toBe(true);
 			await expect(client.respondGate("wg_missing", "approve", "k1")).rejects.toThrow(

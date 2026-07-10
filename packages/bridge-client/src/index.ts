@@ -108,7 +108,8 @@ function isResolvedModelSelection(value: unknown): value is BridgeResolvedModelS
 		value.provider.trim().length > 0 &&
 		typeof value.modelId === "string" &&
 		value.modelId.trim().length > 0 &&
-		isBridgeThinkingLevel(value.thinkingLevel)
+		isBridgeThinkingLevel(value.thinkingLevel) &&
+		(value.durability === "confirmed" || value.durability === "unknown")
 	);
 }
 

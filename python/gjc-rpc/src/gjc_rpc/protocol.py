@@ -13,6 +13,7 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 Attribution: TypeAlias = Literal["user", "agent"]
 ThinkingLevel: TypeAlias = Literal["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
 ResolvedThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+DurableSettingsCommitStatus: TypeAlias = Literal["confirmed", "unknown"]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
@@ -747,6 +748,7 @@ class ResolvedModelSelection:
     provider: str
     model_id: str
     thinking_level: ResolvedThinkingLevel
+    durability: DurableSettingsCommitStatus
 
 
 @dataclass(slots=True, frozen=True)
@@ -1399,10 +1401,16 @@ def parse_resolved_model_selection(payload: JsonObject) -> ResolvedModelSelectio
             thinking_level = raw_level
         case _:
             raise ValueError("thinkingLevel must be one of: high, low, max, medium, minimal, off, xhigh")
+    match payload.get("durability"):
+        case "confirmed" | "unknown" as durability:
+            pass
+        case _:
+            raise ValueError("durability must be one of: confirmed, unknown")
     return ResolvedModelSelection(
         provider=_require_str(payload, "provider"),
         model_id=_require_str(payload, "modelId"),
         thinking_level=thinking_level,
+        durability=durability,
     )
 
 
