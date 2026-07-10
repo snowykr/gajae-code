@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -24,6 +24,14 @@ const fixtureModelsYaml = `providers:
     baseUrl: http://127.0.0.1:9/v1
     models:
       - id: rpc-test-model
+        contextWindow: 100000
+        maxTokens: 4096
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+      - id: model-b
         contextWindow: 100000
         maxTokens: 4096
         cost:
@@ -67,7 +75,7 @@ async function waitForSocket(socketPath: string, timeoutMs = 30_000): Promise<vo
 	throw new Error(`socket ${socketPath} was not created`);
 }
 
-function spawnRpc(socketPath: string) {
+function spawnRpc(socketPath: string, useConfiguredDefault = false) {
 	return Bun.spawn(
 		[
 			"bun",
@@ -76,8 +84,7 @@ function spawnRpc(socketPath: string) {
 			"rpc",
 			"--provider",
 			"rpc-test",
-			"--model",
-			"rpc-test-model",
+			...(useConfiguredDefault ? [] : ["--model", "rpc-test-model"]),
 			"--session-dir",
 			path.join(workspace, "sessions"),
 			"--listen",
@@ -94,6 +101,60 @@ function spawnRpc(socketPath: string) {
 }
 
 describe("RpcClient UDS transport", () => {
+	test("persists default model selection across a real UDS restart", async () => {
+		// Given
+		const socketPath = path.join(workspace, "default-selection-restart.sock");
+		const canonical = { provider: "rpc-test", modelId: "model-b", thinkingLevel: "off" } as const;
+		const configPath = path.join(agentDir, "config.yml");
+
+		// When
+		const firstProcess = spawnRpc(socketPath);
+		try {
+			await waitForSocket(socketPath);
+			const client = new RpcClient({ transport: "uds", socketPath });
+			try {
+				await client.start();
+				await expect(client.setDefaultModelSelection(canonical)).resolves.toEqual(canonical);
+			} finally {
+				client.stop();
+			}
+		} finally {
+			firstProcess.kill();
+			await firstProcess.exited;
+			await rm(socketPath, { force: true });
+		}
+
+		const secondProcess = spawnRpc(socketPath, true);
+		try {
+			await waitForSocket(socketPath);
+			const client = new RpcClient({ transport: "uds", socketPath });
+			try {
+				await client.start();
+
+				// Then
+				const state = await client.getState();
+				expect({
+					provider: state.model?.provider,
+					modelId: state.model?.id,
+					thinkingLevel: state.thinkingLevel,
+				}).toEqual(canonical);
+				const config = Bun.YAML.parse(await readFile(configPath, "utf8"));
+				expect(config).toMatchObject({
+					defaultThinkingLevel: canonical.thinkingLevel,
+					modelRoles: { default: "rpc-test/model-b:off" },
+				});
+				expect((await stat(configPath)).mode & 0o777).toBe(0o600);
+				expect((await readdir(agentDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+			} finally {
+				client.stop();
+			}
+		} finally {
+			secondProcess.kill();
+			await secondProcess.exited;
+			await rm(socketPath, { force: true });
+		}
+	}, 60_000);
+
 	test("connects to rpc-mode UDS, correlates requests, checks pending-gate replay API, and leaves server alive on close", async () => {
 		const socketPath = path.join(workspace, "rpc.sock");
 		const proc = spawnRpc(socketPath);
