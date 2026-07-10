@@ -248,6 +248,21 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.defaultThinkingLevel).toBe("off");
 		});
+		it("restores a durable default model selection after fresh settings initialization", async () => {
+			await writeSettings({ defaultThinkingLevel: Effort.High });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			await settings.commitDurable({
+				defaultThinkingLevel: Effort.Low,
+				modelRoles: { default: "anthropic/claude-sonnet-4-6:low" },
+			});
+
+			resetSettingsForTest();
+			const freshSettings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(freshSettings.get("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(freshSettings.getModelRole("default")).toBe("anthropic/claude-sonnet-4-6:low");
+		});
 		it("does not retry an explicitly rejected durability save", async () => {
 			await writeSettings({ defaultThinkingLevel: Effort.High });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -275,7 +290,7 @@ describe("Settings", () => {
 					blockNextWrite = false;
 					await releaseWrite.promise;
 				}
-				return realWrite(target, data);
+				return realWrite(String(target), String(data));
 			});
 
 			settings.set("defaultThinkingLevel", Effort.Low);
@@ -337,7 +352,7 @@ describe("Settings", () => {
 					writeStarted.resolve();
 					await releaseWrite.promise;
 				}
-				return realWrite(target, data);
+				return realWrite(String(target), String(data));
 			});
 
 			const commitPromise = settings.commitDurable({

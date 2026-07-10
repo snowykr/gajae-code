@@ -813,7 +813,7 @@ export const SETTINGS_SCHEMA = {
 	defaultThinkingLevel: {
 		type: "enum",
 		values: THINKING_EFFORTS,
-		default: THINKING_EFFORTS[3],
+		default: Effort.High,
 		ui: {
 			tab: "model",
 			label: "Thinking Level",
