@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -235,6 +235,56 @@ describe("Settings", () => {
 				executor: "persisted/executor",
 				planner: "user/planner:high",
 			});
+		});
+	});
+	describe("durable save barriers", () => {
+		it("does not retry an explicitly rejected durability save", async () => {
+			await writeSettings({ defaultThinkingLevel: Effort.High });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("defaultThinkingLevel", Effort.Low);
+
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
+				throw new Error("durable save failed");
+			});
+			await expect(settings.flushOrThrow()).rejects.toThrow("durable save failed");
+			writeSpy.mockRestore();
+
+			await settings.flush();
+			const savedSettings = await readSettings();
+			expect(savedSettings.defaultThinkingLevel).toBe(Effort.High);
+		});
+
+		it("waits for an in-flight debounced save before acknowledging the latest value", async () => {
+			await writeSettings({ defaultThinkingLevel: Effort.High });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const releaseWrite = Promise.withResolvers<void>();
+			const realWrite = Bun.write.bind(Bun);
+			let blockNextWrite = true;
+			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
+				if (blockNextWrite) {
+					blockNextWrite = false;
+					await releaseWrite.promise;
+				}
+				return realWrite(target, data);
+			});
+
+			settings.set("defaultThinkingLevel", Effort.Low);
+			await Bun.sleep(120);
+			settings.set("defaultThinkingLevel", Effort.Off);
+
+			let flushCompleted = false;
+			const flushPromise = settings.flushOrThrow().then(() => {
+				flushCompleted = true;
+			});
+			await Bun.sleep(0);
+			expect(flushCompleted).toBe(false);
+
+			releaseWrite.resolve();
+			await flushPromise;
+			writeSpy.mockRestore();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.defaultThinkingLevel).toBe(Effort.Off);
 		});
 	});
 

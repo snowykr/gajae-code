@@ -370,7 +370,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow();
+			await this.#startSave();
 		}
 	}
 
@@ -383,7 +383,7 @@ export class Settings {
 			await this.#savePromise;
 		}
 		if (this.#modified.size > 0) {
-			await this.#saveNow(true);
+			await this.#startSave(true);
 		}
 	}
 
@@ -824,10 +824,25 @@ export class Settings {
 		}
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			this.#saveNow().catch(err => {
+			this.#startSave().catch(err => {
 				logger.warn("Settings: background save failed", { error: String(err) });
 			});
 		}, 100);
+	}
+
+	#startSave(throwOnError = false): Promise<void> {
+		const previousSave = this.#savePromise ?? Promise.resolve();
+		const savePromise = previousSave.then(() => this.#saveNow(throwOnError));
+		this.#savePromise = savePromise;
+		savePromise.then(
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+			() => {
+				if (this.#savePromise === savePromise) this.#savePromise = undefined;
+			},
+		);
+		return savePromise;
 	}
 
 	async #saveNow(throwOnError = false): Promise<void> {
@@ -861,9 +876,13 @@ export class Settings {
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
+			// Keep ordinary background/flush saves retryable. An explicit
+			// durability acknowledgement must reject without leaving its
+			// failed selection queued for a later flush.
+			if (!throwOnError) {
+				for (const p of modifiedPaths) {
+					this.#modified.add(p);
+				}
 			}
 			if (throwOnError) throw error;
 		}

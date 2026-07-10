@@ -3,11 +3,12 @@ import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 
 describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
@@ -26,6 +27,7 @@ describe("AgentSession role model thinking behavior", () => {
 		for (const authStorage of authStorages.splice(0)) {
 			authStorage.close();
 		}
+		resetSettingsForTest();
 		tempDir.removeSync();
 	});
 
@@ -39,6 +41,7 @@ describe("AgentSession role model thinking behavior", () => {
 		initialModelId: string;
 		initialThinkingLevel: Effort;
 		modelRoles: Record<string, string>;
+		settings?: Settings;
 	}) {
 		const model = getAnthropicModelOrThrow(options.initialModelId);
 		const agent = new Agent({
@@ -55,7 +58,7 @@ describe("AgentSession role model thinking behavior", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
-		sessionSettings = Settings.isolated();
+		sessionSettings = options.settings ?? Settings.isolated();
 		for (const [role, modelRoleValue] of Object.entries(options.modelRoles)) {
 			sessionSettings.setModelRole(role, modelRoleValue);
 		}
@@ -325,18 +328,33 @@ describe("AgentSession role model thinking behavior", () => {
 
 	it("does not report success when durable default selection save fails", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		resetSettingsForTest();
 		const selectedModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const persistentSettings = await Settings.init({ cwd: tempDir.path(), agentDir: tempDir.path() });
 		await createSession({
 			initialModelId: initialModel.id,
 			initialThinkingLevel: Effort.High,
 			modelRoles: { default: `${initialModel.provider}/${initialModel.id}:high` },
+			settings: persistentSettings,
 		});
-		const flushOrThrow = sessionSettings.flushOrThrow;
-		sessionSettings.flushOrThrow = async () => {
+		await sessionSettings.flush();
+		const writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
 			throw new Error("durable save failed");
+		});
+
+		try {
+			await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow("durable save failed");
+		} finally {
+			writeSpy.mockRestore();
+		}
+
+		await sessionSettings.flush();
+		const savedSettings = YAML.parse(await Bun.file(path.join(tempDir.path(), "config.yml")).text()) as {
+			modelRoles?: { default?: string };
+			defaultThinkingLevel?: string;
 		};
-		await expect(session.setDefaultModelSelection(selectedModel, Effort.Low)).rejects.toThrow("durable save failed");
-		sessionSettings.flushOrThrow = flushOrThrow;
+		expect(savedSettings.modelRoles?.default).toBe(`${initialModel.provider}/${initialModel.id}:high`);
+		expect(savedSettings.defaultThinkingLevel).toBeUndefined();
 	});
 	it("rejects a cwd-disabled durable default before mutating the session", async () => {
 		const initialModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
