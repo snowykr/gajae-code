@@ -258,11 +258,10 @@ describe("Settings", () => {
 			await writeSettings({ theme: { dark: "initial-dark" }, modelRoles: { default: "initial/model" } });
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			settings.set("theme.dark", "pending-dark");
-			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
-				if (String(target).endsWith(".tmp")) throw new Error("forced durable candidate failure");
-				const lockMetadata = String(data);
-				await fs.promises.writeFile(String(target), lockMetadata);
-				return Buffer.byteLength(lockMetadata);
+			const realOpen = fs.promises.open;
+			const openSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+				if (String(file).endsWith(".tmp")) throw new Error("forced durable candidate failure");
+				return realOpen(file, flags, mode);
 			});
 
 			try {
@@ -270,7 +269,7 @@ describe("Settings", () => {
 					"forced durable candidate failure",
 				);
 			} finally {
-				writeSpy.mockRestore();
+				openSpy.mockRestore();
 			}
 			await settings.flush();
 
@@ -285,15 +284,16 @@ describe("Settings", () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			const writeStarted = Promise.withResolvers<void>();
 			const releaseWrite = Promise.withResolvers<void>();
-			const realWrite = Bun.write;
+			const realOpen = fs.promises.open;
 			let blocked = true;
-			const writeSpy = spyOn(Bun, "write").mockImplementation(async (target, data) => {
-				if (blocked && String(target).endsWith(".tmp")) {
+			const openSpy = spyOn(fs.promises, "open").mockImplementation(async (file, flags, mode) => {
+				const handle = await realOpen(file, flags, mode);
+				if (blocked && String(file).endsWith(".tmp")) {
 					blocked = false;
 					writeStarted.resolve();
 					await releaseWrite.promise;
 				}
-				return realWrite(String(target), String(data));
+				return handle;
 			});
 
 			try {
@@ -304,7 +304,7 @@ describe("Settings", () => {
 				await commit;
 				await settings.flush();
 			} finally {
-				writeSpy.mockRestore();
+				openSpy.mockRestore();
 			}
 
 			resetSettingsForTest();

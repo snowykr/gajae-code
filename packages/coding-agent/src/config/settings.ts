@@ -55,6 +55,10 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+function isRawSettings(value: unknown): value is RawSettings {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -596,15 +600,13 @@ export class Settings {
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		try {
 			const content = await Bun.file(filePath).text();
-			const parsed = YAML.parse(content);
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				return {};
-			}
-			return this.#migrateRawSettings(parsed as RawSettings);
+			const parsed: unknown = YAML.parse(content);
+			if (!isRawSettings(parsed)) throw new TypeError(`Settings root must be an object: ${filePath}`);
+			return this.#migrateRawSettings(parsed);
 		} catch (error) {
 			if (isEnoent(error)) return {};
 			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			throw error;
 		}
 	}
 
@@ -893,14 +895,28 @@ export class Settings {
 				}
 
 				const tempPath = `${configPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+				let tempHandle: fs.promises.FileHandle | undefined;
 				try {
-					await Bun.write(tempPath, YAML.stringify(committed, null, 2));
+					tempHandle = await fs.promises.open(tempPath, "wx", 0o600);
+					await tempHandle.writeFile(YAML.stringify(committed, null, 2), "utf8");
+					await tempHandle.sync();
+					await tempHandle.close();
+					tempHandle = undefined;
 					await fs.promises.rename(tempPath, configPath);
 					linearized = true;
+
+					const parentHandle = await fs.promises.open(path.dirname(configPath), "r");
+					try {
+						await parentHandle.sync();
+					} finally {
+						await parentHandle.close();
+					}
 				} finally {
-					await fs.promises.rm(tempPath, { force: true }).catch(error => {
-						logger.warn("Settings: temporary durable file cleanup failed", { error: String(error) });
-					});
+					try {
+						if (tempHandle) await tempHandle.close();
+					} finally {
+						if (!linearized) await fs.promises.rm(tempPath, { force: true });
+					}
 				}
 			});
 		} catch (error) {
