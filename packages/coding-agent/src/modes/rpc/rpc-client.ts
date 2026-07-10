@@ -9,6 +9,7 @@ import type { ImageContent, Model } from "@gajae-code/ai";
 import { isRecord, ptree, readJsonl } from "@gajae-code/utils";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import { parseThinkingLevel } from "../../thinking";
 import { AGENT_WIRE_EVENT_TYPES, type AgentWireEventType } from "../shared/agent-wire/event-contract";
 import type {
 	RpcCommand,
@@ -630,7 +631,21 @@ export class RpcClient {
 
 	async setDefaultModelSelection(selection: RpcModelSelection): Promise<RpcResolvedModelSelection> {
 		const response = await this.#send({ type: "set_default_model_selection", ...selection });
-		return this.#getData(response);
+		const data = this.#getData<unknown>(response);
+		if (
+			!isRecord(data) ||
+			typeof data.provider !== "string" ||
+			data.provider.trim().length === 0 ||
+			typeof data.modelId !== "string" ||
+			data.modelId.trim().length === 0
+		) {
+			throw new Error("Invalid set_default_model_selection response");
+		}
+		const thinkingLevel = typeof data.thinkingLevel === "string" ? parseThinkingLevel(data.thinkingLevel) : undefined;
+		if (thinkingLevel === undefined || thinkingLevel === "inherit") {
+			throw new Error("Invalid set_default_model_selection response");
+		}
+		return { provider: data.provider, modelId: data.modelId, thinkingLevel };
 	}
 
 	/**
