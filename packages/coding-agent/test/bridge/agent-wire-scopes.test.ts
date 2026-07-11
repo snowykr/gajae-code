@@ -22,6 +22,7 @@ const EXPECTED_RPC_COMMAND_TYPES: readonly RpcCommand["type"][] = [
 	"get_pending_workflow_gates",
 	"set_capabilities",
 	"set_model",
+	"set_default_model_selection",
 	"cycle_model",
 	"get_available_models",
 	"set_thinking_level",
