@@ -137,7 +137,6 @@ import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append
 import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
-import { resolveProfileBindings } from "../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, MODEL_ROLE_IDS, type ModelRegistry } from "../config/model-registry";
 import {
 	extractExplicitThinkingSelector,
@@ -6880,75 +6879,15 @@ export class AgentSession {
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
-		const projectDefaults = [
-			this.settings.getProject("modelProfile.default") !== undefined ? "modelProfile.default" : undefined,
-			this.settings.getProject("modelRoles")?.default !== undefined ? "modelRoles.default" : undefined,
-		].filter((path): path is string => path !== undefined);
-		if (projectDefaults.length > 0) {
-			throw new Error(
-				`Cannot set the durable default model while project settings define authoritative defaults: ${projectDefaults.join(
-					", ",
-				)}. Remove the project-owned defaults first.`,
-			);
-		}
-
-		const previousEditMode = this.#resolveActiveEditMode();
 		const selector = this.#formatRoleModelValue("default", model, undefined, effectiveLevel);
-		const activeProfile = this.getActiveModelProfile();
 		const modelRoles = { ...(this.settings.getGlobal("modelRoles") ?? {}) };
-		const agentModelOverrides = { ...(this.settings.getGlobal("task.agentModelOverrides") ?? {}) };
-		if (activeProfile) {
-			const profile = this.#modelRegistry.getModelProfile(activeProfile);
-			if (profile) {
-				const bindings = resolveProfileBindings(profile);
-				const effectiveModelRoles = this.settings.get("modelRoles");
-				const effectiveAgentModelOverrides = this.settings.get("task.agentModelOverrides");
-				for (const role of Object.keys(bindings.modelRoles)) {
-					const value = effectiveModelRoles[role];
-					if (value !== undefined) modelRoles[role] = value;
-				}
-				for (const role of Object.keys(bindings.agentModelOverrides)) {
-					const value = effectiveAgentModelOverrides[role];
-					if (value !== undefined) agentModelOverrides[role] = value;
-				}
-			}
-		}
 		modelRoles.default = selector;
 		const commitOutcome = await this.settings.commitDurable({
 			defaultThinkingLevel: effectiveLevel,
 			modelRoles,
-			...(activeProfile
-				? {
-						"task.agentModelOverrides": agentModelOverrides,
-						"modelProfile.default": undefined,
-					}
+			...(this.settings.getGlobal("modelProfile.default") !== undefined
+				? { "modelProfile.default": undefined }
 				: {}),
-		});
-
-		if (activeProfile) {
-			try {
-				this.settings.clearOverride("modelProfile.default");
-				this.settings.override("modelRoles", modelRoles);
-				this.settings.override("task.agentModelOverrides", agentModelOverrides);
-				this.setActiveModelProfile(undefined);
-			} catch (error) {
-				logger.warn("Session: model profile publication failed", { error: String(error) });
-			}
-		}
-
-		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(model);
-		try {
-			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default", {
-				thinkingLevel: effectiveLevel,
-			});
-		} catch (error) {
-			logger.warn("Session: default model tuple log append failed", { error: String(error) });
-		}
-		this.#applyThinkingLevel(effectiveLevel, false);
-		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-		await this.#syncEditToolModeAfterModelChange(previousEditMode).catch(error => {
-			logger.warn("Session: default model edit-mode sync failed", { error: String(error) });
 		});
 
 		return {

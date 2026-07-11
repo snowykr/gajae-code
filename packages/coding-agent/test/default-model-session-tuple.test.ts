@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
@@ -68,85 +68,29 @@ describe("default model session tuple", () => {
 		return session;
 	}
 
-	async function recordOldTuple(activeSession: AgentSession): Promise<ModelThinkingTuple> {
-		const oldModel = bundledModel("claude-sonnet-4-5");
-		await activeSession.setDefaultModelSelection(oldModel, Effort.High);
+	it("persists a future-session default without changing session context, entries, or JSONL", async () => {
+		const activeSession = createSession();
+		const selected = bundledModel("claude-sonnet-4-6");
 		await activeSession.sessionManager.ensureOnDisk();
-		return { model: `${oldModel.provider}/${oldModel.id}`, thinkingLevel: Effort.High };
-	}
-
-	it("persists default model and thinking as a single tuple", async () => {
-		// Given
-		const activeSession = createSession();
-		const selected = bundledModel("claude-sonnet-4-6");
-		const entryCount = activeSession.sessionManager.getEntries().length;
-
-		// When
-		await activeSession.setDefaultModelSelection(selected, Effort.Low);
-
-		// Then
-		const appended = activeSession.sessionManager.getEntries().slice(entryCount);
-		expect(appended).toHaveLength(1);
-		const tupleEntry = appended[0];
-		if (tupleEntry?.type !== "model_change") throw new Error("Expected one model_change tuple entry");
-		expect(tupleEntry).toMatchObject({
-			model: `${selected.provider}/${selected.id}`,
-			role: "default",
-			thinkingLevel: Effort.Low,
-		});
-		expectTuple(activeSession.sessionManager.buildSessionContext(), {
-			model: `${selected.provider}/${selected.id}`,
-			thinkingLevel: Effort.Low,
-		});
-	});
-
-	it("keeps the old complete tuple in the same session when tuple append failure occurs", async () => {
-		// Given
-		const activeSession = createSession();
-		const oldTuple = await recordOldTuple(activeSession);
-		const selected = bundledModel("claude-sonnet-4-6");
-		const appendSpy = spyOn(activeSession.sessionManager, "appendModelChange").mockImplementation(() => {
-			throw new Error("forced tuple append failure");
-		});
-
-		// When
-		try {
-			await activeSession.setDefaultModelSelection(selected, "off");
-		} finally {
-			appendSpy.mockRestore();
-		}
-
-		// Then
-		expectTuple(activeSession.sessionManager.buildSessionContext(), oldTuple);
-	});
-
-	it("restores the old complete tuple in a fresh session when tuple append failure occurs", async () => {
-		// Given
-		const activeSession = createSession();
-		const oldTuple = await recordOldTuple(activeSession);
 		const sessionFile = activeSession.sessionManager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
-		const selected = bundledModel("claude-sonnet-4-6");
-		const appendSpy = spyOn(activeSession.sessionManager, "appendModelChange").mockImplementation(() => {
-			throw new Error("forced tuple append failure");
-		});
+		const contextBefore = activeSession.sessionManager.buildSessionContext();
+		const entriesBefore = activeSession.sessionManager.getEntries();
+		const jsonlBefore = await Bun.file(sessionFile).text();
+		const modelBefore = activeSession.model;
+		const thinkingBefore = activeSession.thinkingLevel;
 
-		// When
-		try {
-			await activeSession.setDefaultModelSelection(selected, "off");
-		} finally {
-			appendSpy.mockRestore();
-		}
+		await activeSession.setDefaultModelSelection(selected, Effort.Low);
 		await activeSession.sessionManager.flush();
-		const reopened = await SessionManager.open(sessionFile);
 
-		// Then
-		expectTuple(reopened.buildSessionContext(), oldTuple);
-		await reopened.close();
+		expect(activeSession.model).toEqual(modelBefore);
+		expect(activeSession.thinkingLevel).toBe(thinkingBefore);
+		expect(activeSession.sessionManager.buildSessionContext()).toEqual(contextBefore);
+		expect(activeSession.sessionManager.getEntries()).toEqual(entriesBefore);
+		expect(await Bun.file(sessionFile).text()).toBe(jsonlBefore);
 	});
 
 	it("restores a legacy entry with a separate thinking-level change", () => {
-		// Given
 		const entries: SessionEntry[] = [
 			{
 				type: "thinking_level_change",
@@ -165,15 +109,10 @@ describe("default model session tuple", () => {
 			} satisfies ModelChangeEntry,
 		];
 
-		// When
-		const context = buildSessionContext(entries);
-
-		// Then
-		expectTuple(context, { model: "anthropic/legacy-model", thinkingLevel: Effort.High });
+		expectTuple(buildSessionContext(entries), { model: "anthropic/legacy-model", thinkingLevel: Effort.High });
 	});
 
 	it("restores atomic tuple thinking when switching to another persisted session", async () => {
-		// Given
 		const selected = bundledModel("claude-sonnet-4-6");
 		const target = SessionManager.create(tempDir.path(), tempDir.path());
 		target.appendModelChange(`${selected.provider}/${selected.id}`, "default", {
@@ -185,24 +124,19 @@ describe("default model session tuple", () => {
 		await target.close();
 		const activeSession = createSession(Settings.isolated({ defaultThinkingLevel: Effort.High }));
 
-		// When
 		await activeSession.switchSession(targetFile);
 
-		// Then
 		expect(activeSession.model).toEqual(selected);
 		expect(activeSession.thinkingLevel).toBe(Effort.Low);
 	});
 
 	it("preserves set_model durable default-role setter semantics", async () => {
-		// Given
 		const settings = Settings.isolated();
 		const activeSession = createSession(settings);
 		const selected = bundledModel("claude-sonnet-4-6");
 
-		// When
 		await activeSession.setModel(selected);
 
-		// Then
 		expect(settings.getModelRole("default")).toBe(`${selected.provider}/${selected.id}`);
 		expect(activeSession.sessionManager.buildSessionContext().models.default).toBe(
 			`${selected.provider}/${selected.id}`,
@@ -210,14 +144,11 @@ describe("default model session tuple", () => {
 	});
 
 	it("preserves set_thinking_level session-only setter semantics", () => {
-		// Given
 		const settings = Settings.isolated({ defaultThinkingLevel: Effort.High });
 		const activeSession = createSession(settings);
 
-		// When
 		activeSession.setThinkingLevel(Effort.Low);
 
-		// Then
 		expect(activeSession.sessionManager.buildSessionContext().thinkingLevel).toBe(Effort.Low);
 		expect(settings.get("defaultThinkingLevel")).toBe(Effort.High);
 	});

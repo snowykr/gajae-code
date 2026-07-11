@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added the durable, atomic `set_default_model_selection` RPC operation with typed TypeScript, Bridge, and Python helpers for committing and activating one validated default model/reasoning tuple, including an explicit `confirmed` or `unknown` crash-durability result; project `.gjc` defaults that remain authoritative on restart are rejected before mutation, while user-global and runtime-activated profiles remain supported.
+- Added the durable, atomic `set_default_model_selection` RPC operation with typed TypeScript, Bridge, and Python helpers for committing one validated machine-global model/reasoning tuple for future sessions. It never activates or mutates the current session or its history; project `.gjc` defaults remain higher-precedence overlays and do not reject global writes. A commit replaces only a conflicting persisted global `modelProfile.default`, preserves runtime overrides, and returns explicit `confirmed` or `unknown` crash-durability status.
 
 ### Changed
 

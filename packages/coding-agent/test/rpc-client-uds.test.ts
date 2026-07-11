@@ -101,7 +101,7 @@ function spawnRpc(socketPath: string, useConfiguredDefault = false) {
 }
 
 describe("RpcClient UDS transport", () => {
-	test("persists default model selection across a real UDS restart", async () => {
+	test("persists a default for a fresh UDS process without changing the running session", async () => {
 		// Given
 		const socketPath = path.join(workspace, "default-selection-restart.sock");
 		const requested = { provider: "rpc-test", modelId: "model-b", thinkingLevel: "off" } as const;
@@ -115,7 +115,31 @@ describe("RpcClient UDS transport", () => {
 			const client = new RpcClient({ transport: "uds", socketPath });
 			try {
 				await client.start();
+				const before = await client.getState();
+				if (!before.sessionFile) throw new Error("Expected running RPC session to have a JSONL file");
+				const sessionFile = Bun.file(before.sessionFile);
+				const jsonlBefore = (await sessionFile.exists()) ? await sessionFile.text() : undefined;
 				await expect(client.setDefaultModelSelection(requested)).resolves.toEqual(resolved);
+
+				// Then the active server and its history remain untouched, including after reconnecting.
+				const after = await client.getState();
+				expect(after).toMatchObject({
+					model: { provider: "rpc-test", id: "rpc-test-model" },
+					sessionFile: before.sessionFile,
+				});
+				expect(after.thinkingLevel).toBe(before.thinkingLevel);
+				expect((await sessionFile.exists()) ? await sessionFile.text() : undefined).toBe(jsonlBefore);
+				client.stop();
+
+				const reconnect = new RpcClient({ transport: "uds", socketPath });
+				await reconnect.start();
+				const reconnectedState = await reconnect.getState();
+				expect(reconnectedState).toMatchObject({
+					model: { provider: "rpc-test", id: "rpc-test-model" },
+					sessionFile: before.sessionFile,
+				});
+				expect(reconnectedState.thinkingLevel).toBe(before.thinkingLevel);
+				reconnect.stop();
 			} finally {
 				client.stop();
 			}
@@ -132,7 +156,7 @@ describe("RpcClient UDS transport", () => {
 			try {
 				await client.start();
 
-				// Then
+				// A clean process with no higher-precedence selection uses the persisted global tuple.
 				const state = await client.getState();
 				expect({
 					provider: state.model?.provider,
@@ -155,6 +179,59 @@ describe("RpcClient UDS transport", () => {
 			await rm(socketPath, { force: true });
 		}
 	}, 60_000);
+
+	test("rejects a malformed UDS frame and continues with the next valid request", async () => {
+		const socketPath = path.join(workspace, "malformed-frame.sock");
+		const proc = spawnRpc(socketPath);
+		try {
+			await waitForSocket(socketPath);
+			const frames: Array<{ id?: string; type?: string; command?: string; success?: boolean; error?: unknown }> = [];
+			const validResponse = Promise.withResolvers<void>();
+			const parseFailure = Promise.withResolvers<void>();
+			const socket = net.createConnection(socketPath);
+			await new Promise<void>((resolve, reject) => {
+				socket.once("connect", resolve);
+				socket.once("error", reject);
+			});
+			let buffered = "";
+			socket.on("data", data => {
+				buffered += data.toString();
+				let newline = buffered.indexOf("\n");
+				while (newline >= 0) {
+					const line = buffered.slice(0, newline);
+					buffered = buffered.slice(newline + 1);
+					if (line) {
+						const frame = JSON.parse(line) as {
+							id?: string;
+							type?: string;
+							command?: string;
+							success?: boolean;
+							error?: unknown;
+						};
+						frames.push(frame);
+						if (frame.id === "state-after-bad-frame" && frame.success) validResponse.resolve();
+						if (frame.type === "response" && frame.command === "parse" && frame.success === false)
+							parseFailure.resolve();
+					}
+					newline = buffered.indexOf("\n");
+				}
+			});
+
+			socket.write("{ definitely not json\n");
+			socket.write(`${JSON.stringify({ id: "state-after-bad-frame", type: "get_state" })}\n`);
+			await Promise.all([parseFailure.promise, validResponse.promise]);
+
+			expect(frames).toContainEqual(expect.objectContaining({ type: "response", command: "parse", success: false }));
+			expect(frames).toContainEqual(
+				expect.objectContaining({ id: "state-after-bad-frame", command: "get_state", success: true }),
+			);
+			socket.end();
+		} finally {
+			proc.kill();
+			await proc.exited;
+			await rm(socketPath, { force: true });
+		}
+	}, 30_000);
 
 	test("connects to rpc-mode UDS, correlates requests, checks pending-gate replay API, and leaves server alive on close", async () => {
 		const socketPath = path.join(workspace, "rpc.sock");
@@ -198,7 +275,7 @@ describe("RpcClient UDS transport", () => {
 				thinkingLevel: "off",
 				durability: "confirmed",
 			});
-			expect((await client.getState()).thinkingLevel).toBe("off");
+			expect((await client.getState()).thinkingLevel).toBe(state.thinkingLevel);
 			expect(Array.isArray(await client.getPendingWorkflowGates())).toBe(true);
 			await expect(client.respondGate("wg_missing", "approve", "k1")).rejects.toThrow(
 				/workflow gates are not available|no pending gate|not negotiated|not available/i,
@@ -217,7 +294,7 @@ describe("RpcClient UDS transport", () => {
 			const reconnect = new RpcClient({ transport: "uds", socketPath });
 			await reconnect.start();
 			expect((await reconnect.getState()).sessionId).toBe(state.sessionId);
-			expect((await reconnect.getState()).thinkingLevel).toBe("off");
+			expect((await reconnect.getState()).thinkingLevel).toBe(state.thinkingLevel);
 			reconnect.stop();
 		} finally {
 			proc.kill();

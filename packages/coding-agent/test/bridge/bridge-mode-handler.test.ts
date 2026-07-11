@@ -429,6 +429,60 @@ describe("bridge mode fetch handler", () => {
 		expect((await laterMutation).status).toBe(200);
 		expect(calls).toEqual(["read-1", "model-1", "thinking-1"]);
 	});
+	it.each([
+		["abort", ["model", "prompt"]],
+		["abort_bash", ["model", "bash"]],
+	] as const)("dispatches %s while an earlier mutation body is deferred without releasing a later mutation", async (cancellation, commandScopes) => {
+		const slowMutationBody = deferredRequestBody();
+		const cancellationStarted = Promise.withResolvers<void>();
+		const laterMutationStarted = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes,
+			endpointMatrix: { commands: true },
+			commandDispatcher: async command => {
+				calls.push(command.id ?? "missing-id");
+				if (command.type === cancellation) cancellationStarted.resolve();
+				if (command.type === "set_thinking_level") laterMutationStarted.resolve();
+				return rpcSuccess(command.id ?? "missing-id", command.type);
+			},
+		});
+		const earlierMutation = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: slowMutationBody.stream,
+			}),
+		);
+		const fastCancellation = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: `${cancellation}-1`, type: cancellation }),
+			}),
+		);
+		const laterMutation = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: "thinking-1", type: "set_thinking_level", level: "high" }),
+			}),
+		);
+
+		await cancellationStarted.promise;
+		expect((await fastCancellation).status).toBe(200);
+		expect(await Promise.race([laterMutationStarted.promise.then(() => "started"), Promise.resolve("pending")])).toBe(
+			"pending",
+		);
+		expect(calls).toEqual([`${cancellation}-1`]);
+
+		slowMutationBody.resolve(JSON.stringify({ id: "model-1", type: "set_model", provider: "p", modelId: "m" }));
+		expect((await earlierMutation).status).toBe(200);
+		expect((await laterMutation).status).toBe(200);
+		expect(calls).toEqual([`${cancellation}-1`, "model-1", "thinking-1"]);
+	});
 
 	it("releases invalid command, denied scope, replay, and rejected dispatcher reservations", async () => {
 		const releaseReplayOwner = Promise.withResolvers<void>();

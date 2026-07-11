@@ -246,20 +246,30 @@ explicitly enabled.
 
 When the dormant command endpoint is enabled for an internal deployment,
 `setDefaultModelSelection(sessionId, provider, modelId, thinkingLevel)` sends
-the same atomic durable operation as RPC. It requires the `model` scope and a
-concrete reasoning level. It rejects before any live or durable mutation when
-project `.gjc` settings own `modelProfile.default` or `modelRoles.default`,
-because those project defaults remain authoritative on restart; user-global
-and runtime-activated profiles remain supported. The command route reserves
-mutation order when each authenticated request arrives, before reading its
-body, so differently sized requests and different idempotency keys cannot
-reorder admitted mutations.
-The helper returns the canonical `BridgeResolvedModelSelection`, including the
-mandatory `durability` value from the RPC result. `confirmed` means the renamed
-settings entry was parent-directory-fsynced; `unknown` means the rename and live
-publication completed but crash durability could not be confirmed. Malformed
-or missing durability values are rejected, and a legacy server's
-unsupported-command or HTTP failure is surfaced explicitly.
+the same atomic, durable machine-global future-session-default operation as
+RPC. It requires the `model` scope and a concrete reasoning level. It never
+activates or mutates the bridge process's live session, its history, or existing
+runtime model/profile overrides. Project `.gjc` `modelProfile.default` and
+`modelRoles.default` settings are higher-precedence overlays: they do not reject
+the global write and continue to win locally. The global commit writes the
+canonical `modelRoles.default` selector and resolved `defaultThinkingLevel`,
+replacing only a conflicting persisted global `modelProfile.default`; it does
+not materialize project or runtime bindings.
+
+The command route reserves the ordered-mutation lane when each authenticated
+request arrives, before reading its body, so differently sized requests and
+different idempotency keys cannot reorder ordered mutations. Cancellation
+(`abort`, `abort_bash`, `abort_retry`) and safe read/control commands are
+fast lanes: they can bypass preceding reserved work for responsiveness, but
+release only their own reservation. Later ordered mutations remain behind every
+earlier ordered reservation.
+The helper returns the
+canonical `BridgeResolvedModelSelection`, including the mandatory `durability`
+value from the RPC result. `confirmed` means the renamed settings entry was
+parent-directory-fsynced; `unknown` means the rename completed but crash
+durability could not be confirmed. Neither status implies live-session
+activation. Malformed or missing durability values are rejected, and a legacy
+server's unsupported-command or HTTP failure is surfaced explicitly.
 
 `BridgeClient.respondGate(sessionId, gateId, ownerToken, answer, options)` posts to the fail-closed UI-response endpoint and returns the gate resolution envelope emitted by the bridge. It deliberately does not send `workflow_gate_response` through `/commands`. Gate answers are authorized by bearer auth, the `control` scope on the (by-default-disabled) `ui-responses` endpoint, and the current controller owner token; unauthorized owner-token attempts return `403 not_controller` without resolving the gate.
 

@@ -79,7 +79,7 @@ describe("bridge default-model-selection conformance", () => {
 			},
 		});
 
-		// When: the canonical durable command crosses both public boundaries.
+		// When: the canonical durable future-session default crosses both public boundaries.
 		const result: BridgeResolvedModelSelection = await client.setDefaultModelSelection(
 			SESSION_ID,
 			model.provider,
@@ -100,12 +100,12 @@ describe("bridge default-model-selection conformance", () => {
 		expect(rawData).toEqual(result);
 	});
 
-	it("preserves mutation arrival order when the earlier request body is slow", async () => {
-		// Given: an earlier streamed mutation and a later public-client mutation with a buffered body.
+	it("preserves future-default mutation arrival order when the earlier request body is slow", async () => {
+		// Given: an earlier streamed global-default mutation and a later public-client mutation with a buffered body.
 		const firstModel = getBundledModel("anthropic", "claude-sonnet-4-6");
 		const secondModel = getBundledModel("openai", "gpt-4o");
 		if (!firstModel || !secondModel) throw new Error("Expected bundled bridge conformance models");
-		const applied: string[] = [];
+		const committedDefaults: string[] = [];
 		const handle = createBridgeFetchHandler({
 			sessionId: SESSION_ID,
 			token: "secret",
@@ -115,7 +115,7 @@ describe("bridge default-model-selection conformance", () => {
 			commandDispatcher: dispatcherFor({
 				getAvailableModels: () => [firstModel, secondModel],
 				setDefaultModelSelection: async (model, thinkingLevel) => {
-					applied.push(model.id);
+					committedDefaults.push(model.id);
 					return { provider: model.provider, modelId: model.id, thinkingLevel, durability: "confirmed" };
 				},
 			}),
@@ -159,8 +159,8 @@ describe("bridge default-model-selection conformance", () => {
 			laterSelection,
 		]);
 
-		// Then: arrival order, raw dispatch output, and typed client output all agree.
-		expect(applied).toEqual([firstModel.id, secondModel.id]);
+		// Then: global-default commit order, raw dispatch output, and typed client output all agree.
+		expect(committedDefaults).toEqual([firstModel.id, secondModel.id]);
 		expect(earlierRaw).toMatchObject({
 			id: "earlier",
 			command: "set_default_model_selection",

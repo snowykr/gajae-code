@@ -154,17 +154,20 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 
 ### `set_default_model_selection` payload
 
-Persists and activates the default model and a concrete reasoning level as one
-atomic operation. Admission uses the effective model scope for the current
-working directory, including path-scoped `enabledModels` rules, and requires
-configured credentials for the selected provider. `inherit` is not accepted
-because the persisted selection must be unambiguous across restarts.
+Persists a machine-global default model and a concrete reasoning level as one
+atomic operation for future sessions. It never activates or mutates the current
+session, its history, or its runtime model/profile overrides. Admission uses the
+effective model scope for the current working directory, including path-scoped
+`enabledModels` rules, and requires configured credentials for the selected
+provider. `inherit` is not accepted because the persisted selection must be
+unambiguous across restarts.
 
-The command rejects before any live or durable mutation when project `.gjc`
-settings own `modelProfile.default` or `modelRoles.default`. Those project
-defaults remain authoritative on restart and cannot be superseded by a
-user-global default commit. User-global and runtime-activated profiles remain
-supported and are materialized normally.
+Project `.gjc` `modelProfile.default` and `modelRoles.default` settings are
+higher-precedence overlays, not ownership of the machine-global settings. They
+do not reject a global write and continue to win in that project. The commit
+persists the canonical global `modelRoles.default` selector and resolved
+`defaultThinkingLevel`, replacing only a conflicting persisted global
+`modelProfile.default`; it does not materialize project or runtime bindings.
 
 On success the response returns the exact committed tuple:
 
@@ -183,19 +186,21 @@ On success the response returns the exact committed tuple:
 }
 ```
 
-Validation and pre-replacement persistence failures leave the live and durable
-defaults unchanged. Once the settings replacement linearizes at rename, it
-remains authoritative if a later session-history append fails, so the live tuple
-and the next process start still agree.
+Validation and pre-replacement persistence failures leave durable settings and
+all live session state unchanged. Once the settings replacement linearizes at
+rename, the future-session default remains authoritative even if a later
+parent-directory fsync cannot be confirmed; no session-history append or live
+tuple publication occurs.
+
 The settings commit preserves unrelated configuration, including credential
 fields, by writing an exclusively created mode-`0600` temporary sibling,
 fsyncing that file before atomic rename, and requesting a parent-directory fsync
 afterward. `durability` is `"confirmed"` when that directory sync completes. If
 the rename succeeds but opening or syncing the parent directory fails, the
-renamed tuple remains authoritative and is published to the live session, while
-the successful response reports `"unknown"` because crash/power-loss durability
-could not be confirmed. Both values are mandatory; typed clients reject a
-missing or unrecognized status.
+renamed future-session default remains committed while the successful response
+reports `"unknown"` because crash/power-loss durability could not be confirmed.
+Both values are mandatory; typed clients reject a missing or unrecognized
+status.
 
 The existing commands are unchanged: `set_model` continues to activate the
 model and persist the default model-role selection, while `set_thinking_level`

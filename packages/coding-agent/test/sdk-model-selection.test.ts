@@ -66,7 +66,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 	}
 
-	function buildSessionOptions(modelPattern: string) {
+	function buildSessionOptions(modelPattern?: string) {
 		return {
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -83,7 +83,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			toolNames: [],
 			rules: [],
 			modelRegistry,
-			modelPattern,
+			...(modelPattern ? { modelPattern } : {}),
 		};
 	}
 
@@ -186,6 +186,47 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("applies startup selection precedence over a persisted global default", async () => {
+		const globalDefault = "runtime-provider/runtime-model";
+		const higherPrecedence = "runtime-provider/runtime-reasoning-model";
+		const globalSettings = Settings.isolated();
+		globalSettings.setModelRole("default", globalDefault);
+
+		const explicitCli = await createAgentSession({
+			...buildSessionOptions(higherPrecedence),
+			settings: globalSettings,
+		});
+		expect(explicitCli.session.model?.id).toBe("runtime-reasoning-model");
+		await explicitCli.session.dispose();
+
+		const resumedSessionManager = SessionManager.inMemory(tempDir);
+		resumedSessionManager.appendModelChange(higherPrecedence, "default", { thinkingLevel: Effort.Low });
+		const resumed = await createAgentSession({
+			...buildSessionOptions(),
+			settings: globalSettings,
+			sessionManager: resumedSessionManager,
+		});
+		expect(resumed.session.model?.id).toBe("runtime-reasoning-model");
+		expect(resumed.session.thinkingLevel).toBe(Effort.Low);
+		await resumed.session.dispose();
+
+		// Startup receives project settings as its already-merged settings layer.
+		const projectOverlay = Settings.isolated();
+		projectOverlay.setModelRole("default", higherPrecedence);
+		const project = await createAgentSession({
+			...buildSessionOptions(),
+			settings: projectOverlay,
+		});
+		expect(project.session.model?.id).toBe("runtime-reasoning-model");
+		await project.session.dispose();
+
+		const clean = await createAgentSession({
+			...buildSessionOptions(),
+			settings: globalSettings,
+		});
+		expect(clean.session.model?.id).toBe("runtime-model");
+		await clean.session.dispose();
+	});
 	test("selects the settings default model without synchronously validating auth", async () => {
 		const defaultModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!defaultModel) {
