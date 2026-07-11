@@ -376,10 +376,8 @@ export class Settings {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		await this.#saveTail;
-		if (this.#modified.size > 0) {
-			await this.#saveNow();
-		}
+		const save = this.#modified.size > 0 ? this.#saveNow() : this.#saveTail;
+		await save;
 	}
 
 	/**
@@ -393,10 +391,8 @@ export class Settings {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		await this.#saveTail;
-		if (this.#modified.size > 0) {
-			await this.#saveNow({ throwOnError: true });
-		}
+		const save = this.#modified.size > 0 ? this.#saveNow({ throwOnError: true }) : this.#saveTail;
+		await save;
 	}
 
 	async cloneForCwd(cwd: string): Promise<Settings> {
@@ -511,8 +507,13 @@ export class Settings {
 		const previousPatch = this.#modified.get("modelRoles");
 		this.setGlobalModelRole(role, modelId);
 		const generation = this.#modified.get("modelRoles")?.generation;
+		if (this.#saveTimer) {
+			clearTimeout(this.#saveTimer);
+			this.#saveTimer = undefined;
+		}
+		const save = this.#saveNow({ throwOnError: true });
 		try {
-			await this.flushOrThrow();
+			await save;
 		} catch (error) {
 			const currentPatch = this.#modified.get("modelRoles");
 			if (currentPatch?.generation === generation) {
@@ -868,18 +869,12 @@ export class Settings {
 
 		const configPath = this.#configPath;
 		const patches = [...this.#modified.values()];
-		const capturedGeneration = Math.max(...patches.map(patch => patch.generation));
 
 		const save = this.#saveTail.then(() =>
 			withFileLock(configPath, async () => {
 				const current = await this.#loadYaml(configPath);
 				for (const patch of patches) {
 					setByPath(current, patch.path.split("."), patch.value);
-				}
-				for (const patch of this.#modified.values()) {
-					if (patch.generation > capturedGeneration) {
-						setByPath(current, patch.path.split("."), patch.value);
-					}
 				}
 				await Bun.write(configPath, YAML.stringify(current, null, 2));
 				for (const patch of patches) {

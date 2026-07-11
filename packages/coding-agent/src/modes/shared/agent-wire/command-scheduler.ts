@@ -47,7 +47,10 @@ export function createSharedRpcCommandScheduler<TResult>(
 				if (settled) throw new Error("RPC command reservation already settled");
 				settled = true;
 				if (isFastLaneRpcCommand(command.type)) {
-					slot.resolve();
+					void prior.then(
+						() => slot.resolve(),
+						() => slot.resolve(),
+					);
 					task = run(command);
 				} else {
 					task = prior.then(() => run(command));
@@ -62,7 +65,10 @@ export function createSharedRpcCommandScheduler<TResult>(
 			cancel(): void {
 				if (settled) return;
 				settled = true;
-				slot.resolve();
+				void prior.then(
+					() => slot.resolve(),
+					() => slot.resolve(),
+				);
 			},
 		};
 	};

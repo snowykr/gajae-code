@@ -249,6 +249,58 @@ test("a reservation holds its ordered position until its command body arrives", 
 	await later;
 	expect(order).toEqual(["first", "later"]);
 });
+test("a fast-lane reservation does not release later ordered commands before its predecessor", async () => {
+	const order: string[] = [];
+	const first = Promise.withResolvers<void>();
+	const scheduler = createSharedRpcCommandScheduler(async command => {
+		if (command.id === "A") {
+			order.push("A:start");
+			await first.promise;
+			order.push("A:done");
+			return;
+		}
+		order.push(command.id ?? "");
+	});
+
+	const a = scheduler.dispatch({ id: "A", type: "set_model", provider: "p", modelId: "m" });
+	await flushMicrotasks();
+	const b = scheduler.dispatch({ id: "B", type: "get_state" } as RpcCommand);
+	const c = scheduler.dispatch({ id: "C", type: "set_model", provider: "p", modelId: "m" });
+	await b;
+	await flushMicrotasks();
+
+	expect(order).toEqual(["A:start", "B"]);
+
+	first.resolve();
+	await Promise.all([a, c]);
+	expect(order).toEqual(["A:start", "B", "A:done", "C"]);
+});
+
+test("cancelling a reservation does not release later ordered commands before its predecessor", async () => {
+	const order: string[] = [];
+	const first = Promise.withResolvers<void>();
+	const scheduler = createSharedRpcCommandScheduler(async command => {
+		if (command.id === "A") {
+			order.push("A:start");
+			await first.promise;
+			order.push("A:done");
+			return;
+		}
+		order.push(command.id ?? "");
+	});
+
+	const a = scheduler.dispatch({ id: "A", type: "set_model", provider: "p", modelId: "m" });
+	await flushMicrotasks();
+	scheduler.reserve().cancel();
+	const c = scheduler.dispatch({ id: "C", type: "set_model", provider: "p", modelId: "m" });
+	await flushMicrotasks();
+
+	expect(order).toEqual(["A:start"]);
+
+	first.resolve();
+	await Promise.all([a, c]);
+	expect(order).toEqual(["A:start", "A:done", "C"]);
+});
 
 describe("get_messages fast-lane snapshot (#618)", () => {
 	const ctx = (session: Partial<AgentSession>): RpcCommandDispatchContext => ({

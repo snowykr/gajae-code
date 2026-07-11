@@ -173,6 +173,50 @@ describe("Settings", () => {
 			const savedSettings = await readSettings();
 			expect(savedSettings.modelRoles).toEqual({ default: "anthropic/claude-sonnet-4-5" });
 		});
+		it("persists an owned selection while a blocked predecessor waits and leaves a newer selection dirty", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			let releaseFirstWrite = () => {};
+			const firstWriteWait = new Promise<void>(resolve => {
+				releaseFirstWrite = resolve;
+			});
+			let resolveFirstWriteStarted = () => {};
+			const firstWriteStarted = new Promise<void>(resolve => {
+				resolveFirstWriteStarted = resolve;
+			});
+			let configWriteCount = 0;
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (args[0] === getConfigPath()) {
+					configWriteCount++;
+					if (configWriteCount === 1) {
+						resolveFirstWriteStarted();
+						await firstWriteWait;
+					}
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.set("defaultThinkingLevel", Effort.High);
+				const olderSave = settings.flush();
+				await firstWriteStarted;
+
+				const selection = settings.setGlobalModelRoleAndFlush("default", "selection/a");
+				settings.setGlobalModelRole("default", "selection/b");
+				releaseFirstWrite();
+
+				await olderSave;
+				await selection;
+				expect((await readSettings()).modelRoles).toEqual({ default: "selection/a" });
+				expect(settings.getModelRole("default")).toBe("selection/b");
+
+				await settings.flush();
+				expect((await readSettings()).modelRoles).toEqual({ default: "selection/b" });
+			} finally {
+				releaseFirstWrite();
+				writeSpy.mockRestore();
+			}
+		});
 
 		it("does not roll back a newer model role after the selected role flush fails", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -210,6 +254,59 @@ describe("Settings", () => {
 			await settings.flush();
 			const savedSettings = await readSettings();
 			expect(savedSettings.modelRoles).toEqual({ default: "newer/model" });
+		});
+		it("does not leak a rejected owned selection through an older save", async () => {
+			await writeSettings({
+				modelRoles: { default: "durable/model" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			let releaseFirstWrite = () => {};
+			const firstWriteWait = new Promise<void>(resolve => {
+				releaseFirstWrite = resolve;
+			});
+			let resolveFirstWriteStarted = () => {};
+			const firstWriteStarted = new Promise<void>(resolve => {
+				resolveFirstWriteStarted = resolve;
+			});
+			let configWriteCount = 0;
+			let failedWriteContent = "";
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (args[0] === getConfigPath()) {
+					configWriteCount++;
+					if (configWriteCount === 1) {
+						resolveFirstWriteStarted();
+						await firstWriteWait;
+					} else if (configWriteCount === 2) {
+						failedWriteContent = String(args[1]);
+						throw new Error("selection save failed");
+					}
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				settings.set("defaultThinkingLevel", Effort.High);
+				const olderSave = settings.flush();
+				await firstWriteStarted;
+
+				const selection = settings.setGlobalModelRoleAndFlush("default", "rejected/a");
+				settings.setGlobalModelRole("default", "newer/b");
+				releaseFirstWrite();
+
+				await olderSave;
+				await expect(selection).rejects.toThrow("selection save failed");
+				expect(failedWriteContent).toContain("rejected/a");
+				expect(failedWriteContent).not.toContain("newer/b");
+				expect((await readSettings()).modelRoles).toEqual({ default: "durable/model" });
+				expect(settings.getModelRole("default")).toBe("newer/b");
+
+				await settings.flush();
+				expect((await readSettings()).modelRoles).toEqual({ default: "newer/b" });
+			} finally {
+				releaseFirstWrite();
+				writeSpy.mockRestore();
+			}
 		});
 	});
 	describe("model role overrides", () => {

@@ -322,7 +322,7 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			if (!commandScheduler) return jsonResponse(503, { error: "commands_unavailable" });
 			const idempotencyKey = request.headers.get("Idempotency-Key") ?? undefined;
 			const existingRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
-			const reservation = existingRecord ? undefined : commandScheduler.reserve();
+			let reservation = existingRecord ? undefined : commandScheduler.reserve();
 			let body = "";
 			let payload: unknown;
 			let pendingResponse: PromiseWithResolvers<unknown> | undefined;
@@ -335,6 +335,15 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 						body,
 					});
 					if (cached) return await cached;
+					reservation = commandScheduler.reserve();
+					pendingResponse = Promise.withResolvers<unknown>();
+					void pendingResponse.promise.catch(() => undefined);
+					rememberIdempotencyResponse(options.idempotencyCache, idempotencyKey, {
+						route: url.pathname,
+						body,
+						response: pendingResponse.promise,
+						pending: true,
+					});
 				} else {
 					bodyReservation = Promise.withResolvers<string>();
 					void bodyReservation.promise.catch(() => undefined);

@@ -180,6 +180,18 @@ const RPC_RESPONSE_DATA_COMMANDS = new Set<RpcCommand["type"]>([
 	"workflow_gate_response",
 ]);
 
+function isRpcResolvedModelSelection(value: unknown): value is RpcResolvedModelSelection {
+	return (
+		isRecord(value) &&
+		typeof value.provider === "string" &&
+		value.provider.trim().length > 0 &&
+		typeof value.modelId === "string" &&
+		value.modelId.trim().length > 0 &&
+		typeof value.thinkingLevel === "string" &&
+		["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinkingLevel)
+	);
+}
+
 function isRpcResponse(value: unknown): value is RpcResponse {
 	if (!isRecord(value) || value.type !== "response" || typeof value.command !== "string") return false;
 	if (typeof value.success !== "boolean" || (value.id !== undefined && typeof value.id !== "string")) return false;
@@ -188,14 +200,7 @@ function isRpcResponse(value: unknown): value is RpcResponse {
 
 	const command = value.command as RpcCommand["type"];
 	if (RPC_RESPONSE_DATA_COMMANDS.has(command) !== Object.hasOwn(value, "data")) return false;
-	if (
-		command === "set_default_model_selection" &&
-		(!isRecord(value.data) ||
-			typeof value.data.provider !== "string" ||
-			typeof value.data.modelId !== "string" ||
-			!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.data.thinkingLevel as string))
-	)
-		return false;
+	if (command === "set_default_model_selection" && !isRpcResolvedModelSelection(value.data)) return false;
 	return true;
 }
 
@@ -716,7 +721,9 @@ export class RpcClient {
 			modelId: selection.modelId,
 			thinkingLevel: selection.thinkingLevel,
 		});
-		return this.#getData(response);
+		const data = this.#getData<unknown>(response);
+		if (!isRpcResolvedModelSelection(data)) throw new Error("Invalid set_default_model_selection response");
+		return data;
 	}
 
 	/**

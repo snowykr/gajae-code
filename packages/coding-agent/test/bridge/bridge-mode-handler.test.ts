@@ -334,6 +334,68 @@ describe("bridge mode fetch handler", () => {
 		expect((await second).status).toBe(200);
 		expect(calls).toBe(1);
 	});
+	it("retries a pending idempotency key as a fresh generation after its original dispatch fails", async () => {
+		let calls = 0;
+		const firstStarted = Promise.withResolvers<void>();
+		const failFirst = Promise.withResolvers<void>();
+		const duplicateBodyRead = Promise.withResolvers<void>();
+		const releaseDuplicateBody = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		const body = JSON.stringify({ id: "req-1", type: "prompt", message: "hello" });
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["prompt"],
+			endpointMatrix: { commands: true },
+			idempotencyCache: new Map(),
+			commandDispatcher: async command => {
+				calls += 1;
+				if (calls === 1) {
+					firstStarted.resolve();
+					await failFirst.promise;
+					throw new Error("first dispatch failed");
+				}
+				secondStarted.resolve();
+				await releaseSecond.promise;
+				return rpcSuccess(command.id, "prompt");
+			},
+		});
+		const request = (requestBody: string | ReadableStream<Uint8Array>) =>
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret", "Idempotency-Key": "retry-after-failure" },
+				body: requestBody,
+			});
+
+		const first = handle(request(body));
+		await firstStarted.promise;
+		const duplicate = handle(
+			request(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						duplicateBodyRead.resolve();
+						return releaseDuplicateBody.promise.then(() => {
+							controller.enqueue(new TextEncoder().encode(body));
+							controller.close();
+						});
+					},
+				}),
+			),
+		);
+		await duplicateBodyRead.promise;
+		failFirst.resolve();
+		await expect(first).rejects.toThrow("first dispatch failed");
+
+		releaseDuplicateBody.resolve();
+		await secondStarted.promise;
+		const laterDuplicate = handle(request(body));
+		releaseSecond.resolve();
+
+		expect((await duplicate).status).toBe(200);
+		expect((await laterDuplicate).status).toBe(200);
+		expect(calls).toBe(2);
+	});
 	it("serializes distinct model mutations through the shared command lane", async () => {
 		const order: string[] = [];
 		const first = Promise.withResolvers<void>();
@@ -372,8 +434,10 @@ describe("bridge mode fetch handler", () => {
 		expect((await queued).status).toBe(200);
 		expect(order).toEqual(["set_model", "set_default_model_selection"]);
 	});
-	it("reserves an ordered command slot before reading a deferred request body", async () => {
+	it("keeps later ordered commands behind a deferred predecessor after a fast-lane request", async () => {
 		const order: string[] = [];
+		const first = Promise.withResolvers<void>();
+		const firstStarted = Promise.withResolvers<void>();
 		let controller!: ReadableStreamDefaultController<Uint8Array>;
 		const deferredBody = new ReadableStream<Uint8Array>({
 			start(next) {
@@ -383,40 +447,49 @@ describe("bridge mode fetch handler", () => {
 		const handle = createBridgeFetchHandler({
 			sessionId: "sess-1",
 			token: "secret",
-			commandScopes: ["model"],
+			commandScopes: ["model", "message:read"],
 			endpointMatrix: { commands: true },
 			commandDispatcher: async command => {
-				order.push(command.id ?? "");
+				if (command.id === "A") {
+					order.push("A:start");
+					firstStarted.resolve();
+					await first.promise;
+					order.push("A:done");
+				} else {
+					order.push(command.id ?? "");
+				}
 				return rpcSuccess(command.id, command.type);
 			},
 		});
-		const deferred = handle(
-			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
-				method: "POST",
-				headers: { Authorization: "Bearer secret" },
-				body: deferredBody,
-			}),
-		);
-		const later = handle(
-			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
-				method: "POST",
-				headers: { Authorization: "Bearer secret" },
-				body: JSON.stringify({ id: "later", type: "set_model", provider: "provider-b", modelId: "model-b" }),
-			}),
-		);
+		const send = (body: object | ReadableStream<Uint8Array>) =>
+			handle(
+				new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+					method: "POST",
+					headers: { Authorization: "Bearer secret" },
+					body: body instanceof ReadableStream ? body : JSON.stringify(body),
+				}),
+			);
 
-		await Bun.sleep(1);
-		expect(order).toEqual([]);
+		const deferred = send(deferredBody);
+		const fast = send({ id: "B", type: "get_state" });
+		const later = send({ id: "C", type: "set_model", provider: "provider-b", modelId: "model-b" });
+
+		expect((await fast).status).toBe(200);
+		expect(order).toEqual(["B"]);
+
 		controller.enqueue(
 			new TextEncoder().encode(
-				JSON.stringify({ id: "first", type: "set_model", provider: "provider-a", modelId: "model-a" }),
+				JSON.stringify({ id: "A", type: "set_model", provider: "provider-a", modelId: "model-a" }),
 			),
 		);
 		controller.close();
+		await firstStarted.promise;
+		expect(order).toEqual(["B", "A:start"]);
 
+		first.resolve();
 		expect((await deferred).status).toBe(200);
 		expect((await later).status).toBe(200);
-		expect(order).toEqual(["first", "later"]);
+		expect(order).toEqual(["B", "A:start", "A:done", "C"]);
 	});
 	it("claims control and resolves permission responses with owner token", async () => {
 		const permissionBroker = new UiRequestBroker<BridgePermissionRequestPayload, ClientBridgePermissionOutcome>({

@@ -130,19 +130,48 @@ describe("RpcClient.setDefaultModelSelection", () => {
 			},
 		);
 	});
-	test("rejects malformed correlated selection data", async () => {
+	test.each([
+		["null", null],
+		["array", []],
+		["primitive", "selection"],
+		["missing provider", { modelId: selection.modelId, thinkingLevel: selection.thinkingLevel }],
+		["non-string provider", { ...selection, provider: 1 }],
+		["empty provider", { ...selection, provider: "" }],
+		["whitespace provider", { ...selection, provider: " \t" }],
+		["missing model ID", { provider: selection.provider, thinkingLevel: selection.thinkingLevel }],
+		["non-string model ID", { ...selection, modelId: 1 }],
+		["empty model ID", { ...selection, modelId: "" }],
+		["whitespace model ID", { ...selection, modelId: "\n " }],
+		["inherit thinking level", { ...selection, thinkingLevel: "inherit" }],
+		["invalid thinking level", { ...selection, thinkingLevel: "invalid" }],
+	])("rejects malformed correlated selection data with %s", async (_name, data) => {
 		await withRpcServer(
 			frame => ({
 				id: frame.id,
 				type: "response",
 				command: "set_default_model_selection",
 				success: true,
-				data: { ...selection, thinkingLevel: "invalid" },
+				data,
 			}),
 			async client => {
 				await expect(client.setDefaultModelSelection(selection)).rejects.toThrow(
 					"Protocol error: invalid response",
 				);
+			},
+		);
+	});
+	test("accepts a correlated selection response with max thinking level", async () => {
+		const resolvedSelection = { ...selection, thinkingLevel: ThinkingLevel.Max };
+		await withRpcServer(
+			frame => ({
+				id: frame.id,
+				type: "response",
+				command: "set_default_model_selection",
+				success: true,
+				data: resolvedSelection,
+			}),
+			async client => {
+				await expect(client.setDefaultModelSelection(selection)).resolves.toEqual(resolvedSelection);
 			},
 		);
 	});
