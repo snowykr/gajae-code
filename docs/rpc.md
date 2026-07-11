@@ -91,8 +91,16 @@ Important edge behavior from runtime:
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
+- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }`
 - `{ id?, type: "cycle_model" }`
 - `{ id?, type: "get_available_models" }`
+
+`set_default_model_selection` stores the selector in the machine-global
+`modelRoles.default` setting and returns the selected provider/model with its
+model-effective concrete thinking level. A success response means
+`flushOrThrow()` completed without error. It does not change the current live
+session or its history; project settings, active profile overrides, explicit CLI
+selection, and resumed-session state retain their existing precedence.
 
 ### Thinking
 

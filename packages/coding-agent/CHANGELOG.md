@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `set_default_model_selection` RPC support for saving the machine-global default model and model-effective thinking level.
+
 ### Changed
 
 - Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2, including the robogjc web workspace and a non-mutating publish-type gate.
