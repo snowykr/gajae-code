@@ -3,7 +3,13 @@
  *
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
-import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	type AgentEvent,
+	type AgentMessage,
+	type AgentToolResult,
+	type ResolvedThinkingLevel,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type { ImageContent, Model } from "@gajae-code/ai";
 import { isRecord, ptree, readJsonl } from "@gajae-code/utils";
@@ -64,6 +70,12 @@ export interface RpcClientOptions {
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
 
+export type RpcDefaultModelSelection = {
+	readonly provider: string;
+	readonly modelId: string;
+	readonly thinkingLevel: ResolvedThinkingLevel;
+};
+
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 
@@ -106,6 +118,29 @@ const coreAgentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_update",
 	"tool_execution_end",
 ]);
+
+function isResolvedThinkingLevel(value: unknown): value is ResolvedThinkingLevel {
+	return (
+		value === ThinkingLevel.Off ||
+		value === ThinkingLevel.Minimal ||
+		value === ThinkingLevel.Low ||
+		value === ThinkingLevel.Medium ||
+		value === ThinkingLevel.High ||
+		value === ThinkingLevel.XHigh ||
+		value === ThinkingLevel.Max
+	);
+}
+
+function isDefaultModelSelection(value: unknown): value is RpcDefaultModelSelection {
+	return (
+		isRecord(value) &&
+		typeof value.provider === "string" &&
+		value.provider.trim().length > 0 &&
+		typeof value.modelId === "string" &&
+		value.modelId.trim().length > 0 &&
+		isResolvedThinkingLevel(value.thinkingLevel)
+	);
+}
 
 function isRpcResponse(value: unknown): value is RpcResponse {
 	if (!isRecord(value)) return false;
@@ -623,6 +658,24 @@ export class RpcClient {
 	 */
 	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
 		const response = await this.#send({ type: "set_model", provider, modelId });
+		return this.#getData(response);
+	}
+
+	async setDefaultModelSelection(
+		provider: string,
+		modelId: string,
+		thinkingLevel: ResolvedThinkingLevel,
+	): Promise<RpcDefaultModelSelection> {
+		const response = await this.#send({
+			type: "set_default_model_selection",
+			provider,
+			modelId,
+			thinkingLevel,
+		});
+		if (!response.success) return this.#getData(response);
+		if (response.command !== "set_default_model_selection" || !isDefaultModelSelection(response.data)) {
+			throw new Error("Invalid set_default_model_selection response");
+		}
 		return this.#getData(response);
 	}
 
