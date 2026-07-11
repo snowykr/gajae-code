@@ -4,7 +4,7 @@
  * Commands are sent as JSON lines on stdin.
  * Responses and events are emitted as JSON lines on stdout.
  */
-import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
+import type { AgentMessage, AgentToolResult, ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type { Effort, ImageContent, Model } from "@gajae-code/ai";
 import type { BashResult } from "../../exec/bash-executor";
@@ -14,6 +14,13 @@ import type { TodoPhase } from "../../tools/todo-write";
 
 export type RpcGetStateInclude = "tools" | "dumpTools" | "systemPrompt";
 export type RpcCapability = "compact_message_update";
+export type RpcModelSelection = {
+	provider: string;
+	modelId: string;
+	thinkingLevel: ResolvedThinkingLevel;
+};
+
+export type RpcResolvedModelSelection = RpcModelSelection;
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -38,6 +45,7 @@ export type RpcCommand =
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
+	| ({ id?: string; type: "set_default_model_selection" } & RpcModelSelection)
 	| { id?: string; type: "cycle_model" }
 	| { id?: string; type: "get_available_models" }
 
@@ -151,6 +159,13 @@ export type RpcResponse =
 	  }
 
 	// Model
+	| {
+			id?: string;
+			type: "response";
+			command: "set_default_model_selection";
+			success: true;
+			data: RpcResolvedModelSelection;
+	  }
 	| {
 			id?: string;
 			type: "response";

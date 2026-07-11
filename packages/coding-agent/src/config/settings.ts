@@ -480,7 +480,6 @@ export class Settings {
 	 * Set a model role (helper for modelRoles record).
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides &&
@@ -488,12 +487,18 @@ export class Settings {
 			!Array.isArray(runtimeOverrides) &&
 			Object.hasOwn(runtimeOverrides, role);
 
-		this.set("modelRoles", { ...current, [role]: modelId });
+		this.setGlobalModelRole(role, modelId);
 
 		if (updateRuntimeOverride) {
 			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
 		}
 	}
+
+	setGlobalModelRole(role: ModelRole | string, modelId: string): void {
+		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
+		this.set("modelRoles", { ...current, [role]: modelId });
+	}
+
 	/**
 	 * Set an agent model override while keeping any live runtime override aligned.
 	 *

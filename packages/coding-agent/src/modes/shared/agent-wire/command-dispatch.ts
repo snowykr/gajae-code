@@ -2,8 +2,10 @@ import type { AgentTool } from "@gajae-code/agent-core";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { Snowflake } from "@gajae-code/utils";
+import { formatModelSelectorValue } from "../../../config/model-resolver";
 import type { ExtensionUIContext } from "../../../extensibility/extensions";
 import type { AgentSession } from "../../../session/agent-session";
+import { parseThinkingLevel, resolveThinkingLevelForModel } from "../../../thinking";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -237,6 +239,32 @@ export async function dispatchRpcCommand(
 				}
 				await session.setModel(model);
 				return rpcSuccess(id, "set_model", model);
+			}
+
+			case "set_default_model_selection": {
+				const provider = command.provider.trim();
+				const modelId = command.modelId.trim();
+				const thinkingLevel = parseThinkingLevel(command.thinkingLevel);
+				if (!provider || !modelId || thinkingLevel === undefined || thinkingLevel === ThinkingLevel.Inherit) {
+					return rpcError(id, "set_default_model_selection", "Invalid default model selection");
+				}
+				const model = session
+					.getAvailableModels()
+					.find(candidate => candidate.provider === provider && candidate.id === modelId);
+				if (!model) {
+					return rpcError(id, "set_default_model_selection", `Model not found: ${provider}/${modelId}`);
+				}
+				const effectiveLevel = resolveThinkingLevelForModel(model, thinkingLevel) ?? ThinkingLevel.Off;
+				session.settings.setGlobalModelRole(
+					"default",
+					formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+				);
+				await session.settings.flushOrThrow();
+				return rpcSuccess(id, "set_default_model_selection", {
+					provider: model.provider,
+					modelId: model.id,
+					thinkingLevel: effectiveLevel,
+				});
 			}
 
 			case "cycle_model": {
