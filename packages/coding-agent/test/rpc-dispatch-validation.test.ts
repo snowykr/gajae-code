@@ -5,6 +5,7 @@ import {
 	dispatchRpcCommand,
 	type RpcCommandDispatchContext,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
+import { isRpcCommand } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-validation";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
 function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
@@ -18,6 +19,75 @@ function ctx(session: Partial<AgentSession> = {}): RpcCommandDispatchContext {
 }
 
 describe("dispatchRpcCommand validation + error correlation", () => {
+	test("accepts a valid default model selection wire command", () => {
+		// Given: a complete selector with an explicit reasoning level.
+		const command = {
+			id: "selection-1",
+			type: "set_default_model_selection",
+			provider: "openai",
+			modelId: "gpt-5",
+			thinkingLevel: ThinkingLevel.High,
+		};
+
+		// When: the public wire boundary validates the frame.
+		const accepted = isRpcCommand(command);
+
+		// Then: the command is accepted without dispatching it.
+		expect(accepted).toBe(true);
+	});
+
+	test("accepts a default model selection without an optional reasoning level", () => {
+		// Given: a complete model selector with no reasoning override.
+		const command = {
+			id: "selection-2",
+			type: "set_default_model_selection",
+			provider: "anthropic",
+			modelId: "claude-sonnet-4-5",
+		};
+
+		// When: the public wire boundary validates the frame.
+		const accepted = isRpcCommand(command);
+
+		// Then: omission preserves the command's optional-level contract.
+		expect(accepted).toBe(true);
+	});
+
+	test("rejects malformed default model selection wire commands", () => {
+		// Given: frames covering missing, blank, non-string, inherited, and unknown selector fields.
+		const malformed: readonly unknown[] = [
+			{ type: "set_default_model_selection", modelId: "gpt-5" },
+			{ type: "set_default_model_selection", provider: "openai" },
+			{ type: "set_default_model_selection", provider: "   ", modelId: "gpt-5" },
+			{ type: "set_default_model_selection", provider: "openai", modelId: "\t" },
+			{ type: "set_default_model_selection", provider: 42, modelId: "gpt-5" },
+			{ type: "set_default_model_selection", provider: "openai", modelId: false },
+			{
+				type: "set_default_model_selection",
+				provider: "openai",
+				modelId: "gpt-5",
+				thinkingLevel: "",
+			},
+			{
+				type: "set_default_model_selection",
+				provider: "openai",
+				modelId: "gpt-5",
+				thinkingLevel: ThinkingLevel.Inherit,
+			},
+			{
+				type: "set_default_model_selection",
+				provider: "openai",
+				modelId: "gpt-5",
+				thinkingLevel: "extreme",
+			},
+		];
+
+		// When: each untrusted frame crosses the public wire boundary.
+		const results = malformed.map(isRpcCommand);
+
+		// Then: none reaches the typed dispatcher contract.
+		expect(results).toEqual(malformed.map(() => false));
+	});
+
 	test("rejects an invalid thinking level with a correlated error (issue 02)", async () => {
 		const res = await dispatchRpcCommand(
 			{ id: "t1", type: "set_thinking_level", level: "BOGUS" } as unknown as RpcCommand,
