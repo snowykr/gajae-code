@@ -628,6 +628,7 @@ export class RpcClient {
 		return this.#getData(response);
 	}
 
+	/** Persist the machine-global model and concrete thinking default for future sessions. */
 	async setDefaultModelSelection(selection: RpcModelSelection): Promise<RpcResolvedModelSelection> {
 		const response = await this.#send({
 			type: "set_default_model_selection",

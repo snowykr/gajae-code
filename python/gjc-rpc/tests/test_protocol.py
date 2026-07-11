@@ -12,6 +12,7 @@ from gjc_rpc import (
     GoalUpdatedEvent,
     IrcMessageEvent,
     NoticeEvent,
+    ResolvedModelSelection,
     SessionState,
     SubagentSteerMessageEvent,
     ThinkingLevelChangedEvent,
@@ -24,6 +25,7 @@ from gjc_rpc import (
     assistant_text,
     assistant_text_with_thinking,
     parse_notification,
+    parse_resolved_model_selection,
     parse_session_state,
     parse_workflow_gate,
     parse_workflow_gate_event,
@@ -43,6 +45,28 @@ def _wrapped_event(event: dict) -> dict:
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_resolved_model_selection_validates_canonical_fields(self) -> None:
+        selection = parse_resolved_model_selection(
+            {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "high"}
+        )
+        self.assertEqual(
+            selection,
+            ResolvedModelSelection(
+                provider="anthropic",
+                model_id="claude-sonnet-4-6",
+                thinking_level="high",
+            ),
+        )
+
+        malformed = (
+            {"provider": " ", "modelId": "claude-sonnet-4-6", "thinkingLevel": "high"},
+            {"provider": "anthropic", "modelId": "", "thinkingLevel": "high"},
+            {"provider": "anthropic", "modelId": "claude-sonnet-4-6", "thinkingLevel": "inherit"},
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                parse_resolved_model_selection(payload)
+
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
             {

@@ -100,7 +100,9 @@ Important edge behavior from runtime:
 model-effective concrete thinking level. A success response means
 `flushOrThrow()` completed without error. It does not change the current live
 session or its history; project settings, active profile overrides, explicit CLI
-selection, and resumed-session state retain their existing precedence.
+selection, and resumed-session state retain their existing precedence. A failed
+flush restores the prior in-memory global selector so a later settings save
+cannot persist a rejected request.
 
 ### Thinking
 

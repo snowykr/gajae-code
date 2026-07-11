@@ -334,6 +334,44 @@ describe("bridge mode fetch handler", () => {
 		expect((await second).status).toBe(200);
 		expect(calls).toBe(1);
 	});
+	it("serializes distinct model mutations through the shared command lane", async () => {
+		const order: string[] = [];
+		const first = Promise.withResolvers<void>();
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model"],
+			endpointMatrix: { commands: true },
+			commandDispatcher: async command => {
+				order.push(command.type);
+				if (command.type === "set_model") await first.promise;
+				return rpcSuccess(command.id, command.type);
+			},
+		});
+		const send = (body: object) =>
+			handle(
+				new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+					method: "POST",
+					headers: { Authorization: "Bearer secret" },
+					body: JSON.stringify(body),
+				}),
+			);
+
+		const active = send({ id: "model-1", type: "set_model", provider: "provider-a", modelId: "model-a" });
+		const queued = send({
+			id: "default-1",
+			type: "set_default_model_selection",
+			provider: "provider-b",
+			modelId: "model-b",
+			thinkingLevel: "high",
+		});
+		await Bun.sleep(1);
+		expect(order).toEqual(["set_model"]);
+		first.resolve();
+		expect((await active).status).toBe(200);
+		expect((await queued).status).toBe(200);
+		expect(order).toEqual(["set_model", "set_default_model_selection"]);
+	});
 	it("claims control and resolves permission responses with owner token", async () => {
 		const permissionBroker = new UiRequestBroker<BridgePermissionRequestPayload, ClientBridgePermissionOutcome>({
 			emitRequest: () => {},

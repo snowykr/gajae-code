@@ -38,6 +38,8 @@ from .protocol import (
     MessageUpdateEvent,
     ModelCycleResult,
     ModelInfo,
+    ResolvedModelSelection,
+    ResolvedThinkingLevel,
     ReadyEvent,
     RetryFallbackAppliedEvent,
     RetryFallbackSucceededEvent,
@@ -78,6 +80,7 @@ from .protocol import (
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_resolved_model_selection,
     parse_workflow_gate,
     parse_session_state,
     parse_session_stats,
@@ -750,6 +753,20 @@ class RpcClient:
         if model is None:
             raise RpcError("set_model returned an empty payload")
         return model
+
+    def set_default_model_selection(
+        self,
+        provider: str,
+        model_id: str,
+        thinking_level: ResolvedThinkingLevel,
+    ) -> ResolvedModelSelection:
+        payload = self._request(
+            "set_default_model_selection",
+            provider=provider,
+            modelId=model_id,
+            thinkingLevel=thinking_level,
+        )
+        return parse_resolved_model_selection(payload)
 
     def cycle_model(self) -> ModelCycleResult | None:
         return parse_model_cycle_result(self._request("cycle_model"))

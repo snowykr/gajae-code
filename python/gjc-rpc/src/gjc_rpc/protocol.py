@@ -12,6 +12,7 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 
 Attribution: TypeAlias = Literal["user", "agent"]
 ThinkingLevel: TypeAlias = Literal["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+ResolvedThinkingLevel: TypeAlias = Literal["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
@@ -46,6 +47,9 @@ INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]]
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset({"select", "input", "editor"})
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset(
     {"inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+_RESOLVED_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 _WORKFLOW_GATE_KIND_VALUES: Final[frozenset[str]] = frozenset({"question", "approval", "execution"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
@@ -742,6 +746,13 @@ class ModelCycleResult:
 
 
 @dataclass(slots=True, frozen=True)
+class ResolvedModelSelection:
+    provider: str
+    model_id: str
+    thinking_level: ResolvedThinkingLevel
+
+
+@dataclass(slots=True, frozen=True)
 class ThinkingLevelCycleResult:
     level: ThinkingLevel
 
@@ -1382,6 +1393,20 @@ def parse_model_cycle_result(payload: JsonObject | None) -> ModelCycleResult | N
         thinking_level=cast(ThinkingLevel | None, payload.get("thinkingLevel")),
         is_scoped=bool(payload.get("isScoped", False)),
     )
+
+
+def parse_resolved_model_selection(payload: JsonObject) -> ResolvedModelSelection:
+    provider = _require_str(payload, "provider")
+    model_id = _require_str(payload, "modelId")
+    if not provider.strip():
+        raise ValueError("provider must not be blank")
+    if not model_id.strip():
+        raise ValueError("modelId must not be blank")
+    thinking_level = cast(
+        ResolvedThinkingLevel,
+        _require_literal(payload.get("thinkingLevel"), _RESOLVED_THINKING_LEVEL_VALUES, field="thinkingLevel"),
+    )
+    return ResolvedModelSelection(provider=provider, model_id=model_id, thinking_level=thinking_level)
 
 
 def parse_thinking_level_cycle_result(payload: JsonObject | None) -> ThinkingLevelCycleResult | None:

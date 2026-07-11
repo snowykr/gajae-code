@@ -71,6 +71,21 @@ with RpcClient(model="openrouter/anthropic/claude-sonnet-4.6", no_session=True) 
 `set_todos()` accepts either a flat list of todo strings/items or explicit
 phases, and `get_state().todo_phases` returns the typed current todo state.
 
+To update the machine-global model and concrete thinking default used by future
+sessions, use the typed default-selection helper:
+
+```python
+selection = client.set_default_model_selection(
+    "anthropic",
+    "claude-sonnet-4-6",
+    "high",
+)
+print(selection.provider, selection.model_id, selection.thinking_level)
+```
+
+This does not change the current live session or its history. The thinking
+level must be concrete; `inherit` is not accepted.
+
 By default the client runs:
 
 ```bash

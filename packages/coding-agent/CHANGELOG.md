@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added `set_default_model_selection` RPC support for saving the machine-global default model and model-effective thinking level.
+- Added `set_default_model_selection` RPC support, including TypeScript, Bridge, and Python client helpers, ordered Bridge dispatch, and rollback after a failed settings flush.
 
 ### Changed
 

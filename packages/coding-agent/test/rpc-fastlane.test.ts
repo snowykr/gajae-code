@@ -10,6 +10,7 @@ import {
 	dispatchRpcCommand,
 	type RpcCommandDispatchContext,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
+import { RPC_COMMAND_TYPES } from "@gajae-code/coding-agent/modes/shared/agent-wire/scopes";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
 const FAST_LANE_COMMANDS: RpcCommand["type"][] = [
@@ -25,6 +26,7 @@ const FAST_LANE_COMMANDS: RpcCommand["type"][] = [
 	"get_last_assistant_text",
 	"get_messages",
 	"get_login_providers",
+	"get_pending_workflow_gates",
 ];
 
 // Commands that MUST stay on the ordered serial chain: async/long work, causally
@@ -45,11 +47,13 @@ const ORDERED_COMMANDS: RpcCommand["type"][] = [
 	"handoff",
 	"login",
 	"set_model",
+	"set_default_model_selection",
 	"cycle_model",
 	"set_todos",
 	"set_session_name",
 	"set_host_tools",
 	"set_host_uri_schemes",
+	"set_capabilities",
 	"export_html",
 	"negotiate_unattended",
 	"workflow_gate_response",
@@ -118,6 +122,11 @@ describe("RPC fast-lane classification (#606, issue 13)", () => {
 		expect(FAST_LANE_COMMANDS.filter(t => ORDERED_COMMANDS.includes(t))).toEqual([]);
 		// Guards against a new command type silently slipping through untested.
 		expect(all.size).toBe(FAST_LANE_COMMANDS.length + ORDERED_COMMANDS.length);
+		expect([...all].sort()).toEqual([...RPC_COMMAND_TYPES].sort());
+	});
+
+	test("set_default_model_selection stays ordered", () => {
+		expect(isFastLaneRpcCommand("set_default_model_selection")).toBe(false);
 	});
 });
 

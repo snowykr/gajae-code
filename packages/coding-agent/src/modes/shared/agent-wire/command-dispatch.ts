@@ -255,11 +255,10 @@ export async function dispatchRpcCommand(
 					return rpcError(id, "set_default_model_selection", `Model not found: ${provider}/${modelId}`);
 				}
 				const effectiveLevel = resolveThinkingLevelForModel(model, thinkingLevel) ?? ThinkingLevel.Off;
-				session.settings.setGlobalModelRole(
+				await session.settings.setGlobalModelRoleAndFlush(
 					"default",
 					formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
 				);
-				await session.settings.flushOrThrow();
 				return rpcSuccess(id, "set_default_model_selection", {
 					provider: model.provider,
 					modelId: model.id,

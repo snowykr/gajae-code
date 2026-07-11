@@ -499,6 +499,23 @@ export class Settings {
 		this.set("modelRoles", { ...current, [role]: modelId });
 	}
 
+	async setGlobalModelRoleAndFlush(role: ModelRole | string, modelId: string): Promise<void> {
+		const hadModelRoles = Object.hasOwn(this.#global, "modelRoles");
+		const previousModelRoles = structuredClone(this.#global.modelRoles);
+		const wasModified = this.#modified.has("modelRoles");
+		this.setGlobalModelRole(role, modelId);
+		try {
+			await this.flushOrThrow();
+		} catch (error) {
+			if (hadModelRoles) this.#global.modelRoles = previousModelRoles;
+			else delete this.#global.modelRoles;
+			if (wasModified) this.#modified.add("modelRoles");
+			else this.#modified.delete("modelRoles");
+			this.#rebuildMerged();
+			throw error;
+		}
+	}
+
 	/**
 	 * Set an agent model override while keeping any live runtime override aligned.
 	 *

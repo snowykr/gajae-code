@@ -229,4 +229,42 @@ describe("set_default_model_selection RPC", () => {
 		);
 		expect(valid.success).toBe(true);
 	});
+
+	test("a failed persistence attempt cannot leak into a later settings flush", async () => {
+		// Given a loaded config whose path becomes unwritable for the command's flush.
+		const initial = {
+			modelRoles: { default: "old/default:low", smol: "provider-s/smol:off" },
+			defaultThinkingLevel: ThinkingLevel.Low,
+		};
+		await Bun.write(configPath, YAML.stringify(initial));
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		fs.rmSync(configPath);
+		fs.mkdirSync(configPath);
+
+		// When the default selection write fails, then an unrelated setting is saved later.
+		const response = await dispatchRpcCommand(
+			{
+				id: "persist-failure-1",
+				type: "set_default_model_selection",
+				provider: registeredModel.provider,
+				modelId: registeredModel.id,
+				thinkingLevel: ThinkingLevel.High,
+			},
+			context(settings),
+		);
+		fs.rmSync(configPath, { recursive: true });
+		await Bun.write(configPath, YAML.stringify(initial));
+		settings.set("defaultThinkingLevel", ThinkingLevel.Medium);
+		await settings.flushOrThrow();
+
+		// Then the rejected selector is absent from memory and the later durable save.
+		expectError(response, "persist-failure-1");
+		expect(settings.getGlobal("modelRoles")).toEqual(initial.modelRoles);
+		const persisted = YAML.parse(await Bun.file(configPath).text()) as {
+			modelRoles: Record<string, string>;
+			defaultThinkingLevel: string;
+		};
+		expect(persisted.modelRoles).toEqual(initial.modelRoles);
+		expect(persisted.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
+	});
 });

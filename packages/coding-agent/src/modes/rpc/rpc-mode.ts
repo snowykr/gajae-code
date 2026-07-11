@@ -22,6 +22,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
+import { createSharedRpcCommandScheduler } from "../shared/agent-wire/command-scheduler";
 import {
 	AgentWireCompactEventEncoder,
 	AgentWireFrameSequencer,
@@ -87,59 +88,11 @@ export function shouldEmitRpcTitlesForTest(): boolean {
 
 const shouldEmitRpcTitles = shouldEmitRpcTitlesForTest;
 
-/**
- * Cancellation commands bypass the ordered serial chain because they must
- * interrupt in-flight work — they cannot wait behind the very command they are
- * meant to abort.
- */
-export const RPC_CANCELLATION_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
-	"abort",
-	"abort_bash",
-	"abort_retry",
-]);
-
-/**
- * Safe read-only commands that bypass the ordered serial chain so they never
- * head-of-line-block behind a long-running ordered command like
- * `bash`/`compact`/`handoff`/`login` (#606, issue 13 — the partial fix only
- * fast-laned cancellation).
- *
- * Every command listed here has a dispatch handler that is **fully synchronous
- * and side-effect-free**: on the single-threaded event loop it runs to
- * completion between the await points of any in-flight ordered command, reading
- * live state without mutating it. Because such a read performs no causal write,
- * jumping ahead of an earlier *queued* ordered command is observably harmless —
- * there is no state change to reorder. Read payloads are additionally
- * snapshotted inside the handler (e.g. `get_messages` returns a shallow copy of
- * `session.messages`) so a fast-lane read can never serialize a half-mutated
- * array that an ordered turn/compaction is rewriting in place.
- *
- * Deliberately excluded (kept ordered): every async/long command and every
- * mutating command. In particular the control-flag setters (`set_thinking_level`,
- * `cycle_thinking_level`, `set_steering_mode`, `set_follow_up_mode`,
- * `set_interrupt_mode`, `set_auto_compaction`, `set_auto_retry`) stay ordered.
- * Their handlers are synchronous, so fast-laning one ahead of an already-queued
- * `prompt`/`bash` would apply the new mode *before* that earlier command runs —
- * the earlier command would then observe the later setter's value, a
- * causal-order (arrival-order) regression. Mutations therefore stay on the
- * chain, and new command types default to ordered (fail-safe).
- */
-export const RPC_SAFE_READ_CONTROL_COMMANDS: ReadonlySet<RpcCommand["type"]> = new Set<RpcCommand["type"]>([
-	// Pure synchronous reads — snapshot live state at processing time, never mutate.
-	"get_state",
-	"get_session_stats",
-	"get_available_models",
-	"get_branch_messages",
-	"get_last_assistant_text",
-	"get_messages",
-	"get_login_providers",
-	"get_pending_workflow_gates",
-]);
-
-/** True when a command may bypass the ordered serial chain and run immediately. */
-export function isFastLaneRpcCommand(type: RpcCommand["type"]): boolean {
-	return RPC_CANCELLATION_COMMANDS.has(type) || RPC_SAFE_READ_CONTROL_COMMANDS.has(type);
-}
+export {
+	isFastLaneRpcCommand,
+	RPC_CANCELLATION_COMMANDS,
+	RPC_SAFE_READ_CONTROL_COMMANDS,
+} from "../shared/agent-wire/command-scheduler";
 
 /**
  * Schedules inbound RPC commands: fast-lane commands run immediately while
@@ -151,15 +104,10 @@ export function createRpcCommandScheduler(
 	run: (command: RpcCommand) => Promise<void>,
 	track: (task: Promise<void>) => void,
 ): { dispatch: (command: RpcCommand) => void } {
-	let orderedChain: Promise<void> = Promise.resolve();
+	const scheduler = createSharedRpcCommandScheduler(run, track);
 	return {
 		dispatch(command: RpcCommand): void {
-			if (isFastLaneRpcCommand(command.type)) {
-				track(run(command));
-				return;
-			}
-			orderedChain = orderedChain.then(() => run(command));
-			track(orderedChain);
+			void scheduler.dispatch(command);
 		},
 	};
 }

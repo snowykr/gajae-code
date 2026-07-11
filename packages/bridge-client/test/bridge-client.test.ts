@@ -71,6 +71,28 @@ describe("BridgeClient", () => {
 		expect(seen[3]).toBe("https://bridge.test/v1/sessions/sess%2F1/commands");
 		expect(headersSeen[3]).toBe("idem-3");
 	});
+	it("sends default model selections through the conventional command helper", async () => {
+		let body: unknown;
+		const client = new BridgeClient({
+			baseUrl: "https://bridge.test",
+			token: "secret",
+			fetch: async (_input, init) => {
+				body = JSON.parse(init?.body?.toString() ?? "");
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			},
+		});
+
+		await client.setDefaultModelSelection("sess-1", "provider-a", "model-a", "high", {
+			idempotencyKey: "default-model-1",
+		});
+
+		expect(body).toEqual({
+			type: "set_default_model_selection",
+			provider: "provider-a",
+			modelId: "model-a",
+			thinkingLevel: "high",
+		});
+	});
 	it("sends controller claim and UI response requests", async () => {
 		const seen: Array<{ url: string; headers: Record<string, string>; body: string | null }> = [];
 		const client = new BridgeClient({
