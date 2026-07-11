@@ -20,6 +20,8 @@ import type {
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcModelSelection,
+	RpcResolvedModelSelection,
 	RpcResponse,
 	RpcSessionState,
 	RpcUnattendedAccepted,
@@ -623,6 +625,16 @@ export class RpcClient {
 	 */
 	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
 		const response = await this.#send({ type: "set_model", provider, modelId });
+		return this.#getData(response);
+	}
+
+	async setDefaultModelSelection(selection: RpcModelSelection): Promise<RpcResolvedModelSelection> {
+		const response = await this.#send({
+			type: "set_default_model_selection",
+			provider: selection.provider,
+			modelId: selection.modelId,
+			thinkingLevel: selection.thinkingLevel,
+		});
 		return this.#getData(response);
 	}
 
