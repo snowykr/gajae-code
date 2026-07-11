@@ -201,6 +201,47 @@ describe("AgentSession durable default model selection", () => {
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/plain:off" });
 	});
 
+	it("serializes concurrent selections so the FIFO last request owns durable, live, and resume defaults", async () => {
+		// Given
+		const firstModel = { ...targetModel(), id: "first" };
+		const lastModel = { ...targetModel(), id: "last" };
+		const firstLiveApplyEntered = Promise.withResolvers<void>();
+		const releaseFirstLiveApply = Promise.withResolvers<void>();
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		vi.spyOn(session, "setModelTemporary").mockImplementation(async (model, thinkingLevel, options) => {
+			if (model.id === firstModel.id) {
+				firstLiveApplyEntered.resolve();
+				await releaseFirstLiveApply.promise;
+			}
+			await originalLiveApply(model, thinkingLevel, options);
+		});
+		const lastPreflightEntered = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model.id === lastModel.id) lastPreflightEntered.resolve();
+			return originalGetApiKey(model, ...args);
+		});
+
+		// When
+		const firstSelection = session.setDefaultModelSelection(firstModel, Effort.Low);
+		await firstLiveApplyEntered.promise;
+		const lastSelection = session.setDefaultModelSelection(lastModel, Effort.High);
+		const preflightRace = Promise.withResolvers<boolean>();
+		void lastPreflightEntered.promise.then(() => preflightRace.resolve(true));
+		setImmediate(() => preflightRace.resolve(false));
+		const lastRequestOvertookFirst = await preflightRace.promise;
+		if (lastRequestOvertookFirst) await lastSelection;
+		releaseFirstLiveApply.resolve();
+		await Promise.all([firstSelection, lastSelection]);
+
+		// Then
+		expect(lastRequestOvertookFirst).toBeFalse();
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/last:high" });
+		expect(session.model).toBe(lastModel);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionManager.buildSessionContext().models.default).toBe("target-provider/last");
+	});
+
 	it("rejects inherit before settings or session mutation", async () => {
 		// Given
 		const entriesBefore = sessionManager.getEntries();
@@ -243,6 +284,31 @@ describe("AgentSession durable default model selection", () => {
 		await expect(selection).rejects.toThrow("durable write failed");
 		expect(liveApply).not.toHaveBeenCalled();
 		expect(session.model).toBe(INITIAL_MODEL);
+	});
+
+	it("continues the selection queue after a rejected operation", async () => {
+		// Given
+		const successfulModel = { ...targetModel(), id: "after-failure" };
+		const originalDurableCommit = settings.setGlobalModelRoleAndFlush.bind(settings);
+		vi.spyOn(settings, "setGlobalModelRoleAndFlush")
+			.mockImplementation(originalDurableCommit)
+			.mockRejectedValueOnce(new Error("durable write failed"));
+
+		// When
+		const failedSelection = session.setDefaultModelSelection(targetModel(), Effort.Low);
+		await expect(failedSelection).rejects.toThrow("durable write failed");
+		const successfulSelection = await session.setDefaultModelSelection(successfulModel, Effort.High);
+
+		// Then
+		expect(successfulSelection).toEqual({
+			provider: "target-provider",
+			modelId: "after-failure",
+			thinkingLevel: Effort.High,
+		});
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/after-failure:high" });
+		expect(session.model).toBe(successfulModel);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(sessionManager.buildSessionContext().models.default).toBe("target-provider/after-failure");
 	});
 
 	it("keeps the durable selector and rejects when post-commit live apply fails", async () => {
