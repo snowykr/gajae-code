@@ -10,6 +10,7 @@ import {
 	dispatchRpcCommand,
 	type RpcCommandDispatchContext,
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
+import { createSharedRpcCommandScheduler } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-scheduler";
 import { RPC_COMMAND_TYPES } from "@gajae-code/coding-agent/modes/shared/agent-wire/scopes";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
@@ -231,6 +232,22 @@ describe("createRpcCommandScheduler ordering behavior", () => {
 		expect(tracked).toHaveLength(2);
 		await Promise.allSettled(tracked);
 	});
+});
+test("a reservation holds its ordered position until its command body arrives", async () => {
+	const order: string[] = [];
+	const scheduler = createSharedRpcCommandScheduler(async command => {
+		order.push(command.id ?? "");
+	});
+	const first = scheduler.reserve();
+	const second = scheduler.reserve();
+
+	const later = second.dispatch({ id: "later", type: "set_model", provider: "p", modelId: "m" });
+	await flushMicrotasks();
+	expect(order).toEqual([]);
+
+	await first.dispatch({ id: "first", type: "set_model", provider: "p", modelId: "m" });
+	await later;
+	expect(order).toEqual(["first", "later"]);
 });
 
 describe("get_messages fast-lane snapshot (#618)", () => {

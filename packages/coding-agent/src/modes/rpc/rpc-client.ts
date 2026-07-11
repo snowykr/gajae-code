@@ -109,15 +109,93 @@ const coreAgentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_end",
 ]);
 
+const RPC_RESPONSE_COMMANDS = new Set<RpcCommand["type"]>([
+	"prompt",
+	"steer",
+	"follow_up",
+	"abort",
+	"abort_and_prompt",
+	"new_session",
+	"get_state",
+	"set_todos",
+	"set_host_tools",
+	"set_host_uri_schemes",
+	"get_pending_workflow_gates",
+	"set_capabilities",
+	"set_model",
+	"set_default_model_selection",
+	"cycle_model",
+	"get_available_models",
+	"set_thinking_level",
+	"cycle_thinking_level",
+	"set_steering_mode",
+	"set_follow_up_mode",
+	"set_interrupt_mode",
+	"compact",
+	"set_auto_compaction",
+	"set_auto_retry",
+	"abort_retry",
+	"bash",
+	"abort_bash",
+	"get_session_stats",
+	"export_html",
+	"switch_session",
+	"branch",
+	"get_branch_messages",
+	"get_last_assistant_text",
+	"set_session_name",
+	"handoff",
+	"get_messages",
+	"get_login_providers",
+	"login",
+	"negotiate_unattended",
+	"workflow_gate_response",
+]);
+const RPC_RESPONSE_DATA_COMMANDS = new Set<RpcCommand["type"]>([
+	"new_session",
+	"get_state",
+	"set_todos",
+	"set_host_tools",
+	"set_host_uri_schemes",
+	"get_pending_workflow_gates",
+	"set_capabilities",
+	"set_model",
+	"set_default_model_selection",
+	"cycle_model",
+	"get_available_models",
+	"cycle_thinking_level",
+	"compact",
+	"bash",
+	"get_session_stats",
+	"export_html",
+	"switch_session",
+	"branch",
+	"get_branch_messages",
+	"get_last_assistant_text",
+	"handoff",
+	"get_messages",
+	"get_login_providers",
+	"login",
+	"negotiate_unattended",
+	"workflow_gate_response",
+]);
+
 function isRpcResponse(value: unknown): value is RpcResponse {
-	if (!isRecord(value)) return false;
-	if (value.type !== "response") return false;
-	if (typeof value.command !== "string") return false;
-	if (typeof value.success !== "boolean") return false;
-	if (value.id !== undefined && typeof value.id !== "string") return false;
-	if (value.success === false) {
-		return typeof value.error === "string" || isRecord(value.error);
-	}
+	if (!isRecord(value) || value.type !== "response" || typeof value.command !== "string") return false;
+	if (typeof value.success !== "boolean" || (value.id !== undefined && typeof value.id !== "string")) return false;
+	if (value.success === false) return typeof value.error === "string" || isRecord(value.error);
+	if (!RPC_RESPONSE_COMMANDS.has(value.command as RpcCommand["type"])) return false;
+
+	const command = value.command as RpcCommand["type"];
+	if (RPC_RESPONSE_DATA_COMMANDS.has(command) !== Object.hasOwn(value, "data")) return false;
+	if (
+		command === "set_default_model_selection" &&
+		(!isRecord(value.data) ||
+			typeof value.data.provider !== "string" ||
+			typeof value.data.modelId !== "string" ||
+			!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.data.thinkingLevel as string))
+	)
+		return false;
 	return true;
 }
 
@@ -387,8 +465,10 @@ export class RpcClient {
 	#transportClosed = false;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
-	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
-		new Map();
+	#pendingRequests: Map<
+		string,
+		{ command: RpcCommand["type"]; resolve: (response: RpcResponse) => void; reject: (error: Error) => void }
+	> = new Map();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
@@ -924,12 +1004,23 @@ export class RpcClient {
 	// =========================================================================
 
 	#handleLine(data: unknown): void {
-		// Check if it's a response to a pending request
-		if (isRpcResponse(data)) {
-			const id = data.id;
-			if (id && this.#pendingRequests.has(id)) {
-				const pending = this.#pendingRequests.get(id)!;
-				this.#pendingRequests.delete(id);
+		// Check if it's a response to a pending request.
+		if (isRecord(data) && data.type === "response" && typeof data.id === "string") {
+			const pending = this.#pendingRequests.get(data.id);
+			if (pending) {
+				this.#pendingRequests.delete(data.id);
+				if (!isRpcResponse(data)) {
+					pending.reject(new Error(`Protocol error: invalid response for ${data.id}`));
+					return;
+				}
+				if (data.command !== pending.command) {
+					pending.reject(
+						new Error(
+							`Protocol error: expected ${pending.command} response for ${data.id}, received ${data.command}`,
+						),
+					);
+					return;
+				}
 				pending.resolve(data);
 				return;
 			}
@@ -991,6 +1082,7 @@ export class RpcClient {
 		});
 
 		this.#pendingRequests.set(id, {
+			command: command.type,
 			resolve: response => {
 				if (settled) return;
 				settled = true;

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -160,6 +160,58 @@ describe("Settings", () => {
 		});
 	});
 
+	describe("save generations", () => {
+		it("keeps mutable input from changing an immutable captured patch", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const roles = { default: "anthropic/claude-sonnet-4-5" };
+
+			settings.set("modelRoles", roles);
+			roles.default = "openai/gpt-5.2-codex";
+			expect(settings.get("modelRoles")).toEqual({ default: "anthropic/claude-sonnet-4-5" });
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "anthropic/claude-sonnet-4-5" });
+		});
+
+		it("does not roll back a newer model role after the selected role flush fails", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			let releaseWrite = () => {};
+			const writeWait = new Promise<void>(resolve => {
+				releaseWrite = resolve;
+			});
+			let resolveWriteStarted = () => {};
+			const writeStarted = new Promise<void>(resolve => {
+				resolveWriteStarted = resolve;
+			});
+			const originalWrite = Bun.write;
+			const writeSpy = spyOn(Bun, "write").mockImplementation((async (...args: unknown[]) => {
+				if (args[0] === getConfigPath()) {
+					resolveWriteStarted();
+					await writeWait;
+					throw new Error("selection save failed");
+				}
+				return (originalWrite as (...writeArgs: unknown[]) => Promise<number>)(...args);
+			}) as typeof Bun.write);
+
+			try {
+				const selection = settings.setGlobalModelRoleAndFlush("default", "failed/model");
+				await writeStarted;
+				settings.setGlobalModelRole("default", "newer/model");
+				releaseWrite();
+
+				await expect(selection).rejects.toThrow("selection save failed");
+				expect(settings.getModelRole("default")).toBe("newer/model");
+			} finally {
+				releaseWrite();
+				writeSpy.mockRestore();
+			}
+
+			await settings.flush();
+			const savedSettings = await readSettings();
+			expect(savedSettings.modelRoles).toEqual({ default: "newer/model" });
+		});
+	});
 	describe("model role overrides", () => {
 		it("does not persist temporary default model overrides when another role is saved", async () => {
 			await writeSettings({

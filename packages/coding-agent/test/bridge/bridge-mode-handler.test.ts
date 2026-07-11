@@ -372,6 +372,52 @@ describe("bridge mode fetch handler", () => {
 		expect((await queued).status).toBe(200);
 		expect(order).toEqual(["set_model", "set_default_model_selection"]);
 	});
+	it("reserves an ordered command slot before reading a deferred request body", async () => {
+		const order: string[] = [];
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const deferredBody = new ReadableStream<Uint8Array>({
+			start(next) {
+				controller = next;
+			},
+		});
+		const handle = createBridgeFetchHandler({
+			sessionId: "sess-1",
+			token: "secret",
+			commandScopes: ["model"],
+			endpointMatrix: { commands: true },
+			commandDispatcher: async command => {
+				order.push(command.id ?? "");
+				return rpcSuccess(command.id, command.type);
+			},
+		});
+		const deferred = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: deferredBody,
+			}),
+		);
+		const later = handle(
+			new Request("https://bridge.test/v1/sessions/sess-1/commands", {
+				method: "POST",
+				headers: { Authorization: "Bearer secret" },
+				body: JSON.stringify({ id: "later", type: "set_model", provider: "provider-b", modelId: "model-b" }),
+			}),
+		);
+
+		await Bun.sleep(1);
+		expect(order).toEqual([]);
+		controller.enqueue(
+			new TextEncoder().encode(
+				JSON.stringify({ id: "first", type: "set_model", provider: "provider-a", modelId: "model-a" }),
+			),
+		);
+		controller.close();
+
+		expect((await deferred).status).toBe(200);
+		expect((await later).status).toBe(200);
+		expect(order).toEqual(["first", "later"]);
+	});
 	it("claims control and resolves permission responses with owner token", async () => {
 		const permissionBroker = new UiRequestBroker<BridgePermissionRequestPayload, ClientBridgePermissionOutcome>({
 			emitRequest: () => {},

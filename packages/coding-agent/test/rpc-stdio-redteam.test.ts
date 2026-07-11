@@ -263,6 +263,29 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		});
 		expect(result.stderr.trim()).toBe("");
 	}, 30_000);
+	it("rejects an invalid set_capabilities frame without negotiating and keeps serving commands", async () => {
+		const result = await driveRpcServer([
+			{ id: "bad-capabilities", type: "set_capabilities", capabilities: "compact_message_update" },
+			{ id: "state-after-bad-capabilities", type: "get_state" },
+		]);
+
+		expect(result.exitCode, result.stderr).toBe(0);
+		expect(findResponse(result.frames, "bad-capabilities")).toEqual({
+			id: "bad-capabilities",
+			type: "response",
+			command: "parse",
+			success: false,
+			error: "Invalid RPC command",
+		});
+		expect(result.frames.some(frame => frame.id === "bad-capabilities" && frame.command === "set_capabilities")).toBe(
+			false,
+		);
+		expect(findResponse(result.frames, "state-after-bad-capabilities")).toMatchObject({
+			command: "get_state",
+			success: true,
+		});
+		expect(result.stderr.trim()).toBe("");
+	}, 30_000);
 
 	it("runs independent child sessions concurrently without state bleed", async () => {
 		const alphaCwd = path.join(workspace, "alpha");

@@ -28,6 +28,7 @@ interface Frame {
 	command?: string;
 	success?: boolean;
 	data?: { sessionId?: string; output?: string } & Record<string, unknown>;
+	error?: unknown;
 }
 
 let workspace: string;
@@ -54,7 +55,7 @@ afterEach(async () => {
 });
 
 interface SocketConn {
-	send(obj: object): void;
+	send(obj: object | string): void;
 	nextResponse(id: string, timeoutMs?: number): Promise<Frame>;
 	nextFrame(timeoutMs?: number): Promise<Frame>;
 	close(): void;
@@ -96,8 +97,8 @@ async function connect(socketPath: string): Promise<SocketConn> {
 		});
 	};
 	return {
-		send(obj: object) {
-			socket.write(`${JSON.stringify(obj)}\n`);
+		send(obj: object | string) {
+			socket.write(`${typeof obj === "string" ? obj : JSON.stringify(obj)}\n`);
 		},
 		nextFrame,
 		async nextResponse(id: string, timeoutMs = 15_000): Promise<Frame> {
@@ -182,6 +183,55 @@ describe("gjc --mode rpc --listen (UDS persistent server, issue 09)", () => {
 			expect(bash.success).toBe(true);
 			expect(bash.data?.output).toContain("persisted-across-reconnect");
 			second.close();
+		} finally {
+			proc.kill();
+		}
+	}, 45_000);
+	it("rejects an invalid raw set_capabilities frame without negotiating and keeps serving commands", async () => {
+		const socketPath = path.join(workspace, "invalid-capabilities.sock");
+		const proc = Bun.spawn(
+			[
+				"bun",
+				cliEntry,
+				"--mode",
+				"rpc",
+				"--provider",
+				"rpc-test",
+				"--model",
+				"rpc-test-model",
+				"--session-dir",
+				path.join(workspace, "invalid-capabilities-sessions"),
+				"--listen",
+				socketPath,
+			],
+			{
+				cwd: workspace,
+				env: { ...cliEnv.env, GJC_HARNESS_STATE_ROOT: workspace, NO_COLOR: "1", PI_NOTIFICATIONS: "off" },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		try {
+			await waitForSocket(socketPath);
+			const client = await connect(socketPath);
+			expect(await client.nextFrame()).toEqual({ type: "ready" });
+
+			client.send('{"id":"bad-capabilities","type":"set_capabilities","capabilities":"compact_message_update"}');
+			expect(await client.nextResponse("bad-capabilities")).toEqual({
+				id: "bad-capabilities",
+				type: "response",
+				command: "parse",
+				success: false,
+				error: "Invalid RPC command",
+			});
+
+			client.send({ id: "state-after-bad-capabilities", type: "get_state" });
+			expect(await client.nextResponse("state-after-bad-capabilities")).toMatchObject({
+				command: "get_state",
+				success: true,
+			});
+			client.close();
 		} finally {
 			proc.kill();
 		}

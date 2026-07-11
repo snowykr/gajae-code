@@ -63,8 +63,9 @@ All commands accept optional `id?: string`.
 
 Important edge behavior from runtime:
 
-- Unknown command responses are emitted with `id: undefined` (even if the request had an `id`).
-- Parse/handler exceptions in the input loop emit `command: "parse"` with `id: undefined`.
+- A JSON parse error emits an uncorrelated `command: "parse"` error with `id: undefined`; a JSON-shaped frame that fails ingress command validation emits the same error with its string `id`, when present.
+- Once a frame reaches command dispatch, including unknown commands and handler exceptions, its error response preserves the caller's `id` and command discriminator.
+- `RpcClient` resolves a pending request only when both its `id` and command discriminator match the originating command; a mismatch rejects as a protocol error.
 - `prompt` and `abort_and_prompt` return immediate success, then may emit a later error response with the **same** id if async prompt scheduling fails.
 
 ## Command Schema (canonical)
@@ -87,6 +88,9 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_host_tools", tools: RpcHostToolDefinition[] }`
 - `{ id?, type: "set_host_uri_schemes", schemes: RpcHostUriSchemeDefinition[] }`
 - `{ id?, type: "workflow_gate_response", gate_id: string, answer: unknown }`
+- `{ id?, type: "set_capabilities", capabilities: ["compact_message_update"] }`
+
+Every stdio and UDS command is structurally validated before capability negotiation or dispatch; malformed commands receive a parse error and do not change negotiated capabilities.
 
 ### Model
 
@@ -103,6 +107,7 @@ session or its history; project settings, active profile overrides, explicit CLI
 selection, and resumed-session state retain their existing precedence. A failed
 flush restores the prior in-memory global selector so a later settings save
 cannot persist a rejected request.
+Concurrent settings writes are serialized as immutable per-path save generations, so a later selection cannot be overwritten by an earlier in-flight flush.
 
 ### Thinking
 
@@ -148,10 +153,10 @@ cannot persist a rejected request.
 
 All command results use `RpcResponse`:
 
-- Success: `{ id?, type: "response", command: <command>, success: true, data?: ... }`
+- Success: `{ id?, type: "response", command: <known command>, success: true, data?: ... }`; `data` is present exactly for commands with a data payload.
 - Failure: `{ id?, type: "response", command: string, success: false, error: string | object }`; typed control-plane failures use object-valued errors such as `{ "code": "scope_denied", ... }`.
 
-Data payloads are command-specific and defined in `rpc-types.ts`.
+The TypeScript client rejects malformed envelopes, unknown successful commands, missing required data fields, and malformed `set_default_model_selection` payloads before exposing a typed result.
 
 
 By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.

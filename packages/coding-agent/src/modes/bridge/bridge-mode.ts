@@ -322,9 +322,11 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 			if (!commandScheduler) return jsonResponse(503, { error: "commands_unavailable" });
 			const idempotencyKey = request.headers.get("Idempotency-Key") ?? undefined;
 			const existingRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
+			const reservation = existingRecord ? undefined : commandScheduler.reserve();
 			let body = "";
 			let payload: unknown;
 			let pendingResponse: PromiseWithResolvers<unknown> | undefined;
+			let bodyReservation: PromiseWithResolvers<string> | undefined;
 			try {
 				if (existingRecord) {
 					body = await request.text();
@@ -334,21 +336,27 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 					});
 					if (cached) return await cached;
 				} else {
-					const bodyPromise = request.text();
+					bodyReservation = Promise.withResolvers<string>();
+					void bodyReservation.promise.catch(() => undefined);
 					pendingResponse = Promise.withResolvers<unknown>();
 					void pendingResponse.promise.catch(() => undefined);
+					// Reserve the key before consuming the request body so concurrent
+					// retries join this single dispatch generation.
 					rememberIdempotencyResponse(options.idempotencyCache, idempotencyKey, {
 						route: url.pathname,
-						body: bodyPromise,
+						body: bodyReservation.promise,
 						response: pendingResponse.promise,
 						pending: true,
 					});
-					body = await bodyPromise;
+					body = await request.text();
+					bodyReservation.resolve(body);
 				}
 				payload = JSON.parse(body) as unknown;
 			} catch {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
+				bodyReservation?.reject(new Error("invalid_json"));
 				pendingResponse?.reject(new Error("invalid_json"));
+				reservation?.cancel();
 				return jsonResponse(400, { error: "invalid_json" });
 			}
 			const type =
@@ -357,22 +365,25 @@ export function createBridgeFetchHandler(options: BridgeFetchHandlerOptions): (r
 					: undefined;
 			if (!isRpcCommandType(type)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
+				reservation?.cancel();
 				pendingResponse?.reject(new Error("invalid_command"));
 				return jsonResponse(400, { error: "invalid_command" });
 			}
 			if (!isRpcCommand(payload)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
+				reservation?.cancel();
 				pendingResponse?.reject(new Error("invalid_command"));
 				return jsonResponse(400, { error: "invalid_command" });
 			}
 			const scopes = new Set(options.commandScopes ?? DEFAULT_BRIDGE_SCOPES);
 			if (!isRpcCommandAllowed(type, scopes)) {
 				options.idempotencyCache?.delete(idempotencyKey ?? "");
+				reservation?.cancel();
 				pendingResponse?.reject(new Error("scope_denied"));
 				return jsonResponse(403, { error: "scope_denied", scope: scopeForRpcCommand(type) });
 			}
 			try {
-				const response = await commandScheduler.dispatch(payload);
+				const response = await reservation!.dispatch(payload);
 				pendingResponse?.resolve(response);
 				const cachedRecord = idempotencyKey ? options.idempotencyCache?.get(idempotencyKey) : undefined;
 				if (cachedRecord) cachedRecord.pending = false;

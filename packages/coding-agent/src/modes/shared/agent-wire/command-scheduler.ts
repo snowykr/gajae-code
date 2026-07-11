@@ -21,23 +21,56 @@ export function isFastLaneRpcCommand(type: RpcCommand["type"]): boolean {
 	return RPC_CANCELLATION_COMMANDS.has(type) || RPC_SAFE_READ_CONTROL_COMMANDS.has(type);
 }
 
+export interface SharedRpcCommandReservation<TResult> {
+	dispatch(command: RpcCommand): Promise<TResult>;
+	cancel(): void;
+}
+
 export function createSharedRpcCommandScheduler<TResult>(
 	run: (command: RpcCommand) => Promise<TResult>,
 	track: (task: Promise<TResult>) => void = () => {},
-): { dispatch: (command: RpcCommand) => Promise<TResult> } {
+): {
+	dispatch: (command: RpcCommand) => Promise<TResult>;
+	reserve: () => SharedRpcCommandReservation<TResult>;
+} {
 	let orderedTail = Promise.resolve();
+
+	const reserve = (): SharedRpcCommandReservation<TResult> => {
+		const prior = orderedTail;
+		const slot = Promise.withResolvers<void>();
+		let settled = false;
+		let task: Promise<TResult> | undefined;
+		orderedTail = slot.promise;
+
+		return {
+			dispatch(command): Promise<TResult> {
+				if (settled) throw new Error("RPC command reservation already settled");
+				settled = true;
+				if (isFastLaneRpcCommand(command.type)) {
+					slot.resolve();
+					task = run(command);
+				} else {
+					task = prior.then(() => run(command));
+					void task.then(
+						() => slot.resolve(),
+						() => slot.resolve(),
+					);
+				}
+				track(task!);
+				return task!;
+			},
+			cancel(): void {
+				if (settled) return;
+				settled = true;
+				slot.resolve();
+			},
+		};
+	};
+
 	return {
-		dispatch(command: RpcCommand): Promise<TResult> {
-			const fastLane = isFastLaneRpcCommand(command.type);
-			const task = fastLane ? run(command) : orderedTail.then(() => run(command));
-			if (!fastLane) {
-				orderedTail = task.then(
-					() => undefined,
-					() => undefined,
-				);
-			}
-			track(task);
-			return task;
+		dispatch(command): Promise<TResult> {
+			return reserve().dispatch(command);
 		},
+		reserve,
 	};
 }

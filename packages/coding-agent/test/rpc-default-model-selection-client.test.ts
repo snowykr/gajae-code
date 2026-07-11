@@ -115,4 +115,35 @@ describe("RpcClient.setDefaultModelSelection", () => {
 			},
 		);
 	});
+	test("rejects a matching ID with a response for another command", async () => {
+		await withRpcServer(
+			frame => ({
+				id: frame.id,
+				type: "response",
+				command: "prompt",
+				success: true,
+			}),
+			async client => {
+				await expect(client.setDefaultModelSelection(selection)).rejects.toThrow(
+					"Protocol error: expected set_default_model_selection response",
+				);
+			},
+		);
+	});
+	test("rejects malformed correlated selection data", async () => {
+		await withRpcServer(
+			frame => ({
+				id: frame.id,
+				type: "response",
+				command: "set_default_model_selection",
+				success: true,
+				data: { ...selection, thinkingLevel: "invalid" },
+			}),
+			async client => {
+				await expect(client.setDefaultModelSelection(selection)).rejects.toThrow(
+					"Protocol error: invalid response",
+				);
+			},
+		);
+	});
 });

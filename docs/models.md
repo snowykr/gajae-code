@@ -572,7 +572,7 @@ So a model can exist in registry but not be selectable until auth is available.
 - exact model id (provider inferred)
 - fuzzy/substring matching
 - glob scope patterns in `--models` (e.g. `openai/*`, `*sonnet*`)
-- optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh`)
+- optional `:thinkingLevel` suffix (`off|minimal|low|medium|high|xhigh|max`)
 
 `--provider` is legacy; `--model` is preferred.
 
@@ -592,6 +592,7 @@ Resolution precedence for exact selectors:
 3. saved default provider/model
 4. known provider defaults (e.g. OpenAI/Anthropic/etc.) among available models
 5. first available model
+A persisted default affects only future sessions. It does not replace an explicit CLI selection, a scoped/project selection, an active profile override, or resumed-session state.
 
 ### Role aliases and settings
 

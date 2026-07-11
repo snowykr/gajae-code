@@ -11,7 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 
-import { $pickenv, logger, readLines, Snowflake } from "@gajae-code/utils";
+import { $pickenv, isRecord, logger, readLines, Snowflake } from "@gajae-code/utils";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -23,6 +23,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { initializeExtensions } from "../runtime-init";
 import { dispatchRpcCommand } from "../shared/agent-wire/command-dispatch";
 import { createSharedRpcCommandScheduler } from "../shared/agent-wire/command-scheduler";
+import { isRpcCommand } from "../shared/agent-wire/command-validation";
 import {
 	AgentWireCompactEventEncoder,
 	AgentWireFrameSequencer,
@@ -663,15 +664,19 @@ export async function runRpcMode(
 				hostUriBridge.handleResult(parsed);
 				return;
 			}
-			if ((parsed as RpcCommand).type === "set_capabilities") {
+			if (!isRpcCommand(parsed)) {
+				const id = isRecord(parsed) && typeof parsed.id === "string" ? parsed.id : undefined;
+				output(error(id, "parse", "Invalid RPC command"));
+				return;
+			}
+			if (parsed.type === "set_capabilities") {
 				// RPC has no startup handshake; clients negotiate optional event-shape capabilities
 				// with this explicit command. Defaults remain legacy/full-frame until accepted here.
-				const command = parsed as Extract<RpcCommand, { type: "set_capabilities" }>;
-				const requested = Array.isArray(command.capabilities) ? command.capabilities : [];
+				const requested = parsed.capabilities;
 				const acceptedCapabilities = requested.filter(capability => capability === "compact_message_update");
 				rpcCapabilities.compactMessageUpdate = acceptedCapabilities.includes("compact_message_update");
 				output(
-					rpcSuccess(command.id, "set_capabilities", {
+					rpcSuccess(parsed.id, "set_capabilities", {
 						acceptedCapabilities,
 						unsupported: requested.filter(capability => capability !== "compact_message_update"),
 					}),
@@ -681,7 +686,7 @@ export async function runRpcMode(
 			// Ordered commands run through a serial chain to preserve causal order; the
 			// reader never blocks, so cancellation commands stay responsive even while a
 			// long command is in flight (issue 13).
-			dispatchCommand(parsed as RpcCommand);
+			dispatchCommand(parsed);
 			await checkShutdownRequested();
 		} catch (err) {
 			output(error(undefined, "parse", `Failed to parse command: ${decodeError(err)}`));

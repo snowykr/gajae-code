@@ -55,6 +55,11 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
+type SettingsPatch = {
+	path: string;
+	value: unknown;
+	generation: number;
+};
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
@@ -207,12 +212,13 @@ export class Settings {
 	/** Merged view (global + project + overrides) */
 	#merged: RawSettings = {};
 
-	/** Paths modified during this session (for partial save) */
-	#modified = new Set<string>();
+	/** Latest dirty patch for each path, owned by its generation. */
+	#modified = new Map<string, SettingsPatch>();
+	#nextGeneration = 0;
 
 	/** Pending save (debounced) */
 	#saveTimer?: NodeJS.Timeout;
-	#savePromise?: Promise<void>;
+	#saveTail: Promise<void> = Promise.resolve();
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -320,9 +326,13 @@ export class Settings {
 	 */
 	set<P extends SettingPath>(path: P, value: SettingValue<P>): void {
 		const prev = this.get(path);
-		const segments = path.split(".");
-		setByPath(this.#global, segments, value);
-		this.#modified.add(path);
+		const patch: SettingsPatch = {
+			path,
+			value: structuredClone(value),
+			generation: ++this.#nextGeneration,
+		};
+		setByPath(this.#global, path.split("."), structuredClone(patch.value));
+		this.#modified.set(path, patch);
 		this.#rebuildMerged();
 		this.#queueSave();
 
@@ -366,9 +376,7 @@ export class Settings {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		if (this.#savePromise) {
-			await this.#savePromise;
-		}
+		await this.#saveTail;
 		if (this.#modified.size > 0) {
 			await this.#saveNow();
 		}
@@ -385,9 +393,7 @@ export class Settings {
 			clearTimeout(this.#saveTimer);
 			this.#saveTimer = undefined;
 		}
-		if (this.#savePromise) {
-			await this.#savePromise;
-		}
+		await this.#saveTail;
 		if (this.#modified.size > 0) {
 			await this.#saveNow({ throwOnError: true });
 		}
@@ -502,16 +508,20 @@ export class Settings {
 	async setGlobalModelRoleAndFlush(role: ModelRole | string, modelId: string): Promise<void> {
 		const hadModelRoles = Object.hasOwn(this.#global, "modelRoles");
 		const previousModelRoles = structuredClone(this.#global.modelRoles);
-		const wasModified = this.#modified.has("modelRoles");
+		const previousPatch = this.#modified.get("modelRoles");
 		this.setGlobalModelRole(role, modelId);
+		const generation = this.#modified.get("modelRoles")?.generation;
 		try {
 			await this.flushOrThrow();
 		} catch (error) {
-			if (hadModelRoles) this.#global.modelRoles = previousModelRoles;
-			else delete this.#global.modelRoles;
-			if (wasModified) this.#modified.add("modelRoles");
-			else this.#modified.delete("modelRoles");
-			this.#rebuildMerged();
+			const currentPatch = this.#modified.get("modelRoles");
+			if (currentPatch?.generation === generation) {
+				if (hadModelRoles) this.#global.modelRoles = previousModelRoles;
+				else delete this.#global.modelRoles;
+				if (previousPatch) this.#modified.set("modelRoles", previousPatch);
+				else this.#modified.delete("modelRoles");
+				this.#rebuildMerged();
+			}
 			throw error;
 		}
 	}
@@ -846,15 +856,10 @@ export class Settings {
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
 
-		// Debounce: wait 100ms for more changes
-		if (this.#saveTimer) {
-			clearTimeout(this.#saveTimer);
-		}
+		if (this.#saveTimer) clearTimeout(this.#saveTimer);
 		this.#saveTimer = setTimeout(() => {
 			this.#saveTimer = undefined;
-			this.#saveNow().catch(err => {
-				logger.warn("Settings: background save failed", { error: String(err) });
-			});
+			void this.#saveNow();
 		}, 100);
 	}
 
@@ -862,37 +867,52 @@ export class Settings {
 		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
 
 		const configPath = this.#configPath;
-		const modifiedPaths = [...this.#modified];
-		this.#modified.clear();
+		const patches = [...this.#modified.values()];
+		const capturedGeneration = Math.max(...patches.map(patch => patch.generation));
+
+		const save = this.#saveTail.then(() =>
+			withFileLock(configPath, async () => {
+				const current = await this.#loadYaml(configPath);
+				for (const patch of patches) {
+					setByPath(current, patch.path.split("."), patch.value);
+				}
+				for (const patch of this.#modified.values()) {
+					if (patch.generation > capturedGeneration) {
+						setByPath(current, patch.path.split("."), patch.value);
+					}
+				}
+				await Bun.write(configPath, YAML.stringify(current, null, 2));
+				for (const patch of patches) {
+					if (this.#modified.get(patch.path)?.generation === patch.generation) {
+						this.#modified.delete(patch.path);
+					}
+				}
+				this.#global = current;
+				for (const patch of this.#modified.values()) {
+					setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
+				}
+			}),
+		);
+		this.#saveTail = save.then(
+			() => undefined,
+			() => undefined,
+		);
 
 		try {
-			await withFileLock(configPath, async () => {
-				// Re-read to preserve external changes
-				const current = await this.#loadYaml(configPath);
-
-				// Apply only our modified paths
-				for (const modPath of modifiedPaths) {
-					const segments = modPath.split(".");
-					const value = getByPath(this.#global, segments);
-					setByPath(current, segments, value);
-				}
-
-				// Update our global with any external changes we preserved
-				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
-			});
+			await save;
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
-			// Re-add failed paths for retry
-			for (const p of modifiedPaths) {
-				this.#modified.add(p);
+			for (const patch of patches) {
+				const currentPatch = this.#modified.get(patch.path);
+				if (!currentPatch || currentPatch.generation < patch.generation) {
+					this.#modified.set(patch.path, patch);
+				}
 			}
 			if (options.throwOnError) {
 				this.#rebuildMerged();
 				throw error;
 			}
 		}
-
 		this.#rebuildMerged();
 	}
 
