@@ -91,6 +91,7 @@ Important edge behavior from runtime:
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
+- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" }`
 - `{ id?, type: "cycle_model" }`
 - `{ id?, type: "get_available_models" }`
 
@@ -143,6 +144,27 @@ All command results use `RpcResponse`:
 
 Data payloads are command-specific and defined in `rpc-types.ts`.
 
+### `set_default_model_selection` contract
+
+Request:
+
+```json
+{ "id": "model-default-1", "type": "set_default_model_selection", "provider": "openai", "modelId": "gpt-5.6", "thinkingLevel": "high" }
+```
+
+Correlated success response:
+
+```json
+{ "id": "model-default-1", "type": "response", "command": "set_default_model_selection", "success": true, "data": { "provider": "openai", "modelId": "gpt-5.6", "thinkingLevel": "high" } }
+```
+
+`thinkingLevel` may be omitted or set to a concrete level. `"inherit"` is rejected. A requested reasoning level is clamped to the selected model's supported range. A non-reasoning model always resolves to `off`. The response always reports the effective concrete level that was persisted and applied.
+
+This is an ordered mutation. It waits behind earlier mutations and, if the agent is streaming, waits for an active stream to become idle. It acknowledges success only after the machine-global selector is durably written and the selected model and effective level are recorded as the active session default. The selection therefore applies to the next message; it does not change the model of a response already being streamed.
+
+The durable setting is a fallback, not an unconditional override. Project-level model-role policy overrides the machine-global selector, and a resumed session's recorded default model overrides it. Fresh sessions without either higher-precedence source consume the machine-global selector, including its effective thinking-level suffix.
+
+`set_default_model_selection` belongs to the shared agent-wire command surface. If a Bridge command endpoint is enabled by an embedding, the command requires the `model` scope; this catalog mapping does not enable the default-disabled Bridge command endpoint.
 
 By default, `get_state` omits large static fields. Request `include: ["tools"]` to include `dumpTools`, `include: ["systemPrompt"]` to include `systemPrompt`, or both when a host needs a one-shot full session dump.
 ### `get_state` payload
