@@ -12,6 +12,7 @@ import {
 import { deliverRichWithFallback } from "../src/notifications/rich-render";
 import {
 	acquireDaemonOwnership,
+	DAEMON_GENERATION,
 	DAEMON_VERSION,
 	daemonPaths,
 	ensureTelegramDaemonRunning,
@@ -462,6 +463,7 @@ describe("telegram daemon", () => {
 				heartbeatAt: 100,
 				roots: [],
 				version: 1,
+				generation: DAEMON_GENERATION,
 			}),
 		);
 		const result = await acquireDaemonOwnership({
@@ -515,6 +517,163 @@ describe("telegram daemon", () => {
 			tokenFingerprint: "old-fp",
 			chatId: "old-chat",
 		});
+	});
+
+	// -----------------------------------------------------------------------
+	// #2028: a rolling upgrade can leave a still-live PRE-upgrade daemon owning
+	// the lock. Its persisted schema `version` is unchanged (1), so a freshly
+	// upgraded host used to treat it as a fresh live owner and silently attach —
+	// the old daemon speaks the old protocol without ask-ack/controls, so the new
+	// host's Selected acks are dropped. The persisted operational `generation`
+	// lets the new host detect the mismatch and reload instead of attaching.
+	// -----------------------------------------------------------------------
+	function liveOwnerState(extra: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			pid: 999,
+			ownerId: "old",
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 100,
+			roots: [],
+			version: 1,
+			...extra,
+		};
+	}
+
+	function writeLiveOwner(agentDir: string, extra: Record<string, unknown> = {}): void {
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
+		fs.writeFileSync(paths.lock, "");
+	}
+
+	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir); // no generation field == pre-upgrade daemon
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
+	});
+
+	test("#2028 acquire attaches to a current-generation live owner (no reload)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION });
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, attached: true });
+	});
+
+	test("#2028 acquire does not downgrade a NEWER-generation live owner (attaches)", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION + 1 });
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, attached: true });
+	});
+
+	test("#2028 acquiring ownership stamps the current daemon generation into state", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pid: 111,
+			randomId: () => "owner",
+		});
+		expect(result.acquired).toBe(true);
+		const state = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"));
+		expect(state.generation).toBe(DAEMON_GENERATION);
+	});
+
+	test("#2028 ensureTelegramDaemonRunning reloads a live pre-upgrade owner via a safe SIGTERM handoff", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		// Pre-upgrade daemon, still alive with a fresh heartbeat (so it is a fresh
+		// live owner that a version-only check would attach to).
+		writeLiveOwner(agentDir, { heartbeatAt: Date.now() });
+		const paths = daemonPaths(agentDir);
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		let oldAliveAtSpawn: boolean | undefined;
+		const spawns: Array<{ command: string; args: string[] }> = [];
+		const cwd = path.join(agentDir, "new-session");
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd, sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: pid => alive.has(pid),
+				sendSignal: (pid, sig) => {
+					signals.push([pid, sig]);
+					if (sig === "SIGTERM") alive.delete(999);
+				},
+				sleep: async () => undefined,
+				spawn: (command, args) => {
+					oldAliveAtSpawn = alive.has(999);
+					spawns.push({ command, args });
+					return { unref() {} };
+				},
+			},
+		);
+		expect(result).toBe("owner_spawned");
+		// Cooperative handoff: the old poller is SIGTERM'd and must be dead before a
+		// replacement poller spawns (no Telegram getUpdates 409 overlap).
+		expect(signals).toContainEqual([999, "SIGTERM"]);
+		expect(signals.some(([, sig]) => sig === "SIGKILL")).toBe(false);
+		expect(spawns).toHaveLength(1);
+		expect(oldAliveAtSpawn).toBe(false);
+		const after = JSON.parse(fs.readFileSync(paths.state, "utf8"));
+		expect(after.ownerId).not.toBe("old");
+		expect(after.generation).toBe(DAEMON_GENERATION);
+		// The new session's root is persisted so the replacement daemon serves it.
+		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
+	});
+
+	test("#2028 ensureTelegramDaemonRunning reuses a current-generation live owner without a reload", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, heartbeatAt: Date.now() });
+		const paths = daemonPaths(agentDir);
+		const signals: Array<[number, string]> = [];
+		let spawns = 0;
+		const result = await ensureTelegramDaemonRunning(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				pidAlive: () => true,
+				sendSignal: (pid, sig) => signals.push([pid, sig]),
+				sleep: async () => undefined,
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			},
+		);
+		expect(result).toBe("attached");
+		expect(signals).toHaveLength(0);
+		expect(spawns).toBe(0);
+		// Still the original owner; the new session's root is registered onto it.
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("old");
+		expect(fs.existsSync(paths.roots)).toBe(true);
 	});
 
 	test("idle self-exit after timeout releases ownership", async () => {

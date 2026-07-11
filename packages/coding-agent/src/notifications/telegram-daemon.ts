@@ -71,6 +71,14 @@ export interface DaemonState {
 	heartbeatAt: number;
 	roots: string[];
 	version: 1;
+	/**
+	 * Operational daemon generation of the process that owns the lock, distinct
+	 * from the persisted state-schema {@link DaemonState.version}. It records the
+	 * wire generation ({@link DAEMON_GENERATION}) the owning daemon speaks so a
+	 * freshly-upgraded host can detect — and reload — a still-live pre-upgrade
+	 * daemon whose schema version is unchanged. Absent on pre-generation state.
+	 */
+	generation?: number;
 	stoppedAt?: number;
 }
 export interface TelegramDaemonFs {
@@ -100,6 +108,14 @@ export interface TelegramDaemonDeps {
 	) => SpawnResult;
 	execPath?: string;
 	randomId?: () => string;
+	/**
+	 * Signal delivery + poll timing for the stale-generation reload handoff in
+	 * {@link ensureTelegramDaemonRunning}. Defaults use real signals/timers; tests
+	 * inject them to drive the handoff deterministically.
+	 */
+	sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
+	sleep?: (ms: number) => Promise<void>;
+	waitStepMs?: number;
 }
 
 export const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -112,6 +128,16 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
 /** Capability required for typed controls and semantic Selected acknowledgement frames. */
 export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
+/**
+ * Operational generation the current daemon build speaks, persisted into
+ * {@link DaemonState.generation} on ownership acquisition. It is tied to the
+ * wire {@link NOTIFICATION_PROTOCOL_VERSION} so any protocol bump (which is what
+ * gates capabilities like {@link ASK_SELECTED_ACK_CAPABILITY}) also bumps the
+ * generation, letting a freshly-upgraded host recognise an older, still-live
+ * daemon and reload it instead of silently attaching to it. Distinct from the
+ * persisted schema {@link DAEMON_VERSION}, which did not change across #1999.
+ */
+export const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;
 
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 
@@ -370,6 +396,7 @@ export async function acquireDaemonOwnership(input: {
 	attached?: boolean;
 	blocked?: boolean;
 	reason?: "identity_mismatch";
+	reloadRequired?: boolean;
 }> {
 	const fsImpl = input.fs ?? nodeFs;
 	const now = input.now ?? Date.now;
@@ -379,6 +406,28 @@ export async function acquireDaemonOwnership(input: {
 	await ensureDir(fsImpl, paths.dir);
 	const ownerId = input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 	const roots = input.roots ?? (await readJson<{ roots?: string[] }>(fsImpl, paths.roots))?.roots ?? [];
+
+	// A fresh, identity-matching live owner running an OLDER generation than this
+	// build cannot serve our newer wire frames; signal a reload instead of a
+	// silent attach. Newer/equal generations attach as before (no downgrade).
+	const attachDecision = (
+		state: DaemonState | undefined,
+	): { acquired: false; attached: boolean; reloadRequired?: boolean } | undefined => {
+		if (
+			!isFreshLiveOwner({
+				state,
+				now: now(),
+				tokenFingerprint: input.tokenFingerprint,
+				chatId: input.chatId,
+				pidAlive,
+			})
+		) {
+			return undefined;
+		}
+		return (state?.generation ?? 0) < DAEMON_GENERATION
+			? { acquired: false, attached: false, reloadRequired: true }
+			: { acquired: false, attached: true };
+	};
 	const existing = await readJson<DaemonState>(fsImpl, paths.state);
 	if (
 		liveOwnerUsesDifferentIdentity({
@@ -390,17 +439,8 @@ export async function acquireDaemonOwnership(input: {
 	) {
 		return { acquired: false, blocked: true, reason: "identity_mismatch" };
 	}
-	if (
-		isFreshLiveOwner({
-			state: existing,
-			now: now(),
-			tokenFingerprint: input.tokenFingerprint,
-			chatId: input.chatId,
-			pidAlive,
-		})
-	) {
-		return { acquired: false, attached: true };
-	}
+	const existingDecision = attachDecision(existing);
+	if (existingDecision) return existingDecision;
 	if (await tryOpenWx(fsImpl, paths.lock)) {
 		await writeJsonAtomic(fsImpl, paths.state, {
 			pid,
@@ -411,6 +451,7 @@ export async function acquireDaemonOwnership(input: {
 			heartbeatAt: now(),
 			roots,
 			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
 		} satisfies DaemonState);
 		return { acquired: true, ownerId };
 	}
@@ -425,32 +466,14 @@ export async function acquireDaemonOwnership(input: {
 	) {
 		return { acquired: false, blocked: true, reason: "identity_mismatch" };
 	}
-	if (
-		isFreshLiveOwner({
-			state: afterLock,
-			now: now(),
-			tokenFingerprint: input.tokenFingerprint,
-			chatId: input.chatId,
-			pidAlive,
-		})
-	) {
-		return { acquired: false, attached: true };
-	}
+	const afterLockDecision = attachDecision(afterLock);
+	if (afterLockDecision) return afterLockDecision;
 	if (!afterLock) return { acquired: false, attached: true };
 	if (!(await tryOpenWx(fsImpl, paths.steal))) return { acquired: false, attached: true };
 	try {
 		const rechecked = await readJson<DaemonState>(fsImpl, paths.state);
-		if (
-			isFreshLiveOwner({
-				state: rechecked,
-				now: now(),
-				tokenFingerprint: input.tokenFingerprint,
-				chatId: input.chatId,
-				pidAlive,
-			})
-		) {
-			return { acquired: false, attached: true };
-		}
+		const recheckedDecision = attachDecision(rechecked);
+		if (recheckedDecision) return recheckedDecision;
 		if (
 			liveOwnerUsesDifferentIdentity({
 				state: rechecked,
@@ -475,6 +498,7 @@ export async function acquireDaemonOwnership(input: {
 			heartbeatAt: now(),
 			roots,
 			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
 		} satisfies DaemonState);
 		return { acquired: true, ownerId };
 	} finally {
@@ -578,6 +602,12 @@ export interface TelegramSpawnOwnerResult {
 	ownerId?: string;
 	runtime: DaemonRuntimeInfo;
 	warnings: string[];
+	/**
+	 * Set when ownership was NOT acquired because a still-live owner is running an
+	 * older daemon generation. The caller must hand off via a reload rather than
+	 * attach; see {@link ensureTelegramDaemonRunning}.
+	 */
+	reloadRequired?: boolean;
 }
 
 /**
@@ -646,7 +676,7 @@ export async function spawnTelegramDaemonOwner(
 				warnings: ["live telegram daemon uses a different bot token or chat; refusing to attach"],
 			};
 		}
-		return { result: "attached", runtime, warnings: [] };
+		return { result: "attached", runtime, warnings: [], reloadRequired: ownership.reloadRequired };
 	}
 	const spawnImpl = deps.spawn ?? defaultDaemonSpawn;
 	const child = spawnImpl(command, args, {
@@ -674,8 +704,41 @@ export async function ensureTelegramDaemonRunning(
 		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);
 		return spawned.result;
 	}
+	if (spawned.reloadRequired) {
+		// A still-live owner is running an OLDER daemon generation than this host
+		// (e.g. a pre-upgrade daemon reused in place across an in-place upgrade).
+		// Attaching would silently drop this host's newer ask-ack / control frames,
+		// so register this session's root first — so the replacement daemon serves
+		// it — then hand off through the tested SIGTERM/control reload path to bring
+		// up a fresh current-generation daemon.
+		await registerNotificationRoot({ ...input, fs: deps.fs });
+		await reloadStaleGenerationOwner(input.settings, deps);
+		return "owner_spawned";
+	}
 	await registerNotificationRoot({ ...input, fs: deps.fs });
 	return spawned.result;
+}
+
+/**
+ * Reload a still-live owner running an older daemon generation through the
+ * cooperative SIGTERM/control handoff. Lazily imports the controller to avoid a
+ * static import cycle (the controller module imports ownership helpers here).
+ */
+async function reloadStaleGenerationOwner(settings: Settings, deps: TelegramDaemonDeps): Promise<void> {
+	const { TelegramDaemonController } = await import("./telegram-daemon-control");
+	const controller = new TelegramDaemonController(settings, {
+		fs: deps.fs,
+		now: deps.now,
+		pidAlive: deps.pidAlive,
+		sendSignal: deps.sendSignal,
+		spawn: deps.spawn,
+		execPath: deps.execPath,
+		ownerPid: deps.pid,
+		randomId: deps.randomId,
+		sleep: deps.sleep,
+		waitStepMs: deps.waitStepMs,
+	});
+	await controller.reload();
 }
 
 export interface BotApi {
