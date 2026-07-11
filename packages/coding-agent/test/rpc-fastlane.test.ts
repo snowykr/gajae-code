@@ -12,7 +12,7 @@ import {
 } from "@gajae-code/coding-agent/modes/shared/agent-wire/command-dispatch";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 
-const FAST_LANE_COMMANDS: RpcCommand["type"][] = [
+const FAST_LANE_COMMANDS = [
 	// Cancellation (must interrupt in-flight work).
 	"abort",
 	"abort_bash",
@@ -25,14 +25,15 @@ const FAST_LANE_COMMANDS: RpcCommand["type"][] = [
 	"get_last_assistant_text",
 	"get_messages",
 	"get_login_providers",
-];
+	"get_pending_workflow_gates",
+] as const satisfies readonly RpcCommand["type"][];
 
 // Commands that MUST stay on the ordered serial chain: async/long work, causally
 // significant async mutations, or synchronous mutating mode/config setters. The
 // setters are kept ordered because a fast-laned setter could overtake an
 // already-queued ordered command (e.g. a prompt submitted before it) and change
 // that command's causal semantics (#618 review).
-const ORDERED_COMMANDS: RpcCommand["type"][] = [
+const ORDERED_COMMANDS = [
 	"prompt",
 	"steer",
 	"follow_up",
@@ -45,6 +46,7 @@ const ORDERED_COMMANDS: RpcCommand["type"][] = [
 	"handoff",
 	"login",
 	"set_model",
+	"set_default_model_selection",
 	"cycle_model",
 	"set_todos",
 	"set_session_name",
@@ -61,7 +63,17 @@ const ORDERED_COMMANDS: RpcCommand["type"][] = [
 	"set_interrupt_mode",
 	"set_auto_compaction",
 	"set_auto_retry",
-];
+] as const satisfies readonly RpcCommand["type"][];
+
+const PRE_SCHEDULER_COMMANDS = ["set_capabilities"] as const satisfies readonly RpcCommand["type"][];
+
+type ClassifiedRpcCommand =
+	| (typeof FAST_LANE_COMMANDS)[number]
+	| (typeof ORDERED_COMMANDS)[number]
+	| (typeof PRE_SCHEDULER_COMMANDS)[number];
+const RPC_COMMAND_CLASSIFICATION_IS_EXHAUSTIVE: Exclude<RpcCommand["type"], ClassifiedRpcCommand> extends never
+	? true
+	: false = true;
 
 const flushMicrotasks = async (): Promise<void> => {
 	for (let i = 0; i < 8; i++) await Promise.resolve();
@@ -78,6 +90,7 @@ describe("RPC fast-lane classification (#606, issue 13)", () => {
 		for (const type of ORDERED_COMMANDS) {
 			expect(isFastLaneRpcCommand(type)).toBe(false);
 		}
+		expect(ORDERED_COMMANDS).toContain("set_default_model_selection");
 	});
 
 	test("the cancellation set is exactly the three abort commands", () => {
@@ -112,12 +125,11 @@ describe("RPC fast-lane classification (#606, issue 13)", () => {
 		}
 	});
 
-	test("classification is exhaustive — fast-lane and ordered partition every command type", () => {
-		const all = new Set<RpcCommand["type"]>([...FAST_LANE_COMMANDS, ...ORDERED_COMMANDS]);
-		// No command may appear in both lists.
-		expect(FAST_LANE_COMMANDS.filter(t => ORDERED_COMMANDS.includes(t))).toEqual([]);
-		// Guards against a new command type silently slipping through untested.
-		expect(all.size).toBe(FAST_LANE_COMMANDS.length + ORDERED_COMMANDS.length);
+	test("classification is exhaustive across fast-lane, ordered, and pre-scheduler commands", () => {
+		const classified = [...FAST_LANE_COMMANDS, ...ORDERED_COMMANDS, ...PRE_SCHEDULER_COMMANDS];
+		expect(new Set<RpcCommand["type"]>(classified).size).toBe(classified.length);
+		expect(PRE_SCHEDULER_COMMANDS).toEqual(["set_capabilities"]);
+		expect(RPC_COMMAND_CLASSIFICATION_IS_EXHAUSTIVE).toBe(true);
 	});
 });
 
@@ -208,6 +220,40 @@ describe("createRpcCommandScheduler ordering behavior", () => {
 		// The setter applies strictly AFTER the earlier queued prompt, so the prompt
 		// runs under the pre-setter mode (arrival-order / causal semantics preserved).
 		expect(order).toEqual(["bash", "prompt", "set_thinking_level"]);
+	});
+
+	test("set_default_model_selection waits behind a blocked mutation while a fast-lane read proceeds", async () => {
+		const order: string[] = [];
+		const predecessor = Promise.withResolvers<void>();
+		const tracked: Promise<void>[] = [];
+		const run = async (command: RpcCommand): Promise<void> => {
+			if (command.type === "set_model") {
+				order.push("set_model:start");
+				await predecessor.promise;
+				order.push("set_model:end");
+				return;
+			}
+			order.push(command.type);
+		};
+		const { dispatch } = createRpcCommandScheduler(run, task => {
+			tracked.push(task);
+		});
+
+		try {
+			dispatch({ type: "set_model", provider: "p", modelId: "before" });
+			dispatch({ type: "set_default_model_selection", provider: "p", modelId: "after" });
+			dispatch({ type: "get_state" });
+			await flushMicrotasks();
+
+			expect(order).toEqual(["get_state", "set_model:start"]);
+
+			predecessor.resolve();
+			await Promise.all(tracked);
+			expect(order).toEqual(["get_state", "set_model:start", "set_model:end", "set_default_model_selection"]);
+		} finally {
+			predecessor.resolve();
+			await Promise.allSettled(tracked);
+		}
 	});
 
 	test("every dispatched task is tracked for shutdown draining", async () => {

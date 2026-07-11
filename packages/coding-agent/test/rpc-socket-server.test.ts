@@ -28,6 +28,7 @@ interface Frame {
 	command?: string;
 	success?: boolean;
 	data?: { sessionId?: string; output?: string } & Record<string, unknown>;
+	error?: unknown;
 }
 
 let workspace: string;
@@ -58,6 +59,11 @@ interface SocketConn {
 	nextResponse(id: string, timeoutMs?: number): Promise<Frame>;
 	nextFrame(timeoutMs?: number): Promise<Frame>;
 	close(): void;
+}
+
+async function readBytesIfPresent(filePath: string): Promise<Uint8Array | undefined> {
+	const file = Bun.file(filePath);
+	return (await file.exists()) ? new Uint8Array(await file.arrayBuffer()) : undefined;
 }
 
 async function connect(socketPath: string): Promise<SocketConn> {
@@ -128,6 +134,98 @@ async function waitForSocket(socketPath: string, timeoutMs = 15_000): Promise<vo
 }
 
 describe("gjc --mode rpc --listen (UDS persistent server, issue 09)", () => {
+	it("rejects malformed raw default selectors without mutating durable bytes or losing UDS service", async () => {
+		const socketPath = path.join(workspace, "rpc-malformed.sock");
+		const proc = Bun.spawn(
+			[
+				"bun",
+				cliEntry,
+				"--mode",
+				"rpc",
+				"--provider",
+				"rpc-test",
+				"--model",
+				"rpc-test-model",
+				"--session-dir",
+				path.join(workspace, "sessions-malformed"),
+				"--listen",
+				socketPath,
+			],
+			{
+				cwd: workspace,
+				env: { ...cliEnv.env, GJC_HARNESS_STATE_ROOT: workspace, NO_COLOR: "1", PI_NOTIFICATIONS: "off" },
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const stderrText = new Response(proc.stderr).text();
+		let connection: SocketConn | undefined;
+		const malformed = [
+			{ id: "uds-missing-provider", type: "set_default_model_selection", modelId: "rpc-test-model" },
+			{ id: "uds-numeric-model", type: "set_default_model_selection", provider: "rpc-test", modelId: 42 },
+			{ id: "uds-blank-provider", type: "set_default_model_selection", provider: " ", modelId: "rpc-test-model" },
+			{
+				id: "uds-invalid-level",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "extreme",
+			},
+			{
+				id: "uds-inherit-level",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "inherit",
+			},
+			{ id: "uds-unknown-model", type: "set_default_model_selection", provider: "rpc-test", modelId: "missing" },
+		] as const;
+		try {
+			// Given: the real socket is ready and durable baselines are captured only after initial state.
+			await waitForSocket(socketPath);
+			connection = await connect(socketPath);
+			expect(await connection.nextFrame()).toEqual({ type: "ready" });
+			connection.send({ id: "uds-baseline", type: "get_state" });
+			const initialState = await connection.nextResponse("uds-baseline");
+			expect(initialState).toMatchObject({ command: "get_state", success: true });
+			const sessionFile = initialState.data?.sessionFile;
+			if (typeof sessionFile !== "string") throw new Error("Expected UDS get_state to return a session file");
+			const configFile = path.join(agentDir, "config.yml");
+			const configBaseline = await readBytesIfPresent(configFile);
+			const sessionBaseline = await readBytesIfPresent(sessionFile);
+
+			for (const [index, command] of malformed.entries()) {
+				// When: each raw mutation response arrives before its fast-lane state probe is sent.
+				connection.send(command);
+				const failure = await connection.nextResponse(command.id);
+
+				// Then: correlation, survival, and both durable byte snapshots remain exact.
+				expect(failure).toMatchObject({
+					id: command.id,
+					command: "set_default_model_selection",
+					success: false,
+				});
+				expect(failure.command).not.toBe("parse");
+				expect(JSON.stringify(failure.error)).not.toContain("Unknown command");
+				connection.send({ id: `uds-state-after-${index}`, type: "get_state" });
+				expect(await connection.nextResponse(`uds-state-after-${index}`)).toMatchObject({
+					command: "get_state",
+					success: true,
+				});
+				expect(await readBytesIfPresent(configFile)).toEqual(configBaseline);
+				expect(await readBytesIfPresent(sessionFile)).toEqual(sessionBaseline);
+			}
+		} finally {
+			connection?.close();
+			proc.kill();
+			await proc.exited;
+			expect(Bun.spawnSync(["kill", "-0", String(proc.pid)]).exitCode).not.toBe(0);
+			expect(await Bun.file(socketPath).exists()).toBe(false);
+			expect((await stderrText).trim()).toBe("");
+		}
+	}, 45_000);
+
 	it("keeps the AgentSession alive across client reconnects", async () => {
 		const socketPath = path.join(workspace, "rpc.sock");
 		const proc = Bun.spawn(

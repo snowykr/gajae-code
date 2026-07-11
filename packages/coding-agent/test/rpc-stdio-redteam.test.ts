@@ -88,6 +88,11 @@ function findResponse(frames: Frame[], id: string): Frame {
 	return frame;
 }
 
+async function readBytesIfPresent(filePath: string): Promise<Uint8Array | undefined> {
+	const file = Bun.file(filePath);
+	return (await file.exists()) ? new Uint8Array(await file.arrayBuffer()) : undefined;
+}
+
 function spawnRpcServer(options: { cwd?: string; sessionDir?: string } = {}): RpcHarness {
 	const proc = Bun.spawn(
 		[
@@ -263,6 +268,76 @@ describe("gjc --mode rpc red-team stdio lifecycle", () => {
 		});
 		expect(result.stderr.trim()).toBe("");
 	}, 30_000);
+
+	it("rejects malformed raw default selectors without mutating durable bytes or losing stdio service", async () => {
+		const harness = spawnRpcServer();
+		const malformed = [
+			{ id: "bad-missing-provider", type: "set_default_model_selection", modelId: "rpc-test-model" },
+			{ id: "bad-numeric-model", type: "set_default_model_selection", provider: "rpc-test", modelId: 42 },
+			{ id: "bad-blank-provider", type: "set_default_model_selection", provider: " ", modelId: "rpc-test-model" },
+			{
+				id: "bad-invalid-level",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "extreme",
+			},
+			{
+				id: "bad-inherit-level",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "rpc-test-model",
+				thinkingLevel: "inherit",
+			},
+			{
+				id: "bad-unknown-model",
+				type: "set_default_model_selection",
+				provider: "rpc-test",
+				modelId: "missing",
+			},
+		] as const;
+		try {
+			// Given: startup is complete and both durable files have post-ready baselines.
+			expect(await harness.nextFrame()).toEqual({ type: "ready" });
+			harness.send({ id: "baseline-state", type: "get_state" });
+			const initialState = await harness.nextFrame();
+			expect(initialState).toMatchObject({ id: "baseline-state", command: "get_state", success: true });
+			const sessionFile = frameData<{ sessionFile?: string }>(initialState).sessionFile;
+			if (!sessionFile) throw new Error("Expected a session file after initial get_state");
+			const configFile = path.join(agentDir, "config.yml");
+			const configBaseline = await readBytesIfPresent(configFile);
+			const sessionBaseline = await readBytesIfPresent(sessionFile);
+
+			for (const [index, command] of malformed.entries()) {
+				// When: each raw mutation is fully answered before the fast-lane survival probe is sent.
+				harness.send(command);
+				const failure = await harness.nextFrame();
+
+				// Then: the error is correlated to the mutation rather than parse, and service remains usable.
+				expect(failure).toMatchObject({
+					id: command.id,
+					type: "response",
+					command: "set_default_model_selection",
+					success: false,
+				});
+				expect(failure.command).not.toBe("parse");
+				expect(JSON.stringify(failure.error)).not.toContain("Unknown command");
+				harness.send({ id: `state-after-${index}`, type: "get_state" });
+				expect(await harness.nextFrame()).toMatchObject({
+					id: `state-after-${index}`,
+					command: "get_state",
+					success: true,
+				});
+				expect(await readBytesIfPresent(configFile)).toEqual(configBaseline);
+				expect(await readBytesIfPresent(sessionFile)).toEqual(sessionBaseline);
+			}
+		} finally {
+			await harness.closeStdin();
+			const exited = await Promise.race([harness.proc.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
+			if (!exited) harness.kill();
+			await harness.proc.exited;
+		}
+	}, 45_000);
 
 	it("runs independent child sessions concurrently without state bleed", async () => {
 		const alphaCwd = path.join(workspace, "alpha");
