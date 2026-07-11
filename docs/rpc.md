@@ -91,7 +91,7 @@ Important edge behavior from runtime:
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
-- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" }`
+- `{ id?, type: "set_default_model_selection", provider: string, modelId: string, thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }`
 - `{ id?, type: "cycle_model" }`
 - `{ id?, type: "get_available_models" }`
 

@@ -8,6 +8,21 @@ async function readRepositoryFile(relativePath: string): Promise<string> {
 }
 
 describe("durable default model selection documentation", () => {
+	test("lists every concrete thinking level in the command inventory", async () => {
+		// Given the canonical RPC reference
+		const rpcDoc = await readRepositoryFile("docs/rpc.md");
+
+		// When the durable default command inventory is inspected
+		const commandInventory = rpcDoc.match(/^- `\{ id\?, type: "set_default_model_selection"[^\n]+$/m)?.[0];
+		const documentedLevels = commandInventory
+			?.match(/thinkingLevel\?: ([^}]+) \}/)?.[1]
+			?.match(/"[^"]+"/g)
+			?.map(level => level.slice(1, -1));
+
+		// Then it enumerates the complete concrete-level contract
+		expect(documentedLevels).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	});
+
 	test("documents the exact request and success response fields", async () => {
 		// Given the canonical RPC reference
 		const rpcDoc = await readRepositoryFile("docs/rpc.md");
