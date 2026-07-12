@@ -7024,12 +7024,16 @@ export class AgentSession {
 				ThinkingLevel.Off;
 			await this.waitForIdle();
 			const previousDefaultModelRole = this.settings.getGlobal("modelRoles")?.default;
+			await this.sessionManager.flush();
+			const previousSessionState = this.sessionManager.captureState();
+			const previousModel = this.model;
+			const previousThinkingLevel = this.thinkingLevel;
+			const previousActiveRetryFallback = this.#activeRetryFallback ? { ...this.#activeRetryFallback } : undefined;
 			await this.settings.setGlobalModelRoleAndFlush(
 				"default",
 				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
 			);
 			try {
-				const previousThinkingLevel = this.thinkingLevel;
 				await this.setModelTemporary(model, effectiveLevel);
 				if (this.thinkingLevel === previousThinkingLevel) {
 					this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
@@ -7041,6 +7045,42 @@ export class AgentSession {
 						error: String(rollbackError),
 					});
 				});
+				let restoredLiveState = false;
+				try {
+					const failedEditMode = this.#resolveActiveEditMode();
+					const currentModel = this.model;
+					const hasCompatibleModelTransport =
+						currentModel !== undefined &&
+						previousModel !== undefined &&
+						currentModel.provider === previousModel.provider &&
+						currentModel.id === previousModel.id &&
+						currentModel.api === previousModel.api;
+					if (hasCompatibleModelTransport) {
+						this.agent.setModel(previousModel);
+						this.#syncAppendOnlyContext(previousModel);
+					} else {
+						this.#setModelWithProviderSessionReset(previousModel);
+					}
+					this.#thinkingLevel = previousThinkingLevel;
+					this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+					await this.#syncEditToolModeAfterModelChange(failedEditMode);
+					restoredLiveState = true;
+				} catch (rollbackError) {
+					logger.warn("Failed to restore live default model selection after live apply failure", {
+						error: String(rollbackError),
+					});
+				}
+				if (restoredLiveState) {
+					this.#activeRetryFallback = previousActiveRetryFallback;
+				}
+				try {
+					this.sessionManager.restoreState(previousSessionState);
+					await this.sessionManager.rewriteEntries();
+				} catch (rollbackError) {
+					logger.warn("Failed to restore session state after live default model selection failure", {
+						error: String(rollbackError),
+					});
+				}
 				throw error;
 			}
 			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
@@ -8409,7 +8449,7 @@ export class AgentSession {
 		return candidate;
 	}
 
-	#setModelWithProviderSessionReset(model: Model): void {
+	#setModelWithProviderSessionReset(model: Model | undefined): void {
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
@@ -8449,15 +8489,15 @@ export class AgentSession {
 		}
 	}
 
-	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model): void {
+	#closeProviderSessionsForModelSwitch(currentModel: Model, nextModel: Model | undefined): void {
 		const providerKeys = new Set<string>();
-		if (currentModel.api === "openai-codex-responses" || nextModel.api === "openai-codex-responses") {
+		if (currentModel.api === "openai-codex-responses" || nextModel?.api === "openai-codex-responses") {
 			providerKeys.add("openai-codex-responses");
 		}
 		if (currentModel.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${currentModel.provider}`);
 		}
-		if (nextModel.api === "openai-responses") {
+		if (nextModel?.api === "openai-responses") {
 			providerKeys.add(`openai-responses:${nextModel.provider}`);
 		}
 

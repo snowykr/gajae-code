@@ -10,6 +10,11 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	MemorySessionStorage,
+	type SessionStorageWriter,
+	type SessionStorageWriterOpenOptions,
+} from "@gajae-code/coding-agent/session/session-storage";
 import { logger } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -39,6 +44,38 @@ function targetModel(options?: { reasoning?: boolean; minLevel?: Effort; maxLeve
 				? undefined
 				: { mode: "effort", minLevel: options?.minLevel ?? Effort.Low, maxLevel: options?.maxLevel ?? Effort.High },
 	};
+}
+
+class AppendWriterTrackingStorage extends MemorySessionStorage {
+	readonly #appendWriterStates: { closed: boolean }[] = [];
+
+	get openAppendWriterCount(): number {
+		return this.#appendWriterStates.filter(state => !state.closed).length;
+	}
+
+	override openWriter(filePath: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
+		const writer = super.openWriter(filePath, options);
+		if (options?.flags === "w") return writer;
+		const state = { closed: false };
+		this.#appendWriterStates.push(state);
+		return {
+			writeLine: line => writer.writeLine(line),
+			writeLineSync: line => writer.writeLineSync(line),
+			flush: () => writer.flush(),
+			fsync: () => writer.fsync(),
+			async close(): Promise<void> {
+				await writer.close();
+				state.closed = true;
+			},
+			closeSync(): void {
+				writer.closeSync();
+				state.closed = true;
+			},
+			getError: () => writer.getError(),
+			getCloseState: () => writer.getCloseState(),
+			getCloseError: () => writer.getCloseError(),
+		};
+	}
 }
 
 describe("AgentSession durable default model selection", () => {
@@ -340,6 +377,31 @@ describe("AgentSession durable default model selection", () => {
 		expect(session.model).toBe(INITIAL_MODEL);
 	});
 
+	it("does not restore live state when durable default persistence fails", async () => {
+		// Given
+		const priorModelRoles = { default: "initial-provider/initial:low", planner: "planner/model:medium" };
+		const durableError = new Error("durable write failed");
+		settings.set("modelRoles", priorModelRoles);
+		const entriesBeforeSelection = sessionManager.getEntries();
+		const contextBeforeSelection = sessionManager.buildSessionContext();
+		const priorModel = session.model;
+		const priorThinkingLevel = session.thinkingLevel;
+		const setModel = vi.spyOn(session.agent, "setModel");
+		vi.spyOn(settings, "setGlobalModelRoleAndFlush").mockRejectedValue(durableError);
+
+		// When
+		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(durableError);
+		expect(setModel).not.toHaveBeenCalled();
+		expect(settings.getGlobal("modelRoles")).toEqual(priorModelRoles);
+		expect(session.model).toBe(priorModel);
+		expect(session.thinkingLevel).toBe(priorThinkingLevel);
+		expect(sessionManager.getEntries()).toEqual(entriesBeforeSelection);
+		expect(sessionManager.buildSessionContext()).toEqual(contextBeforeSelection);
+	});
+
 	it("continues the selection queue after a rejected operation", async () => {
 		// Given
 		const successfulModel = { ...targetModel(), id: "after-failure" };
@@ -363,6 +425,237 @@ describe("AgentSession durable default model selection", () => {
 		expect(session.model).toBe(successfulModel);
 		expect(session.thinkingLevel).toBe(Effort.High);
 		expect(sessionManager.buildSessionContext().models.default).toBe("target-provider/after-failure");
+	});
+
+	it("restores the prior durable and live selection when the target live apply fails late", async () => {
+		// Given
+		const priorModelRoles = { default: "initial-provider/initial:low", planner: "planner/model:medium" };
+		const priorLiveModel = session.model;
+		const priorThinkingLevel = session.thinkingLevel;
+		const model = targetModel();
+		const lateLiveApplyError = new Error("late live apply failure");
+		settings.set("modelRoles", priorModelRoles);
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		vi.spyOn(session, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		// When
+		const selection = session.setDefaultModelSelection(model, Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(lateLiveApplyError);
+		expect(settings.getGlobal("modelRoles")).toEqual(priorModelRoles);
+		expect(session.model).toBe(priorLiveModel);
+		expect(session.thinkingLevel).toBe(priorThinkingLevel);
+	});
+
+	it("restores the exact prior model when the failed target shares its selector but changes API metadata", async () => {
+		// Given
+		const priorLiveModel = session.model;
+		if (!priorLiveModel) throw new Error("Expected initial live model");
+		const targetWithDifferentApi: Model = {
+			...priorLiveModel,
+			api: "openai-completions",
+			baseUrl: "https://replacement.example.invalid/v1",
+		};
+		const lateLiveApplyError = new Error("late live apply failure");
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		vi.spyOn(session, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		// When
+		const selection = session.setDefaultModelSelection(targetWithDifferentApi, Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(lateLiveApplyError);
+		expect(session.model).toBe(priorLiveModel);
+		expect(session.model?.api).toBe("anthropic-messages");
+		expect(session.model?.baseUrl).toBe("https://example.invalid");
+	});
+
+	it("does not commit the durable default when session snapshot preflight flush fails", async () => {
+		// Given
+		const priorModelRoles = { default: "initial-provider/initial:low", planner: "planner/model:medium" };
+		const entriesBeforeSelection = sessionManager.getEntries();
+		const contextBeforeSelection = sessionManager.buildSessionContext();
+		const flushError = new Error("session snapshot flush failed");
+		settings.set("modelRoles", priorModelRoles);
+		vi.spyOn(sessionManager, "flush").mockRejectedValue(flushError);
+
+		// When
+		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(flushError);
+		expect(settings.getGlobal("modelRoles")).toEqual(priorModelRoles);
+		expect(session.model).toBe(INITIAL_MODEL);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		expect(sessionManager.getEntries()).toEqual(entriesBeforeSelection);
+		expect(sessionManager.buildSessionContext()).toEqual(contextBeforeSelection);
+	});
+
+	it("closes an already-open persisted append writer when late live apply rollback rewrites the transcript", async () => {
+		// Given
+		const storage = new AppendWriterTrackingStorage();
+		const persistentManager = SessionManager.create(tempRoot, path.join(tempRoot, "sessions"), storage);
+		const persistentSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: INITIAL_MODEL, systemPrompt: ["Test"], tools: [] },
+			}),
+			sessionManager: persistentManager,
+			settings,
+			modelRegistry,
+			thinkingLevel: Effort.Low,
+		});
+		const lateLiveApplyError = new Error("late live apply failure");
+		await persistentManager.ensureOnDisk();
+		persistentManager.appendMessage({ role: "user", content: "open hot writer", timestamp: Date.now() });
+		await persistentManager.flush();
+		expect(storage.openAppendWriterCount).toBe(1);
+		const originalLiveApply = persistentSession.setModelTemporary.bind(persistentSession);
+		vi.spyOn(persistentSession, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		try {
+			// When
+			const selection = persistentSession.setDefaultModelSelection(targetModel(), Effort.High);
+
+			// Then
+			await expect(selection).rejects.toBe(lateLiveApplyError);
+			expect(storage.openAppendWriterCount).toBe(0);
+		} finally {
+			await persistentSession.dispose();
+			await persistentManager.close();
+		}
+	});
+
+	it("restores the exact persisted transcript and context when target live apply fails late", async () => {
+		// Given
+		const persistentManager = SessionManager.create(tempRoot, tempRoot);
+		const persistentSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: INITIAL_MODEL, systemPrompt: ["Test"], tools: [] },
+			}),
+			sessionManager: persistentManager,
+			settings,
+			modelRegistry,
+			thinkingLevel: Effort.Low,
+		});
+		const lateLiveApplyError = new Error("late live apply failure");
+		persistentManager.appendMessage({ role: "user", content: "persisted transcript", timestamp: Date.now() });
+		await persistentManager.rewriteEntries();
+		const sessionFile = persistentSession.sessionFile;
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		const entriesBeforeSelection = persistentManager.getEntries();
+		const contextBeforeSelection = persistentManager.buildSessionContext();
+		const originalLiveApply = persistentSession.setModelTemporary.bind(persistentSession);
+		vi.spyOn(persistentSession, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		try {
+			// When
+			const selection = persistentSession.setDefaultModelSelection(targetModel(), Effort.High);
+
+			// Then
+			await expect(selection).rejects.toBe(lateLiveApplyError);
+			expect(persistentManager.getEntries()).toEqual(entriesBeforeSelection);
+			expect(persistentManager.buildSessionContext()).toEqual(contextBeforeSelection);
+			await persistentManager.flush();
+			await persistentManager.close();
+			const reopenedManager = await SessionManager.open(sessionFile, tempRoot);
+			try {
+				expect(reopenedManager.getEntries()).toEqual(entriesBeforeSelection);
+				expect(reopenedManager.buildSessionContext()).toEqual(contextBeforeSelection);
+			} finally {
+				await reopenedManager.close();
+			}
+		} finally {
+			await persistentSession.dispose();
+			await persistentManager.close();
+		}
+	});
+
+	it("restores a model-less session's live model, thinking, entries, and context when target live apply fails late", async () => {
+		// Given
+		const modelLessManager = SessionManager.inMemory(tempRoot);
+		const modelLessSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: undefined, systemPrompt: ["Test"], tools: [] },
+			}),
+			sessionManager: modelLessManager,
+			settings,
+			modelRegistry,
+			thinkingLevel: Effort.Low,
+		});
+		const priorModelRoles = { planner: "planner/model:medium" };
+		const priorThinkingLevel = modelLessSession.thinkingLevel;
+		const lateLiveApplyError = new Error("late live apply failure");
+		settings.set("modelRoles", priorModelRoles);
+		modelLessManager.appendMessage({ role: "user", content: "model-less transcript", timestamp: Date.now() });
+		const entriesBeforeSelection = modelLessManager.getEntries();
+		const contextBeforeSelection = modelLessManager.buildSessionContext();
+		const originalLiveApply = modelLessSession.setModelTemporary.bind(modelLessSession);
+		vi.spyOn(modelLessSession, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+
+		try {
+			// When
+			const selection = modelLessSession.setDefaultModelSelection(targetModel(), Effort.High);
+
+			// Then
+			await expect(selection).rejects.toBe(lateLiveApplyError);
+			expect(settings.getGlobal("modelRoles")).toEqual(priorModelRoles);
+			expect(modelLessSession.model).toBeUndefined();
+			expect(modelLessSession.thinkingLevel).toBe(priorThinkingLevel);
+			expect(modelLessManager.getEntries()).toEqual(entriesBeforeSelection);
+			expect(modelLessManager.buildSessionContext()).toEqual(contextBeforeSelection);
+		} finally {
+			await modelLessSession.dispose();
+		}
+	});
+
+	it("preserves the target live apply error when restoring the prior live selection fails", async () => {
+		// Given
+		const priorLiveModel = session.model;
+		const model = targetModel();
+		const lateLiveApplyError = new Error("late live apply failure");
+		const liveRollbackError = new Error("live rollback failure");
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		const liveApply = vi.spyOn(session, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await originalLiveApply(...args);
+			throw lateLiveApplyError;
+		});
+		const originalSetModel = session.agent.setModel.bind(session.agent);
+		const restoreModel = vi.spyOn(session.agent, "setModel").mockImplementation(appliedModel => {
+			if (appliedModel === priorLiveModel) throw liveRollbackError;
+			originalSetModel(appliedModel);
+		});
+		const rollbackWarning = vi.spyOn(logger, "warn");
+
+		// When
+		const selection = session.setDefaultModelSelection(model, Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(lateLiveApplyError);
+		expect(liveApply).toHaveBeenCalledWith(model, Effort.High);
+		expect(restoreModel).toHaveBeenCalledWith(priorLiveModel);
+		expect(rollbackWarning).toHaveBeenCalledWith(
+			"Failed to restore live default model selection after live apply failure",
+			{ error: "Error: live rollback failure" },
+		);
 	});
 
 	it.each([
