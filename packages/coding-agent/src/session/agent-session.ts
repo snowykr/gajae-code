@@ -28,6 +28,7 @@ import {
 	type AgentTool,
 	assertImagePlaceholdersHavePayload,
 	canContinuePersistedHistory,
+	type ResolvedThinkingLevel,
 	resolveTelemetry,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
@@ -529,6 +530,12 @@ export interface RoleModelCycleResult {
 	model: Model;
 	thinkingLevel: ThinkingLevel | undefined;
 	role: string;
+}
+
+export interface DefaultModelSelectionResult {
+	readonly provider: string;
+	readonly modelId: string;
+	readonly thinkingLevel: ResolvedThinkingLevel;
 }
 
 /** Session statistics for /session command */
@@ -1181,6 +1188,7 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
+	#defaultModelSelectionTail: Promise<void> = Promise.resolve();
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -6984,6 +6992,39 @@ export class AgentSession {
 		// configured defaultLevel; otherwise re-clamp the current level.
 		this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+	}
+
+	async setDefaultModelSelection(
+		model: Model,
+		thinkingLevel: ThinkingLevel | undefined,
+	): Promise<DefaultModelSelectionResult> {
+		const predecessor = this.#defaultModelSelectionTail;
+		const transaction = Promise.withResolvers<void>();
+		this.#defaultModelSelectionTail = transaction.promise;
+		try {
+			await predecessor;
+			if (thinkingLevel === ThinkingLevel.Inherit) {
+				throw new Error("Default model selection cannot inherit a thinking level");
+			}
+			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			if (!apiKey) {
+				throw new Error(`No API key for ${model.provider}/${model.id}`);
+			}
+			const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+			const effectiveLevel =
+				resolvedLevel ??
+				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
+				ThinkingLevel.Off;
+			await this.waitForIdle();
+			await this.settings.setGlobalModelRoleAndFlush(
+				"default",
+				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+			);
+			await this.setModelTemporary(model, effectiveLevel, { persistAsSessionDefault: true });
+			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+		} finally {
+			transaction.resolve();
+		}
 	}
 
 	/**
