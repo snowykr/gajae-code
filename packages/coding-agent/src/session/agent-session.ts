@@ -7022,7 +7022,8 @@ export class AgentSession {
 				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
 			);
 			try {
-				await this.setModelTemporary(model, effectiveLevel, { persistAsSessionDefault: true });
+				await this.setModelTemporary(model, effectiveLevel);
+				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
 			} catch (error) {
 				await this.settings.setGlobalModelRoleAndFlush("default", previousDefaultModelRole).catch(rollbackError => {
 					logger.warn("Failed to restore durable default model selection after live apply failure", {

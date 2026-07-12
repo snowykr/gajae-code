@@ -161,8 +161,8 @@ describe("AgentSession durable default model selection", () => {
 		);
 		const thinkingMarkerIndex = entriesAfterSelection.findIndex(entry => entry.type === "thinking_level_change");
 		expect(completedAssistantIndex).toBeGreaterThanOrEqual(entriesBeforeSelection.length);
-		expect(defaultModelMarkerIndex).toBeGreaterThan(completedAssistantIndex);
-		expect(thinkingMarkerIndex).toBeGreaterThan(defaultModelMarkerIndex);
+		expect(thinkingMarkerIndex).toBeGreaterThan(completedAssistantIndex);
+		expect(defaultModelMarkerIndex).toBeGreaterThan(thinkingMarkerIndex);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/reasoning:high" });
 	});
 
@@ -310,6 +310,42 @@ describe("AgentSession durable default model selection", () => {
 		expect(session.model).toBe(successfulModel);
 		expect(session.thinkingLevel).toBe(Effort.High);
 		expect(sessionManager.buildSessionContext().models.default).toBe("target-provider/after-failure");
+	});
+
+	it.each([
+		[
+			"the prior session default",
+			"initial-provider/initial",
+			{ default: "initial-provider/initial:low", planner: "planner/model:medium" },
+		],
+		["no prior session default", undefined, { planner: "planner/model:medium" }],
+	])("restores %s when live apply fails after a partial session mutation", async (_description, previousSessionDefault, previousModelRoles) => {
+		// Given
+		if (previousSessionDefault) {
+			sessionManager.appendModelChange(previousSessionDefault, "default");
+		}
+		settings.set("modelRoles", previousModelRoles);
+		const entriesBeforeSelection = sessionManager.getEntries();
+		const defaultEntriesBeforeSelection = entriesBeforeSelection.filter(
+			entry => entry.type === "model_change" && entry.role === "default",
+		);
+		const liveApplyError = new Error("late live apply failure");
+		const originalLiveApply = session.setModelTemporary.bind(session);
+		vi.spyOn(session, "setModelTemporary").mockImplementation(async (...args) => {
+			await originalLiveApply(...args);
+			throw liveApplyError;
+		});
+
+		// When
+		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+
+		// Then
+		await expect(selection).rejects.toBe(liveApplyError);
+		expect(settings.getGlobal("modelRoles")).toEqual(previousModelRoles);
+		expect(
+			sessionManager.getEntries().filter(entry => entry.type === "model_change" && entry.role === "default"),
+		).toEqual(defaultEntriesBeforeSelection);
+		expect(sessionManager.buildSessionContext().models.default === previousSessionDefault).toBeTrue();
 	});
 
 	it.each([
