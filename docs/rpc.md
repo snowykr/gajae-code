@@ -200,7 +200,8 @@ By default, `get_state` omits large static fields. Request `include: ["tools"]` 
   "contextUsage": {
     "tokens": 0,
     "contextWindow": 200000,
-    "percent": 0
+    "percent": 0,
+    "source": "heuristic"
   }
   // Optional with include: ["systemPrompt"]:
   // "systemPrompt": ["..."],

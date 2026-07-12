@@ -214,6 +214,7 @@ import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-ur
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
+import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
@@ -11489,7 +11490,7 @@ export class AgentSession {
 			}
 
 			if (!hasPostCompactionUsage) {
-				return { tokens: null, contextWindow, percent: null };
+				return { tokens: null, contextWindow, percent: null, source: "unknown" };
 			}
 		}
 
@@ -11500,6 +11501,7 @@ export class AgentSession {
 			tokens: estimate.tokens,
 			contextWindow,
 			percent,
+			source: estimate.anchored ? "provider_anchor" : "heuristic",
 		};
 	}
 
@@ -11517,6 +11519,7 @@ export class AgentSession {
 	 */
 	#estimateContextTokens(): {
 		tokens: number;
+		anchored: boolean;
 	} {
 		return this.#estimateContextTokensWith(message => this.#estimateMessageDisplayTokens(message));
 	}
@@ -11593,23 +11596,29 @@ export class AgentSession {
 
 	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {
 		tokens: number;
+		anchored: boolean;
 	} {
 		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageCompactionDeltaTokens(message));
 		return {
 			tokens: estimate.tokens + this.#estimateMessagesCompactionDeltaTokens(pendingMessages),
+			anchored: estimate.anchored,
 		};
 	}
 
 	#estimateContextTokensWith(estimateMessage: (message: AgentMessage) => number): {
 		tokens: number;
+		anchored: boolean;
 	} {
 		const messages = this.messages;
+		const latestCompaction = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const boundaryTs = latestCompaction ? new Date(latestCompaction.timestamp).getTime() : 0;
 
 		// Find the last successful assistant message with positive usage.
 		// Error/aborted turns are estimated as trailing context instead.
 		let lastUsageIndex: number | null = null;
 		let lastUsage: Usage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].timestamp < boundaryTs) break;
 			const usage = this.#anchorableAssistantUsage(messages[i]);
 			if (usage) {
 				lastUsage = usage;
@@ -11619,13 +11628,14 @@ export class AgentSession {
 		}
 
 		if (!lastUsage || lastUsageIndex === null) {
-			// No usage data - estimate all messages
-			let estimated = 0;
+			// No usage data - estimate the full provider request.
+			let estimated = computeNonMessageTokens(this);
 			for (const message of messages) {
 				estimated += estimateMessage(message);
 			}
 			return {
 				tokens: estimated,
+				anchored: false,
 			};
 		}
 
@@ -11641,6 +11651,7 @@ export class AgentSession {
 
 		return {
 			tokens: usageTokens + trailingTokens,
+			anchored: true,
 		};
 	}
 

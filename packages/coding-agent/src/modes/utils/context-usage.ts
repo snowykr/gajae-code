@@ -38,7 +38,9 @@ export interface ContextBreakdown {
 	contextWindow: number;
 	categories: CategoryInfo[];
 	lastUserTurnTokens: number;
+	estimatedCategoryTotal: number;
 	usedTokens: number;
+	source: "provider_anchor" | "heuristic" | "unknown";
 	autoCompactBufferTokens: number;
 	freeTokens: number;
 }
@@ -198,7 +200,16 @@ export function computeContextBreakdown(
 		},
 	];
 
-	const usedTokens = categories.reduce((sum, c) => sum + c.tokens, 0);
+	const estimatedCategoryTotal = categories.reduce((sum, c) => sum + c.tokens, 0);
+	const contextUsage = session.getContextUsage?.();
+	let usedTokens = estimatedCategoryTotal;
+	let source: "provider_anchor" | "heuristic" | "unknown" = "heuristic";
+	if (contextUsage?.tokens != null && contextUsage.source === "provider_anchor") {
+		usedTokens = contextUsage.tokens;
+		source = "provider_anchor";
+	} else if (contextUsage?.source === "unknown") {
+		source = "unknown";
+	}
 
 	let autoCompactBufferTokens = 0;
 	if (contextWindow > 0) {
@@ -223,7 +234,9 @@ export function computeContextBreakdown(
 		contextWindow,
 		categories,
 		lastUserTurnTokens,
+		estimatedCategoryTotal,
 		usedTokens,
+		source,
 		autoCompactBufferTokens,
 		freeTokens,
 	};
@@ -310,18 +323,33 @@ function percentString(part: number, whole: number, fractionDigits = 1): string 
 
 function buildLegendLines(breakdown: ContextBreakdown, theme: typeof Theme): string[] {
 	const lines: string[] = [];
-	const { model, contextWindow, categories, usedTokens, autoCompactBufferTokens, freeTokens } = breakdown;
+	const { model, contextWindow, categories, estimatedCategoryTotal, usedTokens, source, autoCompactBufferTokens, freeTokens } =
+		breakdown;
 
 	const modelName = model?.name ?? model?.id ?? "no model";
 	const modelId = model?.id ?? "unknown";
 	const windowLabel = formatNumber(contextWindow).toLowerCase();
+	const totalSourceLabel =
+		source === "provider_anchor"
+			? "provider-reported"
+			: source === "unknown"
+				? "estimated; exact count unknown until next response"
+				: "estimated";
 
 	lines.push(theme.bold(`${modelName}`) + theme.fg("dim", ` (${windowLabel} context)`));
 	lines.push(theme.fg("muted", `${modelId}[${windowLabel}]`));
 	lines.push(
 		`${theme.bold(formatNumber(usedTokens))}${theme.fg("dim", `/${windowLabel} tokens`)}` +
-			theme.fg("muted", ` (${percentString(usedTokens, contextWindow)})`),
+			theme.fg("muted", ` (${percentString(usedTokens, contextWindow)}) (${totalSourceLabel})`),
 	);
+	if (source === "provider_anchor" && estimatedCategoryTotal !== usedTokens) {
+		lines.push(
+			theme.fg(
+				"muted",
+				`Estimated category total: ${formatNumber(estimatedCategoryTotal)} tokens (composition below is estimated)`,
+			),
+		);
+	}
 	lines.push("");
 	lines.push(theme.fg("muted", "Estimated usage by category"));
 

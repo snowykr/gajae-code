@@ -695,11 +695,18 @@ export class StatusLineComponent implements Component {
 			tokensPerSecond: this.#getTokensPerSecond(),
 		};
 
-		// Context usage — aligned with /context command so both surfaces report the same value
-		const breakdown = this.getCachedContextBreakdown();
-		const contextTokens = breakdown.usedTokens;
-		const contextWindow = breakdown.contextWindow || state.model?.contextWindow || 0;
-		const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+		// Provider-anchored context snapshots are primary; the cached heuristic breakdown is a fallback.
+		const contextUsage = this.session.getContextUsage?.();
+		const breakdown = contextUsage ? undefined : this.getCachedContextBreakdown();
+		const contextTokens = breakdown?.usedTokens ?? 0;
+		const contextWindow = contextUsage?.contextWindow ?? breakdown?.contextWindow ?? state.model?.contextWindow ?? 0;
+		const contextPercent = contextUsage
+			? contextUsage.tokens === null
+				? null
+				: contextUsage.percent
+			: contextWindow > 0
+				? (contextTokens / contextWindow) * 100
+				: 0;
 		// Suppress the inline model percentage when a standalone context_pct
 		// segment is also rendered, so the value is not shown twice.
 		const contextPctSegmentActive =

@@ -19,6 +19,7 @@ import type { PlanModeState } from "../src/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import type { ContextUsage } from "../src/extensibility/extensions/types";
 import { FileSessionStorage } from "../src/session/session-storage";
 
 const SESSION_UPDATE_VARIANTS = new Set([
@@ -137,6 +138,7 @@ class FakeAgentSession {
 	}
 	promptCalls: string[] = [];
 	promptResponse: AssistantMessage | undefined;
+	contextUsage: ContextUsage | undefined;
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
@@ -278,8 +280,8 @@ class FakeAgentSession {
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
 
-	getContextUsage(): undefined {
-		return undefined;
+	getContextUsage(): ContextUsage | undefined {
+		return this.contextUsage;
 	}
 
 	async switchSession(sessionPath: string): Promise<boolean> {
@@ -851,6 +853,35 @@ describe("ACP agent", () => {
 		expect(
 			liveChunks.some(
 				update => typeof getChunkMessageId(update) === "string" && getChunkMessageId(update)!.length > 0,
+			),
+		).toBe(true);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+	it("omits ACP usage updates when the context count is unknown", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.contextUsage = {
+			tokens: null,
+			contextWindow: 200_000,
+			percent: null,
+			source: "unknown",
+		};
+		const before = harness.updates.length;
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb62",
+			prompt: [{ type: "text", text: "unknown context" }],
+		} as PromptRequest);
+
+		const endOfTurnUpdates = harness.updates.slice(before);
+		expect(endOfTurnUpdates.some(update => update.update.sessionUpdate === "usage_update")).toBe(false);
+		expect(
+			endOfTurnUpdates.some(
+				update => update.update.sessionUpdate === "session_info_update" && update.update._meta?.gjcPhase === "idle",
 			),
 		).toBe(true);
 
