@@ -106,6 +106,7 @@ export function defineRpcClientTool<
 }
 
 const agentWireEventTypes = new Set<AgentWireEventType>(AGENT_WIRE_EVENT_TYPES);
+const DEFAULT_MODEL_SELECTION_TIMEOUT_MS = 600_000;
 const coreAgentEventTypes = new Set<AgentEvent["type"]>([
 	"agent_start",
 	"agent_end",
@@ -666,12 +667,15 @@ export class RpcClient {
 		modelId: string,
 		thinkingLevel: ResolvedThinkingLevel,
 	): Promise<RpcDefaultModelSelection> {
-		const response = await this.#send({
-			type: "set_default_model_selection",
-			provider,
-			modelId,
-			thinkingLevel,
-		});
+		const response = await this.#send(
+			{
+				type: "set_default_model_selection",
+				provider,
+				modelId,
+				thinkingLevel,
+			},
+			DEFAULT_MODEL_SELECTION_TIMEOUT_MS,
+		);
 		if (!response.success) return this.#getData(response);
 		if (response.command !== "set_default_model_selection" || !isDefaultModelSelection(response.data)) {
 			throw new Error("Invalid set_default_model_selection response");

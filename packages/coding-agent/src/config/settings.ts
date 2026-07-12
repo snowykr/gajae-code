@@ -907,7 +907,7 @@ export class Settings {
 			logger.warn("Settings: save failed", { error: String(error) });
 			for (const patch of patches) {
 				const currentPatch = this.#modified.get(patch.path);
-				if (!currentPatch || currentPatch.generation < patch.generation) {
+				if (currentPatch?.generation === patch.generation) {
 					this.#modified.set(patch.path, patch);
 				}
 			}

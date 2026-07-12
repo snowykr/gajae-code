@@ -162,4 +162,37 @@ describe("Settings global model role durability", () => {
 			planner: "profile/planner:high",
 		});
 	});
+
+	it("does not re-dirty a patch after an earlier duplicate save has persisted it", async () => {
+		// Given: two queued saves that snapshot the same patch before the first write settles.
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const originalWrite = Bun.write.bind(Bun);
+		const firstWrite = Promise.withResolvers<void>();
+		let configWrite = 0;
+		vi.spyOn(Bun, "write").mockImplementation(async (destination, input) => {
+			if (typeof destination !== "string" || typeof input !== "string") {
+				throw new Error("unexpected non-string settings write");
+			}
+			if (destination !== configPath) return originalWrite(destination, input);
+			configWrite += 1;
+			if (configWrite === 1) await firstWrite.promise;
+			if (configWrite === 2) throw new Error("injected duplicate save failure");
+			return originalWrite(destination, input);
+		});
+
+		settings.set("theme.dark", "first-claw");
+		const first = settings.flush();
+		const duplicate = settings.flush();
+
+		// When: the first snapshot persists, then the obsolete duplicate snapshot fails.
+		firstWrite.resolve();
+		await first;
+		await duplicate;
+		await Bun.write(configPath, YAML.stringify({}));
+		settings.set("theme.light", "later-claw");
+		await settings.flush();
+
+		// Then: a later unrelated save cannot replay the stale, already-persisted patch.
+		expect(YAML.parse(await Bun.file(configPath).text())).toEqual({ theme: { light: "later-claw" } });
+	});
 });

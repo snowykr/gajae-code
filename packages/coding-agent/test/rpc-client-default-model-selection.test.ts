@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -63,6 +63,27 @@ describe("RpcClient.setDefaultModelSelection", () => {
 
 				// Then: the correlated, validated tuple is returned.
 				expect(result).toEqual({ provider: "openai", modelId: "gpt-5.2", thinkingLevel: ThinkingLevel.High });
+			},
+		);
+	});
+
+	test("uses the idle-deferred command timeout instead of the default request timeout", async () => {
+		// Given: a server that accepts the command immediately after startup.
+		await withFakeServer(
+			`write({ id: frame.id, type: "response", command: "set_default_model_selection", success: true, data: { provider: "openai", modelId: "gpt-5.2", thinkingLevel: "high" } });`,
+			async client => {
+				await client.start();
+				const timeout = vi.spyOn(globalThis, "setTimeout");
+
+				try {
+					// When: the selection can be deferred until an active session becomes idle.
+					await client.setDefaultModelSelection("openai", "gpt-5.2", ThinkingLevel.High);
+
+					// Then: it receives the longer explicit request deadline without delaying this test.
+					expect(timeout).toHaveBeenCalledWith(expect.any(Function), 600_000);
+				} finally {
+					timeout.mockRestore();
+				}
 			},
 		);
 	});
