@@ -7022,7 +7022,11 @@ export class AgentSession {
 				formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
 			);
 			try {
+				const previousThinkingLevel = this.thinkingLevel;
 				await this.setModelTemporary(model, effectiveLevel);
+				if (this.thinkingLevel === previousThinkingLevel) {
+					this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+				}
 				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "default");
 			} catch (error) {
 				await this.settings.setGlobalModelRoleAndFlush("default", previousDefaultModelRole).catch(rollbackError => {

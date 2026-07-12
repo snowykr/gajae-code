@@ -183,9 +183,62 @@ describe("AgentSession durable default model selection", () => {
 		expect(selectionEntries.filter(entry => entry.type === "model_change" && entry.role === "default")).toEqual([
 			expect.objectContaining({ model: "target-provider/reasoning" }),
 		]);
-		expect(selectionEntries.filter(entry => entry.type === "thinking_level_change")).toEqual([]);
+		expect(selectionEntries.filter(entry => entry.type === "thinking_level_change")).toEqual([
+			expect.objectContaining({ thinkingLevel: ThinkingLevel.Off }),
+		]);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/reasoning:off" });
 		expect(settings.get("defaultThinkingLevel")).toBe(Effort.XHigh);
+	});
+
+	it("restores an unchanged explicit default thinking level on resume", async () => {
+		// Given
+		modelRegistry.registerProvider("target-provider", {
+			baseUrl: "https://example.invalid/v1",
+			apiKey: "resume-key",
+			api: "openai-completions",
+			models: [targetModel()],
+		});
+		const model = modelRegistry.find("target-provider", "reasoning");
+		if (!model) throw new Error("Expected registered resume model");
+		const sourceManager = SessionManager.create(tempRoot, tempRoot);
+		const sourceSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: INITIAL_MODEL, systemPrompt: ["Test"], tools: [] },
+			}),
+			sessionManager: sourceManager,
+			settings,
+			modelRegistry,
+			thinkingLevel: ThinkingLevel.Off,
+		});
+		const resumedSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "test-key",
+				initialState: { model: INITIAL_MODEL, systemPrompt: ["Test"], tools: [] },
+			}),
+			sessionManager: SessionManager.create(tempRoot, tempRoot),
+			settings,
+			modelRegistry,
+			thinkingLevel: Effort.Low,
+		});
+
+		try {
+			const sourceSessionFile = sourceSession.sessionFile;
+			if (!sourceSessionFile) throw new Error("Expected persisted source session");
+
+			// When
+			await sourceSession.setDefaultModelSelection(model, ThinkingLevel.Off);
+			await sourceManager.rewriteEntries();
+			expect(await resumedSession.switchSession(sourceSessionFile)).toBe(true);
+
+			// Then
+			expect(resumedSession.model?.provider).toBe(model.provider);
+			expect(resumedSession.model?.id).toBe(model.id);
+			expect(resumedSession.thinkingLevel).toBe(ThinkingLevel.Off);
+		} finally {
+			await sourceSession.dispose();
+			await resumedSession.dispose();
+		}
 	});
 
 	it("normalizes an unspecified level to off for a non-reasoning model", async () => {
