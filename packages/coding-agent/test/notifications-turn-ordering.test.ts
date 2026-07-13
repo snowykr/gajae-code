@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createNotificationsExtension } from "../src/notifications/index";
-import { readEndpoint } from "../src/notifications/telegram-reference";
+import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 
 /**
  * Regression for the text-before-ask ordering bug: the assistant text that
@@ -32,7 +32,12 @@ type Frame = {
 	cwd?: string;
 };
 
-type TestContextUsage = { tokens: number | null; contextWindow: number };
+type TestContextUsage = {
+	tokens: number | null;
+	contextWindow: number;
+	percent: number | null;
+	source: "provider_anchor" | "heuristic" | "unknown";
+};
 type TestModel = { id?: string };
 
 const tempDirs: string[] = [];
@@ -73,13 +78,15 @@ async function setup(options: { contextUsage?: TestContextUsage | false; model?:
 			getCwd: () => cwd,
 		},
 		getContextUsage: () =>
-			options.contextUsage === false ? undefined : (options.contextUsage ?? { tokens: 12, contextWindow: 100 }),
+			options.contextUsage === false
+				? undefined
+				: (options.contextUsage ?? { tokens: 12, contextWindow: 100, percent: 12, source: "provider_anchor" }),
 		getModel: () => (options.model === false ? undefined : (options.model ?? { id: "test-model" })),
 	} as never;
 
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
 
-	const endpointFile = path.join(cwd, ".gjc", "state", "notifications", `${sid}.json`);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
 	const { url, token } = readEndpoint(endpointFile);
 
@@ -268,7 +275,7 @@ test("session shutdown emits session_closed before stopping the endpoint", async
 //
 // The emit site tags each turn_stream with a `finalAnswer` bit (false for the
 // pre-ask lead-in, true at turn_end). The Rust wire struct `TurnStream`
-// (crates/gjc-notifications/src/protocol.rs) carries it as an optional
+// (crates/gjc-sdk/src/protocol.rs) carries it as an optional
 // `final_answer` (serialized `finalAnswer`), so the bit is asserted here at the
 // WS-observable level; the `finalAnswer` -> `richMarkdown` mapping itself is
 // verified at the pure-renderer level in notifications-threaded-render.test.ts.
