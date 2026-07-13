@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -283,7 +284,11 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
-import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
+import {
+	buildWorkflowIntentDiff,
+	WORKFLOW_INTENT_DIFF_CUSTOM_TYPE,
+	type WorkflowIntentDiff,
+} from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import type { AuthStorage } from "./auth-storage";
 import {
@@ -1017,6 +1022,35 @@ export type BeforeAgentStartContributor = (event: {
 	sessionId: string | undefined;
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
+type PromptCallbackOriginMarker = {
+	readonly token: symbol;
+	active: boolean;
+};
+
+type DisposeCallbackOriginMarker = {
+	readonly token: symbol;
+	active: boolean;
+};
+
+type SessionAdmissionState = "queued" | "admitted" | "cancelled" | "released";
+
+type SessionAdmissionNode = {
+	readonly id: number;
+	readonly kind: "prompt" | "selection";
+	state: SessionAdmissionState;
+	readonly admitted: PromiseWithResolvers<void>;
+	readonly generation?: number;
+	readonly signal?: AbortSignal;
+	abortListener?: () => void;
+	inFlight: boolean;
+	continuesQueuedMessages?: boolean;
+};
+
+type PromptAdmissionReuse = {
+	readonly generation: number;
+	readonly mode: "continuation" | "sequential";
+};
+
 export class WorkerIntegrationRequestScheduler {
 	#inFlight: Promise<void> | undefined = undefined;
 	#pending = false;
@@ -1223,8 +1257,15 @@ export class AgentSession {
 	#scopedModels: ScopedModelSelection[];
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
-	#defaultModelSelectionTail: Promise<void> = Promise.resolve();
+	#admissionQueue: SessionAdmissionNode[] = [];
+	#admissionOwner: SessionAdmissionNode | undefined;
+	#admissionPumpActive = false;
+	#admissionLaneClosed = false;
+	#nextAdmissionId = 0;
+	#pendingPromptAdmissionId: number | undefined;
+	#queuedMessageContinuationAdmissions = new Set<SessionAdmissionNode>();
 	#defaultModelSelectionMutationRevision = 0;
+	#defaultModelSelectionSideEffectsSettled: Promise<void> | undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -1349,6 +1390,9 @@ export class AgentSession {
 	#providerSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
+	#disposePromise: Promise<void> | undefined;
+	#disposeCallbackOriginStorage = new AsyncLocalStorage<DisposeCallbackOriginMarker>();
+	readonly #disposeCallbackOriginToken = Symbol("dispose-callback-origin");
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#turnIndex = 0;
@@ -1359,6 +1403,8 @@ export class AgentSession {
 	});
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
+	#promptCallbackOriginStorage = new AsyncLocalStorage<PromptCallbackOriginMarker>();
+	readonly #promptCallbackOriginToken = Symbol("prompt-callback-origin");
 
 	#skills: Skill[];
 	#skillWarnings: SkillWarning[];
@@ -1455,6 +1501,7 @@ export class AgentSession {
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
+	#scheduledQueuedMessageContinuation: Promise<void> | undefined = undefined;
 
 	#streamingEditAbortTriggered = false;
 	#streamingEditCheckedLineCounts = new Map<string, number>();
@@ -1485,6 +1532,8 @@ export class AgentSession {
 	};
 	#promptInFlightCount = 0;
 	#agentEventHandlersInFlight = 0;
+	#agentEventHandlersIdle: Promise<void> = Promise.resolve();
+	#resolveAgentEventHandlersIdle: (() => void) | undefined;
 	#queuedExtensionEventCount = 0;
 	// Wire-level agent_end emission is deferred until both the prompt finalizer and
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
@@ -1552,7 +1601,277 @@ export class AgentSession {
 		}
 	}
 
-	#beginInFlight(): void {
+	#enqueueSelectionAdmission(): SessionAdmissionNode {
+		if (this.#admissionLaneClosed) {
+			throw new AgentBusyError("Agent session has been disposed.");
+		}
+		const node: SessionAdmissionNode = {
+			id: ++this.#nextAdmissionId,
+			kind: "selection",
+			state: "queued",
+			admitted: Promise.withResolvers<void>(),
+			inFlight: false,
+		};
+		this.#admissionQueue.push(node);
+		this.#pumpAdmissionQueue();
+		return node;
+	}
+
+	#enqueuePromptAdmission(): SessionAdmissionNode {
+		if (this.#admissionLaneClosed) {
+			throw new AgentBusyError("Agent session has been disposed.");
+		}
+		if (this.#pendingPromptAdmissionId !== undefined) {
+			throw new AgentBusyError();
+		}
+		const signal = this.#promptPreflightAbortController.signal;
+		const node: SessionAdmissionNode = {
+			id: ++this.#nextAdmissionId,
+			kind: "prompt",
+			state: "queued",
+			admitted: Promise.withResolvers<void>(),
+			generation: this.#promptGeneration,
+			signal,
+			inFlight: false,
+		};
+		this.#pendingPromptAdmissionId = node.id;
+		const cancel = () => {
+			if (node.state !== "queued") return;
+			if (node.continuesQueuedMessages === true && this.agent.hasQueuedMessages()) {
+				const index = this.#admissionQueue.indexOf(node);
+				if (index !== -1) {
+					const continuation: SessionAdmissionNode = {
+						id: ++this.#nextAdmissionId,
+						kind: "prompt",
+						state: "queued",
+						admitted: Promise.withResolvers<void>(),
+						generation: this.#promptGeneration,
+						inFlight: false,
+					};
+					void continuation.admitted.promise.catch(() => {});
+					this.#admissionQueue.splice(index + 1, 0, continuation);
+					this.#pendingPromptAdmissionId = continuation.id;
+					this.#queuedMessageContinuationAdmissions.add(continuation);
+				}
+			}
+			node.continuesQueuedMessages = false;
+			node.state = "cancelled";
+			signal.removeEventListener("abort", cancel);
+			node.abortListener = undefined;
+			this.#clearPendingPromptAdmissionClaim(node);
+			node.admitted.reject(promptPreflightCancelledError());
+			this.#pumpAdmissionQueue();
+		};
+		node.abortListener = cancel;
+		this.#admissionQueue.push(node);
+		signal.addEventListener("abort", cancel, { once: true });
+		if (signal.aborted) cancel();
+		this.#pumpAdmissionQueue();
+		return node;
+	}
+
+	#clearPendingPromptAdmissionClaim(node: SessionAdmissionNode): void {
+		if (node.kind === "prompt" && this.#pendingPromptAdmissionId === node.id) {
+			this.#pendingPromptAdmissionId = undefined;
+		}
+	}
+
+	#getPendingPromptAdmission(): SessionAdmissionNode | undefined {
+		const pendingId = this.#pendingPromptAdmissionId;
+		if (pendingId === undefined) return undefined;
+		return this.#admissionQueue.find(
+			node =>
+				node.id === pendingId && node.kind === "prompt" && (node.state === "queued" || node.state === "admitted"),
+		);
+	}
+
+	#pumpAdmissionQueue(): void {
+		if (this.#admissionLaneClosed || this.#admissionPumpActive) return;
+		this.#admissionPumpActive = true;
+		try {
+			if (this.#admissionOwner) return;
+			while (true) {
+				const head = this.#admissionQueue[0];
+				if (!head) return;
+				if (head.state === "cancelled") {
+					head.state = "released";
+					this.#admissionQueue.shift();
+					continue;
+				}
+				if (head.state !== "queued") return;
+				head.state = "admitted";
+				this.#admissionOwner = head;
+				if (head.abortListener && head.signal) {
+					head.signal.removeEventListener("abort", head.abortListener);
+					head.abortListener = undefined;
+				}
+				head.admitted.resolve();
+				return;
+			}
+		} finally {
+			this.#admissionPumpActive = false;
+		}
+	}
+
+	#releaseAdmission(node: SessionAdmissionNode): void {
+		const continuesQueuedMessages = node.continuesQueuedMessages === true;
+		node.continuesQueuedMessages = false;
+		const shouldContinueQueuedMessages =
+			continuesQueuedMessages && !this.#admissionLaneClosed && this.agent.hasQueuedMessages();
+		if (
+			shouldContinueQueuedMessages &&
+			node.kind === "prompt" &&
+			node.state === "admitted" &&
+			this.#admissionOwner === node &&
+			!node.inFlight &&
+			this.#scheduleQueuedMessageContinuation(node)
+		) {
+			return;
+		}
+		if (node.state === "admitted" && this.#admissionOwner === node) {
+			node.state = "released";
+			this.#admissionOwner = undefined;
+			if (this.#admissionQueue[0] === node) this.#admissionQueue.shift();
+			this.#clearPendingPromptAdmissionClaim(node);
+			this.#pumpAdmissionQueue();
+		}
+		if (shouldContinueQueuedMessages) {
+			this.#scheduleQueuedMessageContinuation();
+		}
+	}
+
+	#closeAdmissionLane(): void {
+		if (this.#admissionLaneClosed) return;
+		this.#admissionLaneClosed = true;
+		this.#promptPreflightAbortController.abort();
+		const disposedError = new AgentBusyError("Agent session has been disposed.");
+		for (const node of this.#admissionQueue) {
+			if (node.abortListener && node.signal) {
+				node.signal.removeEventListener("abort", node.abortListener);
+				node.abortListener = undefined;
+			}
+			if (node.state === "queued") {
+				node.state = "cancelled";
+				node.admitted.reject(node.kind === "prompt" ? promptPreflightCancelledError() : disposedError);
+			} else if (node.state === "admitted") {
+				node.state = "cancelled";
+				this.#endInFlight(node);
+			}
+			this.#clearPendingPromptAdmissionClaim(node);
+		}
+		this.#admissionOwner = undefined;
+		this.#admissionQueue = [];
+		this.#queuedMessageContinuationAdmissions.clear();
+	}
+
+	#throwIfSelectionAdmissionInactive(node: SessionAdmissionNode): void {
+		if (this.#admissionLaneClosed || node.state !== "admitted" || this.#admissionOwner !== node) {
+			throw new AgentBusyError("Agent session has been disposed.");
+		}
+	}
+
+	#isCurrentPromptAdmission(node: SessionAdmissionNode, generation: number): boolean {
+		return this.#isCurrentPromptAdmissionOwner(node, generation) && node.inFlight;
+	}
+
+	#isCurrentPromptAdmissionOwner(node: SessionAdmissionNode, generation: number): boolean {
+		return (
+			node.kind === "prompt" &&
+			node.state === "admitted" &&
+			node.generation === generation &&
+			this.#admissionOwner === node
+		);
+	}
+
+	#getCurrentPromptAdmission(generation: number): SessionAdmissionNode | undefined {
+		const owner = this.#admissionOwner;
+		return owner && this.#isCurrentPromptAdmission(owner, generation) ? owner : undefined;
+	}
+
+	async #awaitPromptAdmission(node: SessionAdmissionNode, requireAcceptance: boolean): Promise<boolean> {
+		try {
+			await node.admitted.promise;
+			return true;
+		} catch (error) {
+			if (isPromptPreflightCancelledError(error) && !requireAcceptance) return false;
+			throw error;
+		}
+	}
+
+	async #awaitPromptAdmissionUntilAbort(
+		node: SessionAdmissionNode,
+		requireAcceptance: boolean,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		if (signal.aborted) return false;
+		const aborted = Promise.withResolvers<boolean>();
+		const onAbort = () => aborted.resolve(false);
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+		try {
+			return await Promise.race([this.#awaitPromptAdmission(node, requireAcceptance), aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async #runWithPromptAdmission(
+		operation: (admission: SessionAdmissionNode) => Promise<void>,
+		requireAcceptance = false,
+	): Promise<void> {
+		const admission = this.#enqueuePromptAdmission();
+		try {
+			if (!(await this.#awaitPromptAdmission(admission, requireAcceptance))) return;
+			await operation(admission);
+		} finally {
+			this.#releaseAdmission(admission);
+		}
+	}
+
+	async #runExactMessagePrompt(messages: AgentMessage[], options?: { toolChoice?: ToolChoice }): Promise<void> {
+		const admission = this.#enqueuePromptAdmission();
+		try {
+			if (!(await this.#awaitPromptAdmission(admission, false))) return;
+			this.#beginInFlight(admission);
+			try {
+				await this.#promptAgentWithIdleRetry(
+					messages,
+					options,
+					() => this.#clearPendingPromptAdmissionClaim(admission),
+					undefined,
+					() => {
+						const generation = admission.generation;
+						if (generation === undefined || !this.#isCurrentPromptAdmission(admission, generation)) {
+							throw promptPreflightCancelledError();
+						}
+						this.#throwIfPromptPreflightCancelled(
+							generation,
+							admission.signal ?? this.#promptPreflightAbortController.signal,
+						);
+					},
+				);
+			} finally {
+				this.#endInFlight(admission);
+			}
+		} finally {
+			this.#releaseAdmission(admission);
+		}
+	}
+
+	async #runInPromptCallbackFrame<T>(callback: () => Promise<T>): Promise<T> {
+		const marker: PromptCallbackOriginMarker = { token: this.#promptCallbackOriginToken, active: true };
+		try {
+			return await this.#promptCallbackOriginStorage.run(marker, callback);
+		} finally {
+			marker.active = false;
+		}
+	}
+
+	#beginInFlight(node: SessionAdmissionNode): void {
+		if (node.kind !== "prompt" || node.state !== "admitted" || this.#admissionOwner !== node || node.inFlight) {
+			throw new AgentBusyError();
+		}
+		node.inFlight = true;
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
@@ -1628,7 +1947,9 @@ export class AgentSession {
 		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
-	#endInFlight(): void {
+	#endInFlight(node: SessionAdmissionNode): void {
+		if (!node.inFlight) return;
+		node.inFlight = false;
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
 			this.#releasePowerAssertion();
@@ -1739,9 +2060,7 @@ export class AgentSession {
 			isStreaming: () => this.isStreaming,
 			injectStreaming: message => this.agent.followUp(message),
 			injectIdle: async messages => {
-				const first = messages[0];
-				if (!first) return;
-				await this.agent.prompt(messages.length === 1 ? first : messages);
+				await this.#runExactMessagePrompt(messages);
 			},
 			scheduleIdleFlush: run => {
 				this.#schedulePostPromptTask(
@@ -2269,6 +2588,11 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (this.#agentEventHandlersInFlight === 0) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#agentEventHandlersIdle = promise;
+			this.#resolveAgentEventHandlersIdle = resolve;
+		}
 		this.#agentEventHandlersInFlight++;
 		try {
 			await this.#handleAgentEvent(event);
@@ -2276,9 +2600,21 @@ export class AgentSession {
 			logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 		} finally {
 			this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
+			if (this.#agentEventHandlersInFlight === 0) {
+				this.#resolveAgentEventHandlersIdle?.();
+				this.#resolveAgentEventHandlersIdle = undefined;
+			}
 			this.#flushPendingAgentEnd();
 		}
 	};
+
+	async #waitForAgentEventHandlersToStabilize(): Promise<void> {
+		while (true) {
+			const idle = this.#agentEventHandlersIdle;
+			await idle;
+			if (this.#agentEventHandlersInFlight === 0 && idle === this.#agentEventHandlersIdle) return;
+		}
+	}
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
 		void persistCoordinatorRuntimeStateFromEvent(event, {
@@ -2329,7 +2665,7 @@ export class AgentSession {
 		// sinks, so they must not delay or suppress local delivery.
 		this.#emit(event);
 		void persistRuntimeState();
-		await this.#emitExtensionEvent(event);
+		await this.#runInPromptCallbackFrame(() => this.#emitExtensionEvent(event));
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -2931,11 +3267,16 @@ export class AgentSession {
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
+		inheritedAdmission?: SessionAdmissionNode;
+		reservedAdmission?: SessionAdmissionNode;
+		beforeContinue?: () => void;
 		skipCompactionCheck?: boolean;
+		skipRetryFallbackRestore?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
 		onError?: (error: unknown) => void;
+		propagateError?: boolean;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -2957,23 +3298,50 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		const signal = this.#postPromptTasksAbortController.signal;
+		const inheritedAdmission =
+			options?.inheritedAdmission ?? this.#getCurrentPromptAdmission(scheduledGeneration ?? this.#promptGeneration);
+		const reservedAdmission =
+			options?.reservedAdmission ?? (inheritedAdmission ? undefined : this.#enqueuePromptAdmission());
+		if (reservedAdmission) void reservedAdmission.admitted.promise.catch(() => {});
 		return this.#schedulePostPromptTask(
-			async () => {
-				if (signal.aborted) {
-					skip("aborted_signal");
-					return;
-				}
-				if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-					skip("generation_changed");
-					return;
-				}
-				if (options?.shouldContinue && !options.shouldContinue()) {
-					skip("queue_drained");
-					return;
-				}
+			async signal => {
+				let reservedInFlight = false;
 				try {
-					await this.#maybeRestoreRetryFallbackPrimary();
+					if (reservedAdmission) {
+						if (
+							reservedAdmission.state !== "admitted" &&
+							!(await this.#awaitPromptAdmissionUntilAbort(reservedAdmission, false, signal))
+						) {
+							this.#cancelQueuedMessageContinuationAdmission(reservedAdmission);
+							skip("aborted_signal");
+							return;
+						}
+					}
+					if (signal.aborted) {
+						skip("aborted_signal");
+						return;
+					}
+					if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+						skip("generation_changed");
+						return;
+					}
+					if (
+						inheritedAdmission &&
+						!this.#isCurrentPromptAdmission(
+							inheritedAdmission,
+							scheduledGeneration ?? inheritedAdmission.generation ?? this.#promptGeneration,
+						)
+					) {
+						skip("generation_changed");
+						return;
+					}
+					if (options?.shouldContinue && !options.shouldContinue()) {
+						skip("queue_drained");
+						return;
+					}
+					if (!options?.skipRetryFallbackRestore) {
+						await this.#maybeRestoreRetryFallbackPrimary();
+					}
 					if (!options?.skipCompactionCheck) {
 						await this.#checkEstimatedContextBeforePrompt();
 					}
@@ -2989,22 +3357,112 @@ export class AgentSession {
 						skip("queue_drained");
 						return;
 					}
+					if (
+						reservedAdmission &&
+						!this.#isCurrentPromptAdmissionOwner(
+							reservedAdmission,
+							reservedAdmission.generation ?? this.#promptGeneration,
+						)
+					) {
+						skip("aborted_signal");
+						return;
+					}
+					if (reservedAdmission) {
+						this.#beginInFlight(reservedAdmission);
+						reservedInFlight = true;
+					}
+					options?.beforeContinue?.();
 					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
 					try {
-						await this.agent.continue();
+						const continuation = this.agent.continue();
+						if (reservedAdmission) {
+							this.#clearPendingPromptAdmissionClaim(reservedAdmission);
+						}
+						await continuation;
 					} catch (error) {
 						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 						throw error;
 					}
 				} catch (error) {
+					if (reservedAdmission && isPromptPreflightCancelledError(error)) {
+						skip("aborted_signal");
+						return;
+					}
 					fail(error);
+					if (options?.propagateError) throw error;
+				} finally {
+					if (reservedAdmission) {
+						if (reservedInFlight) this.#endInFlight(reservedAdmission);
+						this.#releaseAdmission(reservedAdmission);
+					}
 				}
 			},
 			{
 				delayMs: options?.delayMs,
-				onSkip: () => skip("aborted_signal"),
+				onSkip: () => {
+					if (reservedAdmission) this.#releaseAdmission(reservedAdmission);
+					skip("aborted_signal");
+				},
 			},
 		);
+	}
+
+	#scheduleQueuedMessageContinuation(reservedAdmission?: SessionAdmissionNode): boolean {
+		if (this.#scheduledQueuedMessageContinuation) return false;
+		const pendingAdmission = reservedAdmission ? undefined : this.#getPendingPromptAdmission();
+		if (pendingAdmission) {
+			pendingAdmission.continuesQueuedMessages = true;
+			return true;
+		}
+		let scheduled: Promise<void> | undefined;
+		scheduled = this.#scheduleAgentContinue({
+			reservedAdmission,
+			beforeContinue: () => {
+				if (this.#scheduledQueuedMessageContinuation === scheduled) {
+					this.#scheduledQueuedMessageContinuation = undefined;
+				}
+			},
+			shouldContinue: () =>
+				(this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering()) ||
+				(this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()),
+		});
+		this.#scheduledQueuedMessageContinuation = scheduled;
+		void scheduled
+			.finally(() => {
+				if (this.#scheduledQueuedMessageContinuation === scheduled) {
+					this.#scheduledQueuedMessageContinuation = undefined;
+				}
+			})
+			.catch(() => {});
+		return true;
+	}
+
+	#activateQueuedMessageContinuationAdmissions(): void {
+		for (const admission of this.#queuedMessageContinuationAdmissions) {
+			this.#queuedMessageContinuationAdmissions.delete(admission);
+			if (
+				this.#admissionLaneClosed ||
+				admission.state === "cancelled" ||
+				admission.state === "released" ||
+				admission.generation !== this.#promptGeneration
+			) {
+				this.#cancelQueuedMessageContinuationAdmission(admission);
+				continue;
+			}
+			if (!this.#scheduleQueuedMessageContinuation(admission)) {
+				this.#cancelQueuedMessageContinuationAdmission(admission);
+			}
+		}
+	}
+
+	#cancelQueuedMessageContinuationAdmission(admission: SessionAdmissionNode): void {
+		if (admission.state === "queued") {
+			admission.state = "cancelled";
+			this.#clearPendingPromptAdmissionClaim(admission);
+			this.#pumpAdmissionQueue();
+			return;
+		}
+		this.#releaseAdmission(admission);
 	}
 
 	#logCompactionContinuationSkipped(
@@ -3046,11 +3504,13 @@ export class AgentSession {
 	}
 
 	#scheduleOverflowRetryContinuation(generation: number): void {
+		const inheritedAdmission = this.#getCurrentPromptAdmission(generation);
 		this.#stripOverflowFailedTurnForRetry();
 		if (this.#isResumableAgentTail()) {
 			this.#scheduleAgentContinue({
 				delayMs: 100,
 				generation,
+				inheritedAdmission,
 				suppressPredecessorAgentEnd: true,
 
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
@@ -3070,21 +3530,47 @@ export class AgentSession {
 
 	#scheduleAutoContinuePrompt(generation: number): void {
 		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
+		const inheritedAdmission = this.#getCurrentPromptAdmission(generation);
 		const continuePrompt = async () => {
-			await this.#promptWithMessage(
-				{
-					role: "developer",
-					content: [{ type: "text", text: autoContinuePrompt }],
-					attribution: "agent",
-					timestamp: Date.now(),
-				},
-				autoContinuePrompt,
-				{
-					skipPostPromptRecoveryWait: true,
-					skipCompactionCheck: true,
-					predecessorAgentEndHold,
-				},
-			);
+			if (inheritedAdmission) {
+				if (!this.#isCurrentPromptAdmission(inheritedAdmission, generation)) {
+					throw new AgentBusyError();
+				}
+				await this.#promptWithMessage(
+					inheritedAdmission,
+					{
+						role: "developer",
+						content: [{ type: "text", text: autoContinuePrompt }],
+						attribution: "agent",
+						timestamp: Date.now(),
+					},
+					autoContinuePrompt,
+					{
+						skipPostPromptRecoveryWait: true,
+						skipCompactionCheck: true,
+						predecessorAgentEndHold,
+						reuseAdmission: { generation, mode: "continuation" },
+					},
+				);
+				return;
+			}
+			await this.#runWithPromptAdmission(async admission => {
+				await this.#promptWithMessage(
+					admission,
+					{
+						role: "developer",
+						content: [{ type: "text", text: autoContinuePrompt }],
+						attribution: "agent",
+						timestamp: Date.now(),
+					},
+					autoContinuePrompt,
+					{
+						skipPostPromptRecoveryWait: true,
+						skipCompactionCheck: true,
+						predecessorAgentEndHold,
+					},
+				);
+			});
 		};
 		const scheduledGeneration = generation;
 		const signal = this.#postPromptTasksAbortController.signal;
@@ -3146,6 +3632,7 @@ export class AgentSession {
 	 */
 	async #waitForPostPromptRecovery(): Promise<void> {
 		while (true) {
+			await this.#waitForAgentEventHandlersToStabilize();
 			if (this.#retryPromise) {
 				await this.#retryPromise;
 				continue;
@@ -4028,15 +4515,42 @@ export class AgentSession {
 	 * Remove all listeners, flush pending writes, and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	async dispose(): Promise<void> {
+	dispose(): Promise<void> {
+		if (this.#disposePromise) {
+			const callbackOrigin = this.#disposeCallbackOriginStorage.getStore();
+			if (callbackOrigin?.active && callbackOrigin.token === this.#disposeCallbackOriginToken) {
+				return Promise.resolve();
+			}
+			return this.#disposePromise;
+		}
 		this.#isDisposed = true;
+		this.#closeAdmissionLane();
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#disposePromise = this.#dispose();
+		return this.#disposePromise;
+	}
+
+	async #dispose(): Promise<void> {
+		await this.#defaultModelSelectionSideEffectsSettled;
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
 		this.agent.setOnBeforeYield(undefined);
 		this.#evalExecutionDisposing = true;
 		try {
-			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
-				await this.#extensionRunner.emit({ type: "session_shutdown" });
+			const extensionRunner = this.#extensionRunner;
+			if (extensionRunner?.hasHandlers("session_shutdown")) {
+				await extensionRunner.emit({ type: "session_shutdown" }, async invoke => {
+					const callbackOrigin: DisposeCallbackOriginMarker = {
+						token: this.#disposeCallbackOriginToken,
+						active: true,
+					};
+					try {
+						return await this.#disposeCallbackOriginStorage.run(callbackOrigin, invoke);
+					} finally {
+						callbackOrigin.active = false;
+					}
+				});
 			}
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
@@ -5281,7 +5795,11 @@ export class AgentSession {
 		if (!canContinuePersistedHistory(this.agent.state.messages)) {
 			throw new Error("Cannot continue from persisted message history");
 		}
-		await this.agent.continue();
+		await this.#scheduleAgentContinue({
+			skipCompactionCheck: true,
+			skipRetryFallbackRestore: true,
+			propagateError: true,
+		});
 	}
 
 	buildDisplaySessionContext(): SessionContext {
@@ -5931,45 +6449,51 @@ export class AgentSession {
 			return;
 		}
 
-		if (workflowIntentDiff) {
-			this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-		}
+		await this.#runWithPromptAdmission(async admission => {
+			// Skip eager todo prelude when the user has already queued a directive
+			const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+			const eagerTodoPrelude =
+				!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
 
-		// Skip eager todo prelude when the user has already queued a directive
-		const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
-		const eagerTodoPrelude =
-			!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
+			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+			if (options?.images) {
+				userContent.push(...options.images);
+			}
 
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-		if (options?.images) {
-			userContent.push(...options.images);
-		}
+			const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+			const message = options?.synthetic
+				? {
+						role: "developer" as const,
+						content: userContent,
+						attribution: promptAttribution,
+						timestamp: Date.now(),
+					}
+				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+			await this.refreshGjcSubskillTools();
 
-		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-		const message = options?.synthetic
-			? { role: "developer" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() }
-			: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
-		await this.refreshGjcSubskillTools();
+			if (eagerTodoPrelude?.toolChoice) {
+				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
+					label: "eager-todo",
+				});
+			}
 
-		if (eagerTodoPrelude?.toolChoice) {
-			this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
-				label: "eager-todo",
-			});
-		}
-
-		try {
-			await this.#promptWithMessage(message, expandedText, {
-				...options,
-				prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
-			});
-		} finally {
-			// Clean up residual eager-todo directive if the prompt never consumed it
-			// (e.g., compaction aborted, validation failed).
-			this.#toolChoiceQueue.removeByLabel("eager-todo");
-		}
-		if (!options?.synthetic) {
-			await this.#enforcePlanModeToolDecision();
-		}
+			try {
+				await this.#promptWithMessage(admission, message, expandedText, {
+					...options,
+					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
+					workflowIntentDiff,
+				});
+			} finally {
+				// Clean up residual eager-todo directive if the prompt never consumed it
+				// (e.g., compaction aborted, validation failed).
+				this.#toolChoiceQueue.removeByLabel("eager-todo");
+			}
+			if (!options?.synthetic) {
+				const generation = admission.generation;
+				if (generation === undefined) throw new AgentBusyError();
+				await this.#enforcePlanModeToolDecision(admission, generation);
+			}
+		}, options?.onPreflightAccepted !== undefined);
 	}
 
 	async #syncSkillPromptActiveState(
@@ -6070,28 +6594,47 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		await this.#syncSkillPromptActiveStateSafely(customMessage, true);
-		try {
-			await this.#promptWithMessage(customMessage, textContent, options);
-		} finally {
-			await this.#syncSkillPromptActiveStateSafely(customMessage, false);
-		}
+		await this.#runWithPromptAdmission(async admission => {
+			await this.#syncSkillPromptActiveStateSafely(customMessage, true);
+			try {
+				await this.#promptWithMessage(admission, customMessage, textContent, options);
+			} finally {
+				await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+			}
+		});
 	}
 
 	async #promptWithMessage(
+		admission: SessionAdmissionNode,
 		message: AgentMessage,
 		expandedText: string,
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
+			workflowIntentDiff?: WorkflowIntentDiff | null;
+			reuseAdmission?: PromptAdmissionReuse;
 		},
 	): Promise<void> {
-		this.#beginInFlight();
+		const reuseAdmission = options?.reuseAdmission;
+		const generation = reuseAdmission?.generation ?? admission.generation ?? this.#promptGeneration;
+		let ownsInFlightSegment = false;
+		if (reuseAdmission) {
+			if (!this.#isCurrentPromptAdmissionOwner(admission, generation)) throw new AgentBusyError();
+			if (reuseAdmission.mode === "continuation") {
+				if (!admission.inFlight) throw new AgentBusyError();
+			} else {
+				if (admission.inFlight) throw new AgentBusyError();
+				this.#beginInFlight(admission);
+				ownsInFlightSegment = true;
+			}
+		} else {
+			this.#beginInFlight(admission);
+			ownsInFlightSegment = true;
+		}
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
-		const generation = this.#promptGeneration;
-		const preflightSignal = this.#promptPreflightAbortController.signal;
+		const preflightSignal = admission.signal ?? this.#promptPreflightAbortController.signal;
 
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		try {
@@ -6209,11 +6752,14 @@ export class AgentSession {
 
 			// Emit before_agent_start extension event. Race hook completion with prompt
 			// cancellation so a wedged hook cannot retain SDK prompt authority.
-			if (this.#extensionRunner) {
-				const result = await this.#awaitPromptPreflight(
-					generation,
-					preflightSignal,
-					this.#extensionRunner.emitBeforeAgentStart(expandedText, options?.images, beforeAgentStartSystemPrompt),
+			const extensionRunner = this.#extensionRunner;
+			if (extensionRunner) {
+				const result = await this.#runInPromptCallbackFrame(() =>
+					this.#awaitPromptPreflight(
+						generation,
+						preflightSignal,
+						extensionRunner.emitBeforeAgentStart(expandedText, options?.images, beforeAgentStartSystemPrompt),
+					),
 				);
 				if (result?.messages) {
 					this.#appendBeforeAgentStartCustomMessages(messages, result.messages, promptAttribution, message.role);
@@ -6232,25 +6778,28 @@ export class AgentSession {
 			// alongside the extension runner (not via user-loaded hooks) and append
 			// through the same custom-message attribution path. Errors are nonfatal.
 			if (this.#beforeAgentStartContributors.length > 0) {
-				const contributed: BeforeAgentStartInternalMessage[] = [];
-				for (const contributor of this.#beforeAgentStartContributors) {
-					try {
-						const msg = await this.#awaitPromptPreflight(
-							generation,
-							preflightSignal,
-							contributor({
-								prompt: expandedText,
-								images: options?.images,
-								sessionId: this.sessionId,
-							}),
-						);
-						if (msg) contributed.push(msg);
-					} catch (err) {
-						if (this.#isPromptPreflightCancelled(generation, preflightSignal))
-							throw promptPreflightCancelledError();
-						logger.debug("before_agent_start contributor failed", { error: String(err) });
+				const contributed = await this.#runInPromptCallbackFrame(async () => {
+					const messages: BeforeAgentStartInternalMessage[] = [];
+					for (const contributor of this.#beforeAgentStartContributors) {
+						try {
+							const msg = await this.#awaitPromptPreflight(
+								generation,
+								preflightSignal,
+								contributor({
+									prompt: expandedText,
+									images: options?.images,
+									sessionId: this.sessionId,
+								}),
+							);
+							if (msg) messages.push(msg);
+						} catch (err) {
+							if (this.#isPromptPreflightCancelled(generation, preflightSignal))
+								throw promptPreflightCancelledError();
+							logger.debug("before_agent_start contributor failed", { error: String(err) });
+						}
 					}
-				}
+					return messages;
+				});
 				this.#appendBeforeAgentStartCustomMessages(messages, contributed, promptAttribution, message.role);
 			}
 
@@ -6265,9 +6814,31 @@ export class AgentSession {
 			}
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
+			if (options?.workflowIntentDiff) {
+				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, options.workflowIntentDiff);
+			}
 			options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
-			await this.#promptAgentWithIdleRetry(messages, agentPromptOptions, predecessorAgentEndHold);
+			if (
+				options?.onPreflightAccepted &&
+				(!this.#isCurrentPromptAdmission(admission, generation) ||
+					this.#isPromptPreflightCancelled(generation, preflightSignal))
+			) {
+				this.#resetInjectedContextSignatures();
+				throw promptPreflightCancelledError();
+			}
+			await this.#promptAgentWithIdleRetry(
+				messages,
+				agentPromptOptions,
+				() => this.#clearPendingPromptAdmissionClaim(admission),
+				predecessorAgentEndHold,
+				() => {
+					this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+					if (!this.#isCurrentPromptAdmission(admission, generation)) {
+						throw promptPreflightCancelledError();
+					}
+				},
+			);
 			const terminalAssistant = this.#findLastAssistantMessage();
 			if (
 				rosterClaim &&
@@ -6296,7 +6867,7 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			this.#endInFlight();
+			if (ownsInFlightSegment) this.#endInFlight(admission);
 		}
 	}
 
@@ -6539,9 +7110,7 @@ export class AgentSession {
 		// continue so the steer is delivered promptly. A live loop (or an
 		// already-drained queue) makes the scheduled continue a no-op.
 		if (this.#canAutoContinueForSteer()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
-			});
+			this.#scheduleQueuedMessageContinuation();
 		}
 	}
 
@@ -6574,9 +7143,7 @@ export class AgentSession {
 		// resuming from user/toolResult state runs an extra model call on the
 		// stale prompt before draining the queue.
 		if (this.#canAutoContinueForFollowUp()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
-			});
+			this.#scheduleQueuedMessageContinuation();
 		}
 	}
 
@@ -6618,6 +7185,7 @@ export class AgentSession {
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
+		const inheritedAdmission = this.#getCurrentPromptAdmission(generation);
 		if (this.#scheduledHiddenNextTurnGeneration === generation) {
 			return;
 		}
@@ -6631,7 +7199,7 @@ export class AgentSession {
 					return;
 				}
 				try {
-					await this.#promptQueuedHiddenNextTurnMessages();
+					await this.#promptQueuedHiddenNextTurnMessages(inheritedAdmission, generation);
 				} catch {
 					// Leave the hidden next-turn messages queued for the next explicit prompt.
 				}
@@ -6647,32 +7215,42 @@ export class AgentSession {
 		);
 	}
 
-	async #promptQueuedHiddenNextTurnMessages(): Promise<void> {
+	async #promptQueuedHiddenNextTurnMessages(
+		inheritedAdmission?: SessionAdmissionNode,
+		generation?: number,
+	): Promise<void> {
 		if (this.#pendingNextTurnMessages.length === 0) {
 			return;
 		}
 
-		const queuedMessages = [...this.#pendingNextTurnMessages];
-		this.#pendingNextTurnMessages = [];
-		const message = queuedMessages[queuedMessages.length - 1];
-		if (!message) {
+		const promptQueuedMessages = async (admission: SessionAdmissionNode, reuseAdmission?: PromptAdmissionReuse) => {
+			const queuedMessages = [...this.#pendingNextTurnMessages];
+			this.#pendingNextTurnMessages = [];
+			const message = queuedMessages[queuedMessages.length - 1];
+			if (!message) return;
+
+			const prependMessages = queuedMessages.slice(0, -1);
+			const textContent = this.#getCustomMessageTextContent(message);
+			await this.#syncSkillPromptActiveStateSafely(message, true);
+			try {
+				await this.#promptWithMessage(admission, message, textContent, {
+					prependMessages,
+					skipPostPromptRecoveryWait: true,
+					reuseAdmission,
+				});
+			} catch (error) {
+				this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
+				throw error;
+			} finally {
+				await this.#syncSkillPromptActiveStateSafely(message, false);
+			}
+		};
+
+		if (inheritedAdmission && generation !== undefined) {
+			await promptQueuedMessages(inheritedAdmission, { generation, mode: "continuation" });
 			return;
 		}
-
-		const prependMessages = queuedMessages.slice(0, -1);
-		const textContent = this.#getCustomMessageTextContent(message);
-		await this.#syncSkillPromptActiveStateSafely(message, true);
-		try {
-			await this.#promptWithMessage(message, textContent, {
-				prependMessages,
-				skipPostPromptRecoveryWait: true,
-			});
-		} catch (error) {
-			this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
-			throw error;
-		} finally {
-			await this.#syncSkillPromptActiveStateSafely(message, false);
-		}
+		await this.#runWithPromptAdmission(admission => promptQueuedMessages(admission));
 	}
 
 	#getCustomMessageTextContent(message: Pick<CustomMessage, "content">): string {
@@ -6750,14 +7328,16 @@ export class AgentSession {
 					this.#queueHiddenNextTurnMessage(appMessage, false);
 					return;
 				}
-				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
-				try {
-					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
-						skipPostPromptRecoveryWait: true,
-					});
-				} finally {
-					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
-				}
+				await this.#runWithPromptAdmission(async admission => {
+					await this.#syncSkillPromptActiveStateSafely(appMessage, true);
+					try {
+						await this.#promptWithMessage(admission, appMessage, this.#getCustomMessageTextContent(appMessage), {
+							skipPostPromptRecoveryWait: true,
+						});
+					} finally {
+						await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+					}
+				});
 				return;
 			}
 			this.agent.appendMessage(appMessage);
@@ -6777,14 +7357,16 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(appMessage, false);
 				return;
 			}
-			await this.#syncSkillPromptActiveStateSafely(appMessage, true);
-			try {
-				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
-					skipPostPromptRecoveryWait: true,
-				});
-			} finally {
-				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
-			}
+			await this.#runWithPromptAdmission(async admission => {
+				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
+				try {
+					await this.#promptWithMessage(admission, appMessage, this.#getCustomMessageTextContent(appMessage), {
+						skipPostPromptRecoveryWait: true,
+					});
+				} finally {
+					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+				}
+			});
 			return;
 		}
 
@@ -7180,6 +7762,7 @@ export class AgentSession {
 				throw outcome.error;
 			}
 		}
+		this.#activateQueuedMessageContinuationAdmissions();
 		await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
 		// waitForIdle resolves before #promptWithMessage's finally and asynchronous
 		// event handlers necessarily unwind. Keep their counters intact: #endInFlight
@@ -7552,10 +8135,10 @@ export class AgentSession {
 	async #throwDefaultModelSelectionRecovery(
 		error: Error,
 		stage: DefaultModelSelectionStage,
-		commit: GlobalDefaultModelRoleCommit,
+		commit?: GlobalDefaultModelRoleCommit,
 	): Promise<never> {
 		const sessionFailure = await this.#discardDefaultModelSelectionStage(stage);
-		const durableFailure = await this.#restoreDefaultModelSelectionCommit(commit);
+		const durableFailure = commit ? await this.#restoreDefaultModelSelectionCommit(commit) : undefined;
 		const failures = [sessionFailure, durableFailure].filter(
 			(failure): failure is { readonly stage: DefaultModelSelectionRollbackStage; readonly message: string } =>
 				failure !== undefined,
@@ -7603,15 +8186,20 @@ export class AgentSession {
 		model: Model,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<DefaultModelSelectionResult> {
-		const predecessor = this.#defaultModelSelectionTail;
-		const transaction = Promise.withResolvers<void>();
-		this.#defaultModelSelectionTail = transaction.promise;
+		const callbackOrigin = this.#promptCallbackOriginStorage.getStore();
+		if (callbackOrigin?.active && callbackOrigin.token === this.#promptCallbackOriginToken) {
+			throw new AgentBusyError("Default model selection cannot run from a prompt callback in the same session.");
+		}
+		const admission = this.#enqueueSelectionAdmission();
 		try {
-			await predecessor;
+			await admission.admitted.promise;
+			this.#throwIfSelectionAdmissionInactive(admission);
 			if (thinkingLevel === ThinkingLevel.Inherit) {
 				throw new Error("Default model selection cannot inherit a thinking level");
 			}
+			this.#throwIfSelectionAdmissionInactive(admission);
 			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			this.#throwIfSelectionAdmissionInactive(admission);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
 			}
@@ -7620,65 +8208,99 @@ export class AgentSession {
 				resolvedLevel ??
 				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
 				ThinkingLevel.Off;
-			await this.waitForIdle();
+			await this.agent.waitForIdle();
+			this.#throwIfSelectionAdmissionInactive(admission);
 			await this.sessionManager.flush();
+			this.#throwIfSelectionAdmissionInactive(admission);
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
+			this.#throwIfSelectionAdmissionInactive(admission);
 			const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
 			const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
-			const stage = await this.sessionManager.stageDefaultModelSelection(
-				`${model.provider}/${model.id}`,
-				effectiveLevel,
-				{ appendThinkingLevel: true },
-			);
-			let durableCommit: GlobalDefaultModelRoleCommit;
+			this.#throwIfSelectionAdmissionInactive(admission);
+			const sideEffectsSettled = Promise.withResolvers<void>();
+			this.#defaultModelSelectionSideEffectsSettled = sideEffectsSettled.promise;
+			let stage: DefaultModelSelectionStage | undefined;
+			let durableCommit: GlobalDefaultModelRoleCommit | undefined;
 			try {
-				durableCommit = await this.settings.setGlobalModelRoleAndFlush(
-					"default",
-					formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+				stage = await this.sessionManager.stageDefaultModelSelection(
+					`${model.provider}/${model.id}`,
+					effectiveLevel,
+					{ appendThinkingLevel: true },
 				);
-			} catch (error) {
-				await this.sessionManager.discardDefaultModelSelectionStage(stage);
-				throw error;
-			}
-			if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
-				await this.#throwDefaultModelSelectionRecovery(
-					new Error("Default model selection was superseded before session promotion"),
-					stage,
-					durableCommit,
-				);
-			}
-			const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
-			switch (promotion.kind) {
-				case "promoted": {
-					this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
-					break;
+				this.#throwIfSelectionAdmissionInactive(admission);
+				try {
+					this.#throwIfSelectionAdmissionInactive(admission);
+					durableCommit = await this.settings.setGlobalModelRoleAndFlush(
+						"default",
+						formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel),
+					);
+				} catch (error) {
+					if (this.#admissionLaneClosed) {
+						await this.#throwDefaultModelSelectionRecovery(
+							error instanceof Error ? error : new Error(String(error)),
+							stage,
+						);
+					}
+					await this.sessionManager.discardDefaultModelSelectionStage(stage);
+					throw error;
 				}
-				case "not_promoted": {
-					return this.#throwDefaultModelSelectionRecovery(
-						promotion.error ?? new Error("Default model selection was superseded before session promotion"),
+				this.#throwIfSelectionAdmissionInactive(admission);
+				if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
+					await this.#throwDefaultModelSelectionRecovery(
+						new Error("Default model selection was superseded before session promotion"),
 						stage,
 						durableCommit,
 					);
 				}
-				case "unknown": {
-					const message = "Session replacement outcome could not be determined.";
-					throw new DefaultModelSelectionRecoveryError(message, {
-						message,
-						rollback: {
-							disposition: "unknown",
-							failures: [
-								{
-									stage: "session",
-									message: "Session replacement outcome could not be determined.",
-								},
-							],
-						},
-					});
+				this.#throwIfSelectionAdmissionInactive(admission);
+				const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+				switch (promotion.kind) {
+					case "promoted": {
+						this.#throwIfSelectionAdmissionInactive(admission);
+						this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
+						break;
+					}
+					case "not_promoted": {
+						return await this.#throwDefaultModelSelectionRecovery(
+							promotion.error ?? new Error("Default model selection was superseded before session promotion"),
+							stage,
+							durableCommit,
+						);
+					}
+					case "unknown": {
+						const message = "Session replacement outcome could not be determined.";
+						throw new DefaultModelSelectionRecoveryError(message, {
+							message,
+							rollback: {
+								disposition: "unknown",
+								failures: [
+									{
+										stage: "session",
+										message: "Session replacement outcome could not be determined.",
+									},
+								],
+							},
+						});
+					}
+				}
+			} catch (error) {
+				if (this.#admissionLaneClosed && stage && !(error instanceof DefaultModelSelectionRecoveryError)) {
+					await this.#throwDefaultModelSelectionRecovery(
+						error instanceof Error ? error : new Error(String(error)),
+						stage,
+						durableCommit,
+					);
+				}
+				throw error;
+			} finally {
+				sideEffectsSettled.resolve();
+				if (this.#defaultModelSelectionSideEffectsSettled === sideEffectsSettled.promise) {
+					this.#defaultModelSelectionSideEffectsSettled = undefined;
 				}
 			}
 			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
 		} finally {
-			transaction.resolve();
+			this.#releaseAdmission(admission);
 		}
 	}
 	/**
@@ -8793,7 +9415,7 @@ export class AgentSession {
 		this.#checkpointState = undefined;
 		this.#pendingRewindReport = undefined;
 	}
-	async #enforcePlanModeToolDecision(): Promise<void> {
+	async #enforcePlanModeToolDecision(admission: SessionAdmissionNode, generation: number): Promise<void> {
 		if (!this.#planModeState?.enabled) {
 			return;
 		}
@@ -8823,11 +9445,18 @@ export class AgentSession {
 			askToolName: "ask",
 		});
 
-		await this.prompt(reminder, {
-			synthetic: true,
-			expandPromptTemplates: false,
-			toolChoice: "required",
-		});
+		await this.refreshGjcSubskillTools();
+		await this.#promptWithMessage(
+			admission,
+			{
+				role: "developer",
+				content: [{ type: "text", text: reminder }],
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+			reminder,
+			{ toolChoice: "required", reuseAdmission: { generation, mode: "sequential" } },
+		);
 	}
 
 	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
@@ -10596,6 +11225,7 @@ export class AgentSession {
 		this.#scheduleAgentContinue({
 			delayMs: 1,
 			generation,
+			inheritedAdmission: this.#getCurrentPromptAdmission(generation),
 			onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
 			onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
 		});
@@ -10647,19 +11277,25 @@ export class AgentSession {
 
 	async #promptAgentWithIdleRetry(
 		messages: AgentMessage[],
-		options?: { toolChoice?: ToolChoice },
+		options: { toolChoice?: ToolChoice } | undefined,
+		onStarted: () => void,
 		predecessorAgentEndHold?: symbol,
+		assertCanStart?: () => void,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
 		let continuationHold = predecessorAgentEndHold;
 		for (;;) {
 			try {
+				assertCanStart?.();
 				const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(
 					continuationHold ?? this.#reserveDeferredAgentEndForContinuation(),
 				);
 				continuationHold = undefined;
 				try {
-					await this.agent.prompt(messages, options);
+					const wasStreaming = this.agent.state.isStreaming;
+					const prompt = this.agent.prompt(messages, options);
+					if (!wasStreaming && this.agent.state.isStreaming) onStarted();
+					await prompt;
 					return;
 				} catch (error) {
 					this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
@@ -10673,6 +11309,7 @@ export class AgentSession {
 					throw new Error("Timed out waiting for prior agent run to finish before prompting.");
 				}
 				await this.agent.waitForIdle();
+				assertCanStart?.();
 			}
 		}
 	}
@@ -10718,34 +11355,43 @@ export class AgentSession {
 	 * @returns true if retry/resume was initiated, false if no retryable tail exists or agent is busy
 	 */
 	async retry(): Promise<boolean> {
-		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
+		if (this.#admissionLaneClosed || this.isStreaming || this.isCompacting || this.isRetrying) return false;
 
 		const messages = this.agent.state.messages;
 		const lastMsg = messages[messages.length - 1];
 		if (!lastMsg) return false;
 
+		let dropAssistant = false;
 		if (lastMsg.role !== "assistant") {
 			if (!this.#isInterruptedRetryTail(lastMsg)) return false;
-			this.#retryAttempt = 0;
-			this.#scheduleAgentContinue({ delayMs: 1 });
-			return true;
+		} else {
+			const assistantMsg = lastMsg as AssistantMessage;
+			dropAssistant =
+				assistantMsg.stopReason === "error" ||
+				assistantMsg.stopReason === "aborted" ||
+				this.#isUnresolvedToolUseAssistant(assistantMsg);
+			if (!dropAssistant) return false;
 		}
 
-		const assistantMsg = lastMsg as AssistantMessage;
-		const shouldDropAssistant =
-			assistantMsg.stopReason === "error" ||
-			assistantMsg.stopReason === "aborted" ||
-			this.#isUnresolvedToolUseAssistant(assistantMsg);
-		if (!shouldDropAssistant) return false;
+		let reservedAdmission: SessionAdmissionNode;
+		try {
+			reservedAdmission = this.#enqueuePromptAdmission();
+		} catch (error) {
+			if (error instanceof AgentBusyError) return false;
+			throw error;
+		}
+		void reservedAdmission.admitted.promise.catch(() => {});
+		if (dropAssistant) {
+			this.agent.replaceMessages(messages.slice(0, -1));
+		}
 
-		// Remove the failed/aborted/incomplete assistant message before re-attempting.
-		this.agent.replaceMessages(messages.slice(0, -1));
-
-		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
-
-		// Re-attempt the turn
-		this.#scheduleAgentContinue({ delayMs: 1 });
+		this.#scheduleAgentContinue({
+			delayMs: 1,
+			reservedAdmission,
+			beforeContinue: () => {
+				this.#retryAttempt = 0;
+			},
+		});
 
 		return true;
 	}
