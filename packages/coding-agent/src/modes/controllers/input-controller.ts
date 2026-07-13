@@ -1155,6 +1155,23 @@ export class InputController {
 		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
 			return;
 		}
+		// Editor submit resets the composer and emits onChange("") before onSubmit(result).
+		// Defer the empty-buffer clear so the submit handler can still resolve image
+		// placeholders against pendingImages, while manual clears still drop stale images.
+		if (text.length === 0) {
+			const pendingImages = this.ctx.pendingImages;
+			const pendingImageCount = pendingImages.length;
+			queueMicrotask(() => {
+				if (
+					this.ctx.pendingImages === pendingImages &&
+					pendingImages.length === pendingImageCount &&
+					this.ctx.editor.getText().length === 0
+				) {
+					this.ctx.pendingImages = [];
+				}
+			});
+			return;
+		}
 		this.ctx.pendingImages = [];
 	}
 

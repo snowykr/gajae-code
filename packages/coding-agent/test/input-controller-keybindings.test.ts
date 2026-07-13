@@ -693,6 +693,55 @@ describe("InputController keybinding setup", () => {
 		});
 		expect(ctx.pendingImages).toEqual([]);
 	});
+	it("keeps pasted clipboard images when submit reset fires before the submit callback", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.setText("describe [image 1]");
+		editor.setText("");
+		editor.onChange?.("");
+		await editor.onSubmit?.("describe [image 1]");
+
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+			text: "describe [image 1]",
+			images: [image],
+		});
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe [image 1]",
+			images: [image],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("still clears pending images after the composer is manually emptied", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		editor.setText("");
+		editor.onChange?.("");
+		expect(ctx.pendingImages).toEqual([image]);
+
+		await Promise.resolve();
+
+		expect(ctx.pendingImages).toEqual([]);
+	});
 
 	it("marks streaming follow-up submissions as local", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
