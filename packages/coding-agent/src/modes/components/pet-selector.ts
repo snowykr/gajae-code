@@ -1,4 +1,4 @@
-import { Container, PET_SKIN_IDS, PET_SKINS, SelectList } from "@gajae-code/tui";
+import { Container, PET_SKIN_IDS, PET_SKINS, type SelectList } from "@gajae-code/tui";
 import { FramedSelect } from "./chrome";
 import type { PetMode } from "./gajae-pet-widget";
 import { createPetSelectItems } from "./pet-capability";

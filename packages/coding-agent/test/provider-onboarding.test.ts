@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { YAML } from "bun";
 import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { parseSetupArgs } from "../src/cli/setup-cli";
+import { SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import {
 	addApiCompatibleProvider,
 	findProviderPreset,
@@ -14,7 +15,6 @@ import {
 	parseProviderCompatibility,
 	redactSecret,
 } from "../src/setup/provider-onboarding";
-import { SqliteAuthCredentialStore } from "../src/session/auth-storage";
 
 let tempRoot: string | undefined;
 const originalAgentDir = getAgentDir();
@@ -227,7 +227,10 @@ describe("provider onboarding setup core", () => {
 		expect(text).not.toContain("literal-secret");
 		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 		try {
-			expect(store.listAuthCredentials("literal-key-provider")[0]?.credential).toEqual({ type: "api_key", key: "literal-secret" });
+			expect(store.listAuthCredentials("literal-key-provider")[0]?.credential).toEqual({
+				type: "api_key",
+				key: "literal-secret",
+			});
 		} finally {
 			store.close();
 		}
@@ -248,7 +251,10 @@ describe("provider onboarding setup core", () => {
 
 		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 		try {
-			expect(store.listAuthCredentials("custom-path-provider")[0]?.credential).toEqual({ type: "api_key", key: "custom-path-secret" });
+			expect(store.listAuthCredentials("custom-path-provider")[0]?.credential).toEqual({
+				type: "api_key",
+				key: "custom-path-secret",
+			});
 		} finally {
 			store.close();
 		}

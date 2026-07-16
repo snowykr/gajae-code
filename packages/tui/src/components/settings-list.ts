@@ -120,7 +120,11 @@ export class SettingsList implements Component {
 		const endIndex = Math.min(startIndex + this.#maxVisible, this.#items.length);
 
 		// Calculate max label width for alignment
-		const maxLabelWidth = Math.min(30, Math.max(0, width - 12), Math.max(...this.#items.map(item => visibleWidth(item.label))));
+		const maxLabelWidth = Math.min(
+			30,
+			Math.max(0, width - 12),
+			Math.max(...this.#items.map(item => visibleWidth(item.label))),
+		);
 
 		// Render visible items
 		for (let i = startIndex; i < endIndex; i++) {
@@ -132,7 +136,9 @@ export class SettingsList implements Component {
 			const prefixWidth = visibleWidth(prefix);
 
 			// Pad label to align values
-			const labelPadded = truncateToWidth(item.label, maxLabelWidth, Ellipsis.Omit) + padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
+			const labelPadded =
+				truncateToWidth(item.label, maxLabelWidth, Ellipsis.Omit) +
+				padding(Math.max(0, maxLabelWidth - visibleWidth(item.label)));
 			const labelText = this.#theme.label(labelPadded, isSelected);
 
 			// Calculate space for value

@@ -5,7 +5,9 @@ import * as path from "node:path";
 import { KeybindingsManager } from "../src/config/keybindings";
 
 let tempDir: string | undefined;
-afterEach(async () => { if (tempDir) await fs.rm(tempDir, { recursive: true, force: true }); });
+afterEach(async () => {
+	if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+});
 
 describe("keybindings config", () => {
 	it("does not write back a malformed config", async () => {

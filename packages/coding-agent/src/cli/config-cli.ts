@@ -5,9 +5,9 @@
  * Uses the settings schema as the source of truth for available settings.
  */
 
-import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import chalk from "chalk";
 import {
@@ -449,7 +449,11 @@ function handlePath(): void {
 	console.log(getAgentDir());
 }
 
-type ConfigDoctorReport = { unknownKeys: string[]; invalidValues: Array<{ path: string; value: unknown }>; legacyShapes: string[] };
+type ConfigDoctorReport = {
+	unknownKeys: string[];
+	invalidValues: Array<{ path: string; value: unknown }>;
+	legacyShapes: string[];
+};
 
 function flattenConfig(value: unknown, prefix = ""): Array<[string, unknown]> {
 	if (prefix && ALL_SETTING_PATHS.includes(prefix as SettingPath)) return [[prefix, value]];
@@ -462,7 +466,9 @@ function matchesSettingType(path: SettingPath, value: unknown): boolean {
 	switch (definition.type) {
 		case "string":
 		case "enum":
-			return typeof value === "string" && (definition.type !== "enum" || getEnumValues(path)?.includes(value) === true);
+			return (
+				typeof value === "string" && (definition.type !== "enum" || getEnumValues(path)?.includes(value) === true)
+			);
 		case "number":
 			return typeof value === "number" && Number.isFinite(value);
 		case "boolean":
@@ -480,7 +486,9 @@ function isValidSettingValue(path: SettingPath, value: unknown): boolean {
 	return validate?.(value) ?? true;
 }
 
-export async function inspectConfigFile(configPath = path.join(getAgentDir(), "config.yml")): Promise<ConfigDoctorReport> {
+export async function inspectConfigFile(
+	configPath = path.join(getAgentDir(), "config.yml"),
+): Promise<ConfigDoctorReport> {
 	const report: ConfigDoctorReport = { unknownKeys: [], invalidValues: [], legacyShapes: [] };
 	try {
 		const raw = YAML.parse(await fs.readFile(configPath, "utf8"));
@@ -494,7 +502,8 @@ export async function inspectConfigFile(configPath = path.join(getAgentDir(), "c
 				report.invalidValues.push({ path: settingPath, value: redactConfigValue(settingPath, value) });
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") report.legacyShapes.push(`unable to parse config: ${String(error)}`);
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			report.legacyShapes.push(`unable to parse config: ${String(error)}`);
 	}
 	return report;
 }
@@ -504,7 +513,9 @@ async function handleDoctor(flags: { json?: boolean }): Promise<void> {
 	if (flags.json) console.log(JSON.stringify(report, null, 2));
 	else {
 		console.log(`Unknown keys: ${report.unknownKeys.length ? report.unknownKeys.join(", ") : "none"}`);
-		console.log(`Invalid values: ${report.invalidValues.length ? report.invalidValues.map(item => item.path).join(", ") : "none"}`);
+		console.log(
+			`Invalid values: ${report.invalidValues.length ? report.invalidValues.map(item => item.path).join(", ") : "none"}`,
+		);
 		console.log(`Legacy shapes: ${report.legacyShapes.length ? report.legacyShapes.join(", ") : "none"}`);
 	}
 }

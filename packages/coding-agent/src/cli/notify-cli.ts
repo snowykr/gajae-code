@@ -113,11 +113,14 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			"--slack-channel-id",
 			"--slack-authorized-user-id",
 		];
-		if (valueFlags.some(name => {
-			const index = rest.indexOf(name);
-			const value = index >= 0 ? rest[index + 1] : undefined;
-			return index >= 0 && (!value || value.startsWith("--"));
-		})) return undefined;
+		if (
+			valueFlags.some(name => {
+				const index = rest.indexOf(name);
+				const value = index >= 0 ? rest[index + 1] : undefined;
+				return index >= 0 && (!value || value.startsWith("--"));
+			})
+		)
+			return undefined;
 		const provider = rest[0]?.startsWith("--") ? undefined : rest[0];
 		if (provider !== undefined && provider !== "telegram" && provider !== "discord" && provider !== "slack") {
 			return undefined;
@@ -259,7 +262,12 @@ async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps):
 	const botToken = await promptSetupValue(cmd.discordBotToken, "--discord-bot-token", true, deps);
 	const applicationId = await promptSetupValue(cmd.discordApplicationId, "--discord-application-id", false, deps);
 	const guildId = await promptSetupValue(cmd.discordGuildId, "--discord-guild-id", false, deps);
-	const parentChannelId = await promptSetupValue(cmd.discordParentChannelId, "--discord-parent-channel-id", false, deps);
+	const parentChannelId = await promptSetupValue(
+		cmd.discordParentChannelId,
+		"--discord-parent-channel-id",
+		false,
+		deps,
+	);
 	const settings = await getSettings(deps);
 	const patches: SettingsAtomicPatch[] = [
 		{ path: "notifications.discord.botToken", op: "set", value: botToken },

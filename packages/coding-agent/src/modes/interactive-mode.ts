@@ -94,8 +94,8 @@ import {
 	isPetCapabilityProbePending,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
-import { StatusLineComponent } from "./components/tool-status-header";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import { StatusLineComponent } from "./components/tool-status-header";
 import {
 	WelcomeComponent,
 	type WelcomeLogoMode,

@@ -167,7 +167,13 @@ describe("SettingsList", () => {
 	});
 	it("shrinks labels and clamps values at 48 columns", () => {
 		const list = new SettingsList(
-			[{ id: "long", label: "A setting label that exceeds narrow terminals", currentValue: "a value that also exceeds narrow terminals" }],
+			[
+				{
+					id: "long",
+					label: "A setting label that exceeds narrow terminals",
+					currentValue: "a value that also exceeds narrow terminals",
+				},
+			],
 			5,
 			testTheme,
 			() => {},
