@@ -11111,8 +11111,8 @@ export class AgentSession {
 	/**
 	 * Ordered retry classification: typed safety stop (surface) -> legacy safety stop
 	 * (surface) -> overflow (compaction) -> terminal (surface) -> usage_limit
-	 * (rotation) -> first_event_timeout (bounded retry) -> transient (retry) ->
-	 * unknown (retry).
+	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry) ->
+	 * unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
@@ -11123,8 +11123,8 @@ export class AgentSession {
 		// "sensitive") are deterministic for the submitted context: replaying
 		// the identical conversation re-triggers the identical refusal, so an
 		// auto-retry loop can never succeed and only re-bills the full context
-		// on every attempt (#1655). Surface immediately instead of joining the
-		// unbounded "unknown" retry class.
+		// on every attempt (#1655). Surface immediately instead of entering the
+		// bounded unknown retry class.
 		if (isLegacyProviderSafetyStopMessage(err)) return "terminal";
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
@@ -11480,12 +11480,14 @@ export class AgentSession {
 		// fail-closed behavior for generic provider errors. Explicit retry
 		// settings opt into the resilient legacy retry path.
 		if (!managedFallback && (!retrySettings.enabled || !legacyRetryConfigured)) return false;
+		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: attemptsUsed > retrySettings.maxRetries
-				? "exhausted"
-				: "retry";
+			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+				? "retry"
+				: "exhausted";
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
@@ -11506,15 +11508,13 @@ export class AgentSession {
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed, retryAfterMs)
-					: Math.min(
-							cappedExponentialWithFullJitter(
+					: retryAfterMs !== undefined
+						? Math.min(retryAfterMs, retrySettings.maxDelayMs)
+						: cappedExponentialWithFullJitter(
 								retrySettings.baseDelayMs,
 								retrySettings.maxDelayMs,
 								attemptsUsed,
-							),
-							retryAfterMs ?? Number.POSITIVE_INFINITY,
-						);
-
+							);
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
 			if (managedFallback) await this.#markFailedManagedCredential(trigger);
@@ -11562,7 +11562,7 @@ export class AgentSession {
 				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
-				unbounded: false,
+				unbounded: managedFallback ? false : legacyUnbounded,
 			});
 
 			const messages = this.agent.state.messages;

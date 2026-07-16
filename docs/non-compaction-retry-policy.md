@@ -59,8 +59,8 @@ Flow (`#handleRetryableError`):
 2. If `retry.enabled === false`, stop immediately (`false`, no retry started).
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
-5. If attempt exceeded `retry.maxRetries`, emit final failure event and stop.
-6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; a parsed retry-after can shorten, but never extend, that cap.
+5. Transient errors retry without an attempt limit; unknown/no-code errors stop after `retry.maxRetries`.
+6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; a parsed provider retry-after overrides computed backoff and is itself capped at `retry.maxDelayMs`.
 7. For usage-limit errors, parse retry hints and call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the capped backoff.
 8. If no credential switch occurred, advance an eligible ordered role-array fallback chain and force delay to `0` on a model switch. The selected fallback entry remains sticky across later user prompts.
 9. Emit `auto_retry_start`.
@@ -101,7 +101,7 @@ Backoff uses capped exponential full jitter. With default settings the maximum j
 - attempt 2: 4000 ms
 - attempt 3: 8000 ms
 
-`retry.maxDelayMs` caps every legacy session retry delay, including retry-after hints. Managed fallback may honor a larger typed Retry-After because it advances or retries within its separate per-entry budget.
+`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Legacy transient errors have unbounded attempts; unknown/no-code errors are bounded by `retry.maxRetries`. Managed fallback may honor a larger typed Retry-After because it advances or retries within its separate per-entry budget.
 
 ## Abort mechanics
 

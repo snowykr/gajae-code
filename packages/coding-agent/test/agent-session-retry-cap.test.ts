@@ -23,9 +23,9 @@ function lastAssistant(session: AgentSession): AssistantMessage {
 }
 
 /**
- * Contract: legacy transient and unknown errors have the same finite retry
- * budget as every other retry class. Exponential full-jitter delay and
- * provider retry hints are capped at `retry.maxDelayMs`.
+ * Contract: legacy transient retries have unbounded attempts with delays capped
+ * at `retry.maxDelayMs`; unknown errors use the finite retry budget. Provider
+ * retry hints take precedence over computed backoff and are capped at that maximum.
  */
 describe("AgentSession retry delay cap", () => {
 	let tempDir: TempDir;
@@ -104,11 +104,11 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Trigger rate limit with long retry-after");
 		await session.waitForIdle();
 
-		// The retry loop runs once and its delay is capped.
+		// The transient retry loop runs once and its delay is capped.
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
 		expect(retryStartEvents).toHaveLength(1);
-		expect(retryStartEvents[0].unbounded).toBe(false);
-		expect(retryStartEvents[0].delayMs).toBeLessThanOrEqual(100);
+		expect(retryStartEvents[0].unbounded).toBe(true);
+		expect(retryStartEvents[0].delayMs).toBe(100);
 		expect(waitSpy).toHaveBeenCalledWith(retryStartEvents[0].delayMs, expect.anything());
 		// Successful retry emits a success end event and recovers.
 		expect(retryEndEvents).toHaveLength(1);
