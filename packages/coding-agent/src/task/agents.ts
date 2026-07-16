@@ -9,6 +9,8 @@ import { parseAgentFields } from "../discovery/helpers";
 import architectMd from "../prompts/agents/architect.md" with { type: "text" };
 import criticMd from "../prompts/agents/critic.md" with { type: "text" };
 import executorMd from "../prompts/agents/executor.md" with { type: "text" };
+import ralplanPersistenceTemplate from "../prompts/agents/ralplan-persistence.md" with { type: "text" };
+import restrictedBashTemplate from "../prompts/agents/restricted-bash.md" with { type: "text" };
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
 import plannerMd from "../prompts/agents/planner.md" with { type: "text" };
 
@@ -34,7 +36,9 @@ interface EmbeddedAgentDef {
 }
 
 function buildAgentContent(def: EmbeddedAgentDef): string {
-	const body = prompt.render(def.template);
+	const restrictedBash = prompt.render(restrictedBashTemplate);
+	const ralplanPersistence = prompt.render(ralplanPersistenceTemplate, { stage: def.frontmatter?.name ?? "" });
+	const body = prompt.render(def.template, { restrictedBash, ralplanPersistence });
 	if (!def.frontmatter) return body;
 	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
 }
