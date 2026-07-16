@@ -1007,17 +1007,86 @@ function lifecycleCleanupPlan(
 	return { phase: "lifecycle", sessionId: id, metadataRoot: root, lifecycleFiles: files };
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
+	const directory = path.join(path.resolve(root), "sdk");
+	if (path.dirname(original) !== directory) return false;
+	const basename = path.basename(original);
+	return (
+		basename === `${id}.json` ||
+		basename === `${id}.lifecycle.json` ||
+		basename === `${id}.lifecycle.ready.json` ||
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename)
+	);
+}
+
+function lifecycleCleanupHasMixedMetadataSchema(cleanup: CleanupEvidence): boolean {
+	return [
+		cleanup.metadataIdentity,
+		cleanup.metadataPath,
+		cleanup.metadataAttempt,
+		cleanup.plannedMetadataPath,
+		cleanup.detachedMetadataPath,
+		cleanup.metadataCompleted,
+	].some(value => value !== undefined);
+}
+
+function validateLifecycleCleanupShape(cleanup: CleanupEvidence): BrokerResponse | undefined {
+	const files = cleanup.lifecycleFiles;
+	if (
+		cleanup.phase !== "lifecycle" ||
+		!cleanup.sessionId ||
+		!isCanonicalSessionId(cleanup.sessionId) ||
+		!cleanup.metadataRoot ||
+		!Array.isArray(files) ||
+		files.length === 0 ||
+		files.length > 4 ||
+		lifecycleCleanupHasMixedMetadataSchema(cleanup) ||
+		(cleanup.lifecycleDeleteMetadata === true && files.length > 2)
+	)
+		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks a complete unambiguous schema.");
+	const paths = new Set<string>();
+	for (const file of files) {
+		if (!validateLifecycleCleanupFile(cleanup.metadataRoot, cleanup.sessionId, file))
+			return fail("terminal_uncertain", "Lifecycle cleanup replay contains an invalid path authority.");
+		const entryPaths = new Map<string, "path" | "plannedPath" | "detachedPath">();
+		for (const [field, candidate] of [
+			["path", file.path],
+			["plannedPath", file.plannedPath],
+			["detachedPath", file.detachedPath],
+		] as const) {
+			if (candidate === undefined) continue;
+			const resolved = path.resolve(candidate);
+			const previousField = entryPaths.get(resolved);
+			if (previousField !== undefined) {
+				if (
+					(previousField === "plannedPath" && field === "detachedPath") ||
+					(previousField === "detachedPath" && field === "plannedPath")
+				)
+					continue;
+				return fail("terminal_uncertain", "Lifecycle cleanup replay contains duplicate path authority.");
+			}
+			entryPaths.set(resolved, field);
+			if (paths.has(resolved))
+				return fail("terminal_uncertain", "Lifecycle cleanup replay contains duplicate path authority.");
+			paths.add(resolved);
+		}
+	}
+	return undefined;
+}
+
 function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
 	const directory = path.join(path.resolve(root), "sdk");
 	const original = path.resolve(file.path);
 	const planned = path.resolve(file.plannedPath);
 	if (
-		path.dirname(original) !== directory ||
+		!isCanonicalLifecycleCleanupOriginal(root, id, original) ||
 		path.dirname(planned) !== directory ||
 		!path.basename(planned).startsWith(".gjc-delete-") ||
 		(file.attempt !== undefined && (!Number.isSafeInteger(file.attempt) || file.attempt < 1)) ||
-		(![`${id}.json`, `${id}.lifecycle.json`, `${id}.lifecycle.ready.json`].includes(path.basename(original)) &&
-			!path.basename(original).startsWith(`${id}.lifecycle.failure.`)) ||
 		(file.detachedPath !== undefined && path.dirname(path.resolve(file.detachedPath)) !== directory)
 	)
 		return false;
@@ -1372,15 +1441,8 @@ async function reconcileLifecycleCleanup(
 	cleanup: CleanupEvidence,
 	completion: BrokerResponse = fail("spawn_failed", "No ready SDK endpoint remains available."),
 ): Promise<BrokerResponse> {
-	if (
-		cleanup.phase !== "lifecycle" ||
-		!cleanup.sessionId ||
-		!isCanonicalSessionId(cleanup.sessionId) ||
-		!cleanup.metadataRoot ||
-		!Array.isArray(cleanup.lifecycleFiles) ||
-		cleanup.lifecycleFiles.length === 0
-	)
-		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks immutable identity-bound intent.");
+	const shapeValidation = validateLifecycleCleanupShape(cleanup);
+	if (shapeValidation) return shapeValidation;
 	let activeCleanup =
 		cleanup.lifecycleDeleteMetadata === true || completion.ok
 			? { ...cleanup, lifecycleDeleteMetadata: true as const }
@@ -3028,6 +3090,35 @@ async function exactCleanupProof(
 		: undefined;
 }
 
+function validateLifecycleDeleteMetadataBinding(
+	broker: Broker,
+	operation: string,
+	input: Input,
+	identity: string,
+	cleanup: CleanupEvidence,
+): BrokerResponse | undefined {
+	if (operation !== "session.delete")
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup is not authorized for this operation.");
+	const requestedId = sessionId(input);
+	const cwd = lifecycleCwd(input);
+	const requestedRoot = stateRoot(input, cwd);
+	if (
+		!requestedId ||
+		!isCanonicalSessionId(requestedId) ||
+		!cwd ||
+		!requestedRoot ||
+		!hasDefaultStateRoot(cwd, requestedRoot) ||
+		cleanup.sessionId !== requestedId ||
+		!cleanup.metadataRoot ||
+		path.resolve(cleanup.metadataRoot) !== requestedRoot
+	)
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the normalized request.");
+	const recordedRoot = broker.ledger.get(identity)?.effectIntent?.stateRoot;
+	if (recordedRoot && path.resolve(recordedRoot) !== requestedRoot)
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the recorded workspace.");
+	return undefined;
+}
+
 export interface LifecycleExecutionOutcome {
 	response: BrokerResponse;
 	durableEffects?: LifecycleDurableEffectsReceipt;
@@ -3059,6 +3150,8 @@ export async function executeLifecycle(
 					"Legacy metadata cleanup replay lacks immutable identity-bound intent.",
 				),
 			};
+		const binding = validateLifecycleDeleteMetadataBinding(broker, operation, input, identity, migrated);
+		if (binding) return { response: binding };
 		await broker.ledger.transition(identity, "effect_started", {
 			response: fail(
 				"cleanup_pending",
@@ -3073,7 +3166,11 @@ export async function executeLifecycle(
 			}),
 		};
 	}
-	if (cleanup?.phase === "lifecycle")
+	if (cleanup?.phase === "lifecycle") {
+		if (cleanup.lifecycleDeleteMetadata === true || operation === "session.delete") {
+			const binding = validateLifecycleDeleteMetadataBinding(broker, operation, input, identity, cleanup);
+			if (binding) return { response: binding };
+		}
 		return {
 			response: await reconcileLifecycleCleanup(
 				broker,
@@ -3084,6 +3181,7 @@ export async function executeLifecycle(
 					: fail("spawn_failed", "No ready SDK endpoint remains available."),
 			),
 		};
+	}
 	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
 	const entry = broker.ledger.get(identity);
 	const priorDurableEffects = entry?.durableEffects;

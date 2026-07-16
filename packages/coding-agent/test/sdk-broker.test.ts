@@ -1077,8 +1077,8 @@ describe("SDK broker identity and discovery", () => {
 							expect.objectContaining({
 								path: markerPath,
 								identity: expect.objectContaining({ sha256: expect.any(String) }),
-								plannedPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
-								detachedPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
+								plannedPath: detachedQ1,
+								detachedPath: detachedQ1,
 							}),
 						],
 					},
