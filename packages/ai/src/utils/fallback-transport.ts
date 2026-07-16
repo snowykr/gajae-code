@@ -14,7 +14,12 @@ export type TransportHeaders = Headers | Record<string, string | undefined>;
 export interface TransportFailureFacts {
 	kind: "transport";
 	status?: number;
+	/** Canonical provider error code used for fallback classification. */
 	providerCode?: string;
+	/** Anthropic's typed `error.type`, preserved separately at the transport boundary. */
+	anthropicErrorType?: string;
+	/** OpenAI's typed `error.code`, preserved separately at the transport boundary. */
+	openaiErrorCode?: string;
 	headers?: TransportHeaders;
 }
 
@@ -81,18 +86,18 @@ export function transportFailureFacts(
 			: typeof value.response?.status === "number"
 				? value.response.status
 				: capturedResponse?.status;
+	const anthropicErrorType =
+		typeof value.error?.type === "string"
+			? value.error.type
+			: typeof value.type === "string" && value.providerCode === "anthropic"
+				? value.type
+				: undefined;
+	const openaiErrorCode = typeof value.error?.code === "string" ? value.error.code : undefined;
 	const providerCode =
 		typeof value.providerCode === "string"
 			? value.providerCode
-			: typeof value.code === "string"
-				? value.code
-				: typeof value.error?.code === "string"
-					? value.error.code
-					: typeof value.type === "string"
-						? value.type
-						: typeof value.error?.type === "string"
-							? value.error.type
-							: undefined;
+			: openaiErrorCode ??
+				(typeof value.code === "string" ? value.code : anthropicErrorType ?? (typeof value.type === "string" ? value.type : undefined));
 	const headers = isTransportHeaders(value.headers)
 		? value.headers
 		: isTransportHeaders(value.response?.headers)
@@ -108,7 +113,7 @@ export function transportFailureFacts(
 	) {
 		return undefined;
 	}
-	return { kind: "transport", status, providerCode, headers };
+	return { kind: "transport", status, providerCode, anthropicErrorType, openaiErrorCode, headers };
 }
 
 function headersOf(headers: TransportHeaders | undefined): Headers | undefined {
@@ -171,7 +176,7 @@ export function classifyFallbackTrigger(
 	const retryAfterMs =
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
-	const code = facts.providerCode?.toLowerCase();
+	const code = (facts.openaiErrorCode ?? facts.anthropicErrorType ?? facts.providerCode)?.toLowerCase();
 	const triggerClass: FallbackTriggerClass = isQuotaCode(code)
 		? "quota"
 		: facts.status === 401 || facts.status === 403 || isAuthCode(code)

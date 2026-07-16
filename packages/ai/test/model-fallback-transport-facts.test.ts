@@ -105,6 +105,17 @@ describe("fallback transport facts", () => {
 		});
 	});
 
+	it("preserves first-party typed error codes and classifies bare 5xx without prose", () => {
+		const anthropic = transportFailureFacts({ status: 429, error: { type: "rate_limit_error" } });
+		const openai = transportFailureFacts({ status: 401, error: { code: "invalid_api_key" } });
+
+		expect(anthropic).toMatchObject({ anthropicErrorType: "rate_limit_error" });
+		expect(classifyFallbackTrigger(anthropic)).toEqual({ class: "rate_limit" });
+		expect(openai).toMatchObject({ openaiErrorCode: "invalid_api_key" });
+		expect(classifyFallbackTrigger(openai)).toEqual({ class: "auth" });
+		expect(classifyFallbackTrigger({ kind: "transport", status: 500 })).toEqual({ class: "server" });
+	});
+
 	it("does not attach transport facts to non-transport provider errors", () => {
 		const applicationError = Object.assign(new Error("tool schema validation failed"), {
 			code: "invalid_tool_schema",
