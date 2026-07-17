@@ -196,21 +196,22 @@ test("ledger reopen bounds malformed persisted rows before they gain cleanup aut
 		expect(quarantined).toContain('"identity":"deep"');
 		expect(quarantined).toContain('"identity":"wide"');
 
-		const expectStartFailure = async (name: string, content: string, message: string) => {
+		const expectOpenFailure = async (name: string, content: string, message: string) => {
 			const boundedAgentDir = path.join(agentDir, name);
 			const boundedLedgerPath = path.join(boundedAgentDir, "sdk", "lifecycle-ledger.jsonl");
 			await fs.mkdir(path.dirname(boundedLedgerPath), { recursive: true });
 			await fs.writeFile(boundedLedgerPath, content);
-			const broker = new Broker({ agentDir: boundedAgentDir });
-			try {
-				await expect(broker.start()).rejects.toThrow(message);
-			} finally {
-				await broker.stop();
-			}
+			await expect(
+				new LifecycleLedger(boundedAgentDir, {
+					maxLineBytes: 64 * 1024,
+					maxBytes: 512 * 1024,
+					maxRows: 100,
+				}).open(),
+			).rejects.toThrow(message);
 		};
-		await expectStartFailure("line-bound", "x".repeat(64 * 1024 + 1), "maximum byte length");
-		await expectStartFailure("row-bound", "{}\n".repeat(10_001), "maximum row count");
-		await expectStartFailure("file-bound", "x".repeat(8 * 1024 * 1024 + 1), "maximum file byte length");
+		await expectOpenFailure("line-bound", "x".repeat(64 * 1024 + 1), "maximum byte length");
+		await expectOpenFailure("row-bound", "{}\n".repeat(101), "maximum row count");
+		await expectOpenFailure("file-bound", "x".repeat(512 * 1024 + 1), "maximum file byte length");
 		expect(await fs.readFile(cleanupSentinel, "utf8")).toBe("preserve");
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -2402,11 +2403,15 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 test("broker fails closed when the reopened terminal ledger cannot reproduce its response", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-mismatch-"));
 	const broker = new Broker({ agentDir });
-	const originalOpen = LifecycleLedger.prototype.open;
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
 	try {
 		await broker.start();
-		LifecycleLedger.prototype.open = async () => ({ get: () => undefined }) as unknown as LifecycleLedger;
-		const response = await broker.handleRequest("session.unknown", {}, "ledger-mismatch");
+		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		const response = await broker.handleRequest(
+			"session.unknown",
+			{ sessionId: "ledger-mismatch" },
+			"ledger-mismatch",
+		);
 		expect(response).toEqual({
 			ok: false,
 			error: {
@@ -2416,7 +2421,7 @@ test("broker fails closed when the reopened terminal ledger cannot reproduce its
 			},
 		});
 	} finally {
-		LifecycleLedger.prototype.open = originalOpen;
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}

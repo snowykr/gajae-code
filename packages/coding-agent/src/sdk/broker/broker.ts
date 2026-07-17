@@ -721,8 +721,7 @@ export class Broker {
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				},
 			);
-			const reopenedLedger = await new LifecycleLedger(this.settings.agentDir).open();
-			const persisted = reopenedLedger.get(identity);
+			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const expectedResponseDigest = createHash("sha256").update(canonicalJson(response)).digest("hex");
 			const persistenceVerified =
 				persisted?.responseDigest === expectedResponseDigest &&

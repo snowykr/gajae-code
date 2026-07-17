@@ -89,9 +89,17 @@ export type BeginResult =
 	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
 	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
-const MAX_LIFECYCLE_LEDGER_BYTES = 8 * 1024 * 1024;
-const MAX_LIFECYCLE_LEDGER_LINE_BYTES = 64 * 1024;
-const MAX_LIFECYCLE_LEDGER_ROWS = 10_000;
+const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
+export interface LifecycleLedgerLimits {
+	maxBytes?: number;
+	maxLineBytes?: number;
+	maxRows?: number;
+}
+const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	maxBytes: 64 * 1024 * 1024,
+	maxLineBytes: 8 * 1024 * 1024,
+	maxRows: 10_000,
+};
 const MAX_LIFECYCLE_LEDGER_JSON_DEPTH = 64;
 const MAX_LIFECYCLE_LEDGER_JSON_FIELDS = 1024;
 
@@ -115,6 +123,7 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || !isBoundedLedgerJson(value)) return false;
 	const entry = value as Partial<LifecycleLedgerEntry>;
 	return (
+		entry.version === SDK_STATE_VERSION &&
 		typeof entry.identity === "string" &&
 		entry.identity.length > 0 &&
 		typeof entry.requestHash === "string" &&
@@ -157,51 +166,60 @@ export class LifecycleLedger {
 	#corruptFile: string;
 	#entries: LifecycleLedgerEntry[] = [];
 	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#limits: Required<LifecycleLedgerLimits>;
+	#rowCount = 0;
+	#byteCount = 0;
 	#warnings: string[] = [];
-	constructor(agentDir: string) {
+	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
 		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#limits = {
+			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
+			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
+			maxRows: limits.maxRows ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxRows,
+		};
 	}
 	async open(): Promise<this> {
 		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 		this.#entries = [];
-		const quarantinedTerminal = new Set<string>();
 		this.#byIdentity.clear();
 		this.#warnings = [];
+		this.#rowCount = 0;
+		this.#byteCount = 0;
+		const invalidIdentities = new Set<string>();
+		const syntheticUncertain = new Map<string, LifecycleLedgerEntry>();
 		const uncertainAfterCorruption = new Set<string>();
 		const source = await this.#readBoundedSource();
 		let tornTail = false;
 		if (source) {
+			this.#byteCount = source.length;
 			tornTail = source.length > 0 && source.at(-1) !== 0x0a;
 			let lineStart = 0;
-			let rows = 0;
 			for (let offset = 0; offset <= source.length; offset += 1) {
 				if (offset !== source.length && source[offset] !== 0x0a) continue;
 				const line = source.subarray(lineStart, offset);
 				lineStart = offset + 1;
 				if (line.length === 0) continue;
-				rows += 1;
-				if (rows > MAX_LIFECYCLE_LEDGER_ROWS)
+				this.#rowCount += 1;
+				if (this.#rowCount > this.#limits.maxRows)
 					await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum row count.");
-				if (line.length > MAX_LIFECYCLE_LEDGER_LINE_BYTES)
+				if (line.length > this.#limits.maxLineBytes)
 					await this.#rejectOversizedSource("Lifecycle ledger row exceeds the maximum byte length.");
 				try {
 					const value = parseLifecycleJson(line);
+					assertSupportedStateVersion(this.#file, value);
 					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
 					const entry = value;
-					assertSupportedStateVersion(this.#file, entry);
-					if (!hasValidTerminalDigests(entry)) {
+					const prior = this.#byIdentity.get(entry.identity);
+					const invalidHistory =
+						invalidIdentities.has(entry.identity) ||
+						!hasValidTerminalDigests(entry) ||
+						!this.#isValidHistoryContinuation(prior, entry);
+					if (invalidHistory) {
 						await this.#quarantine(line);
-						const {
-							response: _response,
-							responseDigest: _responseDigest,
-							durableEffects: _durableEffects,
-							...uncertain
-						} = entry;
-						const quarantined = { ...uncertain, state: "terminal_uncertain" as const, ts: Date.now() };
-						this.#entries.push(quarantined);
-						this.#byIdentity.set(quarantined.identity, quarantined);
-						quarantinedTerminal.add(quarantined.identity);
+						invalidIdentities.add(entry.identity);
+						if (!syntheticUncertain.has(entry.identity))
+							syntheticUncertain.set(entry.identity, this.#uncertainFrom(prior ?? entry, prior !== undefined));
 						continue;
 					}
 					this.#entries.push(entry);
@@ -210,53 +228,130 @@ export class LifecycleLedger {
 				} catch (error) {
 					if (error instanceof Error && "code" in error && error.code === "unsupported_state_version") throw error;
 					for (const [identity, latest] of this.#byIdentity) {
-						if (!terminal(latest.state) && latest.state !== "terminal_uncertain")
-							uncertainAfterCorruption.add(identity);
+						if (!final(latest.state)) uncertainAfterCorruption.add(identity);
 					}
 					await this.#quarantine(line);
 				}
 			}
 		}
 		if (tornTail) await this.#sealTornTail();
-		for (const identity of quarantinedTerminal) {
-			const entry = this.#byIdentity.get(identity);
-			if (entry) await this.#append(entry);
+		for (const [identity, uncertain] of syntheticUncertain) {
+			this.#byIdentity.set(identity, uncertain);
+			await this.#append(uncertain);
 		}
 		for (const identity of uncertainAfterCorruption) {
 			const entry = this.#byIdentity.get(identity);
-			if (entry && !terminal(entry.state) && entry.state !== "terminal_uncertain") {
-				const uncertain = { ...entry, state: "terminal_uncertain" as const, ts: Date.now() };
-				if (uncertain.response !== undefined)
-					uncertain.responseDigest = createHash("sha256").update(canonicalJson(uncertain.response)).digest("hex");
-				await this.#append(uncertain);
-			}
+			if (entry && !final(entry.state)) await this.#append(this.#uncertainFrom(entry));
 		}
 		// Effects may have completed after the last durable marker; do not retry them after a restart.
 		for (const entry of [...this.#byIdentity.values()]) {
-			if (entry.state === "effect_started" || entry.state === "awaiting_ready") {
-				const uncertain = { ...entry, state: "terminal_uncertain" as const, ts: Date.now() };
-				if (uncertain.response !== undefined)
-					uncertain.responseDigest = createHash("sha256").update(canonicalJson(uncertain.response)).digest("hex");
-				await this.#append(uncertain);
-			}
+			if (entry.state === "effect_started" || entry.state === "awaiting_ready")
+				await this.#append(this.#uncertainFrom(entry));
 		}
 		return this;
+	}
+	/**
+	 * Reads terminal proof for one request without recovering or changing the ledger.
+	 *
+	 * This intentionally accepts an unrelated unterminated final write: concurrent
+	 * appenders may have started a different row after this request's synced terminal
+	 * row. Complete rows are still decoded and validated strictly, and any incomplete
+	 * tail that identifies this request withholds proof.
+	 */
+	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
+		const source = await this.#readBoundedSourceReadOnly();
+		if (!source) return undefined;
+		let prior: LifecycleLedgerEntry | undefined;
+		let latest: LifecycleLedgerEntry | undefined;
+		let rows = 0;
+		let lineStart = 0;
+		const finalNewline = source.length > 0 && source.at(-1) === 0x0a;
+		const completeLength = finalNewline ? source.length : source.lastIndexOf(0x0a) + 1;
+		for (let offset = 0; offset < completeLength; offset += 1) {
+			if (source[offset] !== 0x0a) continue;
+			const line = source.subarray(lineStart, offset);
+			lineStart = offset + 1;
+			if (line.length === 0) continue;
+			rows += 1;
+			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes) return undefined;
+			let entry: LifecycleLedgerEntry;
+			try {
+				const value = parseLifecycleJson(line);
+				assertSupportedStateVersion(this.#file, value);
+				if (!isLifecycleLedgerEntry(value)) return undefined;
+				entry = value;
+			} catch {
+				return undefined;
+			}
+			if (entry.identity !== identity) continue;
+			if (
+				entry.requestHash !== requestHash ||
+				!hasValidTerminalDigests(entry) ||
+				!this.#isValidHistoryContinuation(prior, entry)
+			)
+				return undefined;
+			prior = entry;
+			latest = entry;
+		}
+		if (!finalNewline) {
+			const tail = source.subarray(completeLength);
+			// LifecycleLedger writes JSON.stringify entries, so this marker is exact for
+			// a partially persisted row from this identity without inspecting arbitrary
+			// malformed data as a valid record.
+			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
+			if (tail.includes(identityMarker)) return undefined;
+		}
+		return latest && terminal(latest.state) ? latest : undefined;
+	}
+
+	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
+		if (!previous) return true;
+		if (previous.requestHash !== next.requestHash || final(previous.state)) return false;
+		if (previous.state === "accepted") return true;
+		return next.state === "effect_started" || next.state === "awaiting_ready" || final(next.state);
+	}
+	#uncertainFrom(entry: LifecycleLedgerEntry, trusted = true): LifecycleLedgerEntry {
+		if (trusted) return { ...entry, state: "terminal_uncertain", ts: Date.now() };
+		return {
+			version: SDK_STATE_VERSION,
+			identity: entry.identity,
+			requestHash: entry.requestHash,
+			state: "terminal_uncertain",
+			ts: Date.now(),
+		};
 	}
 	async #readBoundedSource(): Promise<Buffer | undefined> {
 		let handle: fs.FileHandle | undefined;
 		try {
 			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 			const stat = await handle.stat({ bigint: true });
-			if (!stat.isFile() || stat.size > BigInt(MAX_LIFECYCLE_LEDGER_BYTES))
+			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes))
 				await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum file byte length.");
 			const bytes = Buffer.alloc(Number(stat.size) + 1);
 			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-			if (bytesRead > MAX_LIFECYCLE_LEDGER_BYTES)
+			if (bytesRead > this.#limits.maxBytes)
 				await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum file byte length.");
 			return bytes.subarray(0, bytesRead);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
+		} finally {
+			if (handle) await handle.close();
+		}
+	}
+	async #readBoundedSourceReadOnly(): Promise<Buffer | undefined> {
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes)) return undefined;
+			const bytes = Buffer.alloc(Number(stat.size) + 1);
+			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+			if (bytesRead > this.#limits.maxBytes) return undefined;
+			return bytes.subarray(0, bytesRead);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			return undefined;
 		} finally {
 			if (handle) await handle.close();
 		}
@@ -270,6 +365,7 @@ export class LifecycleLedger {
 		try {
 			await h.writeFile("\n");
 			await h.sync();
+			this.#byteCount += 1;
 		} finally {
 			await h.close();
 		}
@@ -285,19 +381,68 @@ export class LifecycleLedger {
 		}
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
+	async #syncDirectory(): Promise<void> {
+		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
+	}
+	async #compact(): Promise<void> {
+		const snapshot = [...this.#byIdentity.values()];
+		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		if (
+			snapshot.length > this.#limits.maxRows ||
+			contents.length > this.#limits.maxBytes ||
+			snapshot.some(entry => Buffer.byteLength(JSON.stringify(entry)) > this.#limits.maxLineBytes)
+		)
+			throw new Error("Lifecycle ledger compaction exceeds configured bounds.");
+		const temporary = path.join(
+			path.dirname(this.#file),
+			`.lifecycle-ledger.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+		);
+		let renamed = false;
+		try {
+			const h = await fs.open(temporary, "wx", 0o600);
+			try {
+				await h.writeFile(contents);
+				await h.sync();
+			} finally {
+				await h.close();
+			}
+			await fs.rename(temporary, this.#file);
+			renamed = true;
+			await this.#syncDirectory();
+			this.#entries = snapshot;
+			this.#rowCount = snapshot.length;
+			this.#byteCount = contents.length;
+		} finally {
+			if (!renamed) await fs.unlink(temporary).catch(() => {});
+		}
+	}
 	get warnings(): readonly string[] {
 		return this.#warnings;
 	}
 	async #append(entry: LifecycleLedgerEntry): Promise<LifecycleLedgerEntry> {
+		const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+		if (line.length - 1 > this.#limits.maxLineBytes)
+			throw new Error("Lifecycle ledger row exceeds the maximum byte length.");
+		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
+			await this.#compact();
+		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
+			throw new Error("Lifecycle ledger append exceeds configured bounds.");
 		const h = await fs.open(this.#file, "a", 0o600);
 		try {
-			await h.writeFile(`${JSON.stringify(entry)}\n`);
+			await h.writeFile(line);
 			await h.sync();
 		} finally {
 			await h.close();
 		}
 		this.#entries.push(entry);
 		this.#byIdentity.set(entry.identity, entry);
+		this.#rowCount += 1;
+		this.#byteCount += line.length;
 		return entry;
 	}
 	async begin(identity: string, requestHash: string): Promise<BeginResult> {
@@ -343,7 +488,6 @@ export class LifecycleLedger {
 		}
 		return this.#append(next);
 	}
-
 	async assertSupportedStateVersions(): Promise<void> {
 		const source = await this.#readBoundedSource();
 		if (!source) return;
@@ -352,7 +496,7 @@ export class LifecycleLedger {
 			if (offset !== source.length && source[offset] !== 0x0a) continue;
 			const line = source.subarray(lineStart, offset);
 			lineStart = offset + 1;
-			if (line.length === 0 || line.length > MAX_LIFECYCLE_LEDGER_LINE_BYTES) continue;
+			if (line.length === 0 || line.length > this.#limits.maxLineBytes) continue;
 			try {
 				assertSupportedStateVersion(this.#file, parseLifecycleJson(line));
 			} catch (error) {
@@ -360,7 +504,6 @@ export class LifecycleLedger {
 			}
 		}
 	}
-
 	get(identity: string): LifecycleLedgerEntry | undefined {
 		return this.#byIdentity.get(identity);
 	}
