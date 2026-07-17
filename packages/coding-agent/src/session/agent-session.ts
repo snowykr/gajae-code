@@ -130,6 +130,7 @@ export interface ForkContextSeed {
 export interface ForkContextSeedOptions {
 	maxMessages: number;
 	maxTokens: number;
+	preserveLatestUser?: boolean;
 	cacheIdentity?: string;
 	signal?: AbortSignal;
 }
@@ -362,6 +363,7 @@ import {
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { ToolChoiceQueue } from "./tool-choice-queue";
+import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
 
 /** Session-specific events that extend the core AgentEvent */
@@ -2284,8 +2286,12 @@ export class AgentSession {
 	}
 
 	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
-		const maxMessages = Math.min(500, Math.max(0, Math.trunc(options.maxMessages)));
-		const maxTokens = Math.max(0, Math.trunc(options.maxTokens));
+		const normalizeCap = (value: number, maximum: number): number => {
+			if (!Number.isFinite(value)) return 1;
+			return Math.min(maximum, Math.max(0, Math.trunc(value)));
+		};
+		const maxMessages = normalizeCap(options.maxMessages, 500);
+		const maxTokens = normalizeCap(options.maxTokens, Number.MAX_SAFE_INTEGER);
 		if (maxMessages <= 0 || maxTokens <= 0) {
 			return {
 				messages: [],
@@ -2318,14 +2324,26 @@ export class AgentSession {
 			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
 		};
 
+		const recordReason = (reason: string) => {
+			skippedReasons[reason] = (skippedReasons[reason] ?? 0) + 1;
+		};
+
 		const sanitizeMessage = (message: Message): Message | undefined => {
 			if (message.role === "developer") {
 				recordSkip("developer-role");
 				return undefined;
 			}
 			if (message.role === "toolResult") {
-				recordSkip("tool-result-role");
-				return undefined;
+				const text = Array.isArray(message.content)
+					? message.content
+							.filter(block => block.type === "text")
+							.map(block => block.text)
+							.join("\n")
+					: String(message.content ?? "");
+				const tool = (message as unknown as { toolName?: string }).toolName ?? "tool";
+				const target = (message.details as { path?: unknown } | undefined)?.path;
+				const digest = `[tool result: ${tool}${typeof target === "string" ? ` ${target}` : ""}]\n${text.split("\n").slice(0, 12).join("\n")}`;
+				return { role: "user", content: [{ type: "text", text: digest }] } as Message;
 			}
 			if (message.role !== "user" && message.role !== "assistant") {
 				recordSkip("unsupported-role");
@@ -2342,7 +2360,7 @@ export class AgentSession {
 					} else if (block.type === "image") {
 						sanitizedContent.push({ type: "text", text: "[Image omitted from fork-context seed]" });
 					} else if (block.type !== "thinking") {
-						recordSkip(`unsupported-content-${block.type}`);
+						recordReason(`unsupported-content-${block.type}`);
 					}
 				}
 				if (sanitizedContent.length === 0) {
@@ -2354,8 +2372,11 @@ export class AgentSession {
 			return cloned;
 		};
 
-		const truncateMessageToTokenBudget = (message: Message): { message: Message; tokens: number } => {
-			const notice = `\n\n[fork-context seed: newest message truncated to fit the ${maxTokens}-token budget]`;
+		const truncateMessageToTokenBudget = (
+			message: Message,
+			tokenBudget = maxTokens,
+		): { message: Message; tokens: number } => {
+			const notice = `\n\n[fork-context seed: newest message truncated to fit the ${tokenBudget}-token budget]`;
 			const contentText = Array.isArray(message.content)
 				? message.content.map(block => (block.type === "text" ? block.text : "")).join("\n\n")
 				: String(message.content ?? "");
@@ -2370,7 +2391,7 @@ export class AgentSession {
 					content: [{ type: "text", text: `${contentText.slice(0, mid)}${notice}` }],
 				};
 				const candidateTokens = estimateMessageTokensHeuristic(candidate);
-				if (candidateTokens <= maxTokens) {
+				if (candidateTokens <= tokenBudget) {
 					bestMessage = candidate;
 					bestTokens = candidateTokens;
 					low = mid + 1;
@@ -2381,33 +2402,86 @@ export class AgentSession {
 			return { message: bestMessage, tokens: bestTokens };
 		};
 
-		for (let i = providerMessages.length - 1; i >= 0; i--) {
-			if (selected.length >= maxMessages) {
-				recordSkip("message-limit");
-				continue;
-			}
-			const sanitized = sanitizeMessage(providerMessages[i]!);
-			if (!sanitized) continue;
-			const messageTokens = estimateMessageTokensHeuristic(sanitized);
-			// Stop at the first message that overflows the token budget. The loop walks
-			// newest→oldest, so `break` keeps the seed a CONTIGUOUS run of the most recent
-			// messages. `continue` here would skip the oversized recent message and scavenge
-			// smaller OLDER ones, yielding a non-contiguous seed that misrepresents the
-			// conversation and violates the recency contract of the receipt/last-turn/bounded modes.
-			if (approximateTokens + messageTokens > maxTokens) {
-				recordSkip("token-limit");
-				if (selected.length === 0) {
-					const truncated = truncateMessageToTokenBudget(sanitized);
-					if (truncated.tokens <= maxTokens) {
-						selected.unshift(truncated.message);
-						approximateTokens = truncated.tokens;
+		if (options.preserveLatestUser) {
+			const userIndex = providerMessages.findLastIndex(message => message.role === "user");
+			if (userIndex >= 0) {
+				const userMessage = sanitizeMessage(providerMessages[userIndex]!);
+				if (userMessage) {
+					let reservedUser = userMessage;
+					let reservedUserTokens = estimateMessageTokensHeuristic(reservedUser);
+					if (reservedUserTokens > maxTokens) {
+						const truncated = truncateMessageToTokenBudget(reservedUser);
+						reservedUser = truncated.message;
+						reservedUserTokens = truncated.tokens;
 						skippedReasons["newest-message-truncated"] = (skippedReasons["newest-message-truncated"] ?? 0) + 1;
 					}
+					selected.push(reservedUser);
+					approximateTokens = reservedUserTokens;
+					for (let i = userIndex + 1; i < providerMessages.length; i++) {
+						const sanitized = sanitizeMessage(providerMessages[i]!);
+						if (!sanitized) continue;
+						if (selected.length >= maxMessages) {
+							recordSkip("message-limit");
+							continue;
+						}
+						const messageTokens = estimateMessageTokensHeuristic(sanitized);
+						if (approximateTokens + messageTokens > maxTokens) {
+							const remainingTokens = maxTokens - approximateTokens;
+							const truncated = truncateMessageToTokenBudget(sanitized, remainingTokens);
+							if (truncated.tokens <= remainingTokens) {
+								selected.push(truncated.message);
+								approximateTokens += truncated.tokens;
+								recordReason("token-limit");
+								recordReason("newest-message-truncated");
+							} else {
+								recordSkip("token-limit");
+							}
+							continue;
+						}
+						selected.push(sanitized);
+						approximateTokens += messageTokens;
+					}
+					for (let i = 0; i < userIndex; i++) recordSkip("semantic-turn");
+				} else {
+					for (const message of providerMessages) sanitizeMessage(message);
 				}
-				break;
+			} else {
+				for (const message of providerMessages) sanitizeMessage(message);
 			}
-			selected.unshift(sanitized);
-			approximateTokens += messageTokens;
+		} else {
+			let tokenBudgetExhausted = false;
+			for (let i = providerMessages.length - 1; i >= 0; i--) {
+				const sanitized = sanitizeMessage(providerMessages[i]!);
+				if (!sanitized) continue;
+				if (selected.length >= maxMessages) {
+					recordSkip("message-limit");
+					continue;
+				}
+				const messageTokens = estimateMessageTokensHeuristic(sanitized);
+				if (tokenBudgetExhausted) {
+					skippedMessages++;
+					continue;
+				}
+				if (approximateTokens + messageTokens > maxTokens) {
+					if (selected.length === 0) {
+						const truncated = truncateMessageToTokenBudget(sanitized);
+						if (truncated.tokens <= maxTokens) {
+							selected.unshift(truncated.message);
+							approximateTokens = truncated.tokens;
+							recordReason("token-limit");
+							recordReason("newest-message-truncated");
+						} else {
+							recordSkip("token-limit");
+						}
+					} else {
+						recordSkip("token-limit");
+					}
+					tokenBudgetExhausted = true;
+					continue;
+				}
+				selected.unshift(sanitized);
+				approximateTokens += messageTokens;
+			}
 		}
 
 		const messages = selected;
@@ -2808,7 +2882,10 @@ export class AgentSession {
 		// await: the EventStream FIFO drain then guarantees tool results and every
 		// steering message are in the branch before a maintenance rewrite starts.
 		if (event.type === "message_end") {
-			if (event.message.role === "hookMessage" || event.message.role === "custom") {
+			if (
+				(event.message.role === "hookMessage" || event.message.role === "custom") &&
+				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
+			) {
 				const isRosterReminder = event.message.role === "custom" && event.message.customType === "irc-peer-roster";
 				if (!isRosterReminder) {
 					this.#appendCustomMessageEntry(
@@ -4608,9 +4685,9 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
-		const hindsightState = this.setHindsightSessionState(undefined);
-		await hindsightState?.flushRetainQueue();
-		hindsightState?.dispose();
+		const hindsightState = this.getHindsightSessionState();
+		await hindsightState?.dispose();
+		this.setHindsightSessionState(undefined);
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
 			this.#unsubscribeAppendOnly = undefined;
@@ -5503,7 +5580,8 @@ export class AgentSession {
 		try {
 			const injected = await backend.beforeAgentStartPrompt(this, promptText);
 			if (!injected) return this.#baseSystemPrompt;
-			return [...this.#baseSystemPrompt, injected];
+			// Recall is volatile user-role context. Mental models remain in the stable developer prefix.
+			return this.#baseSystemPrompt;
 		} catch (err) {
 			logger.debug("Memory backend beforeAgentStartPrompt failed", {
 				backend: backend.id,
@@ -5769,16 +5847,44 @@ export class AgentSession {
 			throw new Error("Cannot continue from persisted message history");
 		}
 		this.#beginInFlight();
+		let hindsightRecall: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
 			this.agent.appendMessage(volatileProjectContextMessage);
 			const untrustedMcpServerInstructionsMessage = this.#buildUntrustedMcpServerInstructionsMessage();
 			if (untrustedMcpServerInstructionsMessage) this.agent.appendMessage(untrustedMcpServerInstructionsMessage);
-			await this.agent.continue(this.#managedFallbackPromptOptions());
+			const hindsightState = this.getHindsightSessionState();
+			await hindsightState?.maybeRecallOnAgentStart();
+			hindsightRecall = hindsightState?.getRecallSnippetForInjection();
+			if (hindsightRecall) {
+				const messages = this.agent.state.messages;
+				const lastUserIndex = messages.findLastIndex(message => message.role === "user");
+				if (lastUserIndex !== -1) {
+					this.agent.replaceMessages([
+						...messages.slice(0, lastUserIndex),
+						{
+							role: "custom",
+							customType: "hindsight-recall",
+							content: hindsightRecall,
+							display: false,
+							attribution: "agent",
+							timestamp: Date.now(),
+						},
+						...messages.slice(lastUserIndex),
+					]);
+				} else {
+					hindsightRecall = undefined;
+				}
+			}
+			await this.agent.continue({
+				...this.#managedFallbackPromptOptions(),
+				onRunAccepted: () => {
+					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
+				},
+			});
 			await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-
 			this.#endInFlight();
 			await this.#waitForSessionSettlement();
 		}
@@ -6740,6 +6846,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		const preflightSignal = this.#promptPreflightAbortController.signal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
+		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			if (message.role === "user") {
@@ -6859,6 +6966,20 @@ export class AgentSession {
 			}
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
+			hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
+			if (hindsightRecall) {
+				// Recall is provider-only context for this request. It must precede the
+				// actual prompt but never become part of durable session history.
+				const promptIndex = messages.lastIndexOf(message);
+				messages.splice(promptIndex, 0, {
+					role: "custom",
+					customType: "hindsight-recall",
+					content: hindsightRecall,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
 
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
@@ -6923,7 +7044,10 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
-				...(options?.admissionLease ? { onRunAccepted: options.admissionLease.release } : undefined),
+				onRunAccepted: () => {
+					options?.admissionLease?.release();
+					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
+				},
 			};
 			options?.onPreflightAccepted?.();
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
@@ -6948,7 +7072,6 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this.#removeEphemeralCustomMessages();
-
 			if (rosterClaim) {
 				this.agent.replaceMessages(
 					this.agent.state.messages.filter(
@@ -9104,16 +9227,32 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
-	async #pruneToolOutputs(signal?: AbortSignal): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
+	async #pruneToolOutputs(
+		signal?: AbortSignal,
+		overThreshold = false,
+	): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG);
+		const result = pruneToolOutputs(
+			branchEntries,
+			DEFAULT_PRUNE_CONFIG,
+			overThreshold ? { relaxedMinimum: 0 } : undefined,
+		);
 		const argumentResult = pruneAssistantToolArguments(branchEntries, DEFAULT_PRUNE_CONFIG);
 		const fileMentionResult = pruneStaleFileMentions(branchEntries, p =>
 			resolveReadPath(p, this.sessionManager.getCwd()),
 		);
+		const volatileContextResult = pruneSupersededVolatileProjectContext(branchEntries);
+		const reminderResult = pruneSupersededMaintenanceReminders(branchEntries);
 		const tokensSaved =
-			result.tokensSaved + argumentResult.argumentTokensSaved + Math.round(fileMentionResult.bytesSaved / 4);
-		const prunedCount = result.prunedCount + argumentResult.argumentPrunedCount + fileMentionResult.changed.length;
+			result.tokensSaved +
+			argumentResult.argumentTokensSaved +
+			Math.round((fileMentionResult.bytesSaved + volatileContextResult.bytesSaved + reminderResult.bytesSaved) / 4);
+		const prunedCount =
+			result.prunedCount +
+			argumentResult.argumentPrunedCount +
+			fileMentionResult.changed.length +
+			volatileContextResult.changed.length +
+			reminderResult.changed.length;
 		if (prunedCount === 0 || signal?.aborted) {
 			return undefined;
 		}
@@ -9122,6 +9261,7 @@ export class AgentSession {
 		// the pruning mutations must be written back into the canonical store.
 		const combined = [...result.prunedEntries, ...argumentResult.prunedEntries, ...fileMentionResult.changed];
 		this.sessionManager.applyEntryMessageUpdates(combined);
+		this.sessionManager.applyCustomMessageEntryUpdates([...volatileContextResult.changed, ...reminderResult.changed]);
 		await this.sessionManager.rewriteEntries();
 		const sessionContext = this.buildDisplaySessionContext();
 		this.agent.replaceMessages(sessionContext.messages);
@@ -9218,6 +9358,7 @@ export class AgentSession {
 			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
 
 			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				contextWindow: this.model.contextWindow,
 				tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
 			});
 			if (!preparation) {
@@ -9671,9 +9812,20 @@ export class AgentSession {
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
-		const pruneResult = await this.#pruneToolOutputs();
-		if (pruneResult) {
-			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: 0,
+		});
+		if (
+			pruneEstimate.tokensSaved > 0 &&
+			!shouldCompact(
+				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+				contextWindow,
+				compactionSettings,
+				autoCompactionOutputReserveTokens,
+			)
+		) {
+			const pruneResult = await this.#pruneToolOutputs(undefined, true);
+			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
@@ -9763,14 +9915,25 @@ export class AgentSession {
 			// 1) Prune stale tool outputs first — cheaper than compaction, may avert it,
 			//    and (like all history rewrites) resets the codex provider session /
 			//    prompt-cache epoch via #closeCodexProviderSessionsForHistoryRewrite.
-			if (isAborted()) return "aborted";
-			const pruneResult = await this.#pruneToolOutputs(maintenanceSignal);
-			if (isAborted()) return "aborted";
-			if (pruneResult) {
-				contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+			const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+				relaxedMinimum: 0,
+			});
+			let pruneResult: { prunedCount: number; tokensSaved: number } | undefined;
+			if (
+				pruneEstimate.tokensSaved > 0 &&
+				!shouldCompact(
+					Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+					contextWindow,
+					compactionSettings,
+					autoCompactionOutputReserveTokens,
+				)
+			) {
+				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
+				if (isAborted()) return "aborted";
+				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
-				return pruneResult && pruneResult.prunedCount > 0 ? "pruned" : "not-needed";
+				return pruneResult?.prunedCount ? "pruned" : "not-needed";
 			}
 
 			// 2) Try context promotion (switch to a larger-window model) before compacting.
@@ -9933,9 +10096,20 @@ export class AgentSession {
 			return;
 		}
 
-		const pruneResult = await this.#pruneToolOutputs();
-		if (pruneResult) {
-			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
+		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
+			relaxedMinimum: 0,
+		});
+		if (
+			pruneEstimate.tokensSaved > 0 &&
+			!shouldCompact(
+				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
+				contextWindow,
+				compactionSettings,
+				autoCompactionOutputReserveTokens,
+			)
+		) {
+			const pruneResult = await this.#pruneToolOutputs(undefined, true);
+			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
@@ -11053,6 +11227,7 @@ export class AgentSession {
 			// it would grow it, so recovery cannot re-overflow the provider window.
 			const overflowRatio = this.#computeCompactionTokenCorrectionRatio();
 			const preparation = prepareCompaction(pathEntries, compactionSettings, {
+				contextWindow: this.model?.contextWindow,
 				tokenCorrectionRatio: overflowRatio !== undefined ? Math.max(1, overflowRatio) : undefined,
 			});
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -13762,7 +13937,6 @@ export class AgentSession {
 	} {
 		return this.#estimateContextTokensWith(
 			message => this.#estimateMessageDisplayTokens(message),
-			false,
 			boundaryTs,
 			anchor,
 		);
@@ -13853,17 +14027,16 @@ export class AgentSession {
 		const num = actual - imgAdjust;
 		const den = heuristic - imgAdjust;
 		if (!(num > 0) || !(den > 0)) return undefined;
-		return num / den;
+		const observedRatio = num / den;
+		this.#compactionDeltaInflation = Math.min(1.3, Math.max(1, observedRatio));
+		return observedRatio;
 	}
 
 	#estimateContextTokensForCompaction(pendingMessages: readonly AgentMessage[]): {
 		tokens: number;
 		anchored: boolean;
 	} {
-		const estimate = this.#estimateContextTokensWith(
-			message => this.#estimateMessageCompactionDeltaTokens(message),
-			true,
-		);
+		const estimate = this.#estimateContextTokensWith(message => this.#estimateMessageCompactionDeltaTokens(message));
 		return {
 			tokens: estimate.tokens + this.#estimateMessagesCompactionDeltaTokens(pendingMessages),
 			anchored: estimate.anchored,
@@ -13872,7 +14045,6 @@ export class AgentSession {
 
 	#estimateContextTokensWith(
 		estimateMessage: (message: AgentMessage) => number,
-		inflateFixed = false,
 		boundaryTs?: number,
 		knownAnchor?: { index: number; usage: Usage } | undefined,
 	): {
@@ -13890,7 +14062,7 @@ export class AgentSession {
 		if (!anchor) {
 			// No usage data - estimate the full provider request.
 			const fixedTokens = computeNonMessageTokens(this);
-			let estimated = inflateFixed ? Math.ceil(fixedTokens * this.#compactionDeltaInflation) : fixedTokens;
+			let estimated = fixedTokens;
 			for (const message of messages) {
 				estimated += estimateMessage(message);
 			}
@@ -13924,11 +14096,17 @@ export class AgentSession {
 		return tokens;
 	}
 
+	#displayTokenCache = new WeakMap<AgentMessage, { fingerprint: string; tokens: number }>();
+
 	#estimateMessageDisplayTokens(message: AgentMessage): number {
+		const fingerprint = JSON.stringify(message);
+		const cached = this.#displayTokenCache.get(message);
+		if (cached?.fingerprint === fingerprint) return cached.tokens;
 		let tokens = 0;
 		for (const llmMessage of convertToLlm([message])) {
 			tokens += estimateMessageTokensHeuristic(llmMessage);
 		}
+		this.#displayTokenCache.set(message, { fingerprint, tokens });
 		return tokens;
 	}
 
