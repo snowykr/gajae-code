@@ -26,6 +26,20 @@
 			},
 			"additionalProperties": false
 		},
+		"session": {
+			"type": "object",
+			"properties": {
+				"directoryMigration": {
+					"type": "string",
+					"enum": [
+						"copy-retain",
+						"disabled"
+					],
+					"default": "copy-retain"
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {
@@ -823,7 +837,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {
@@ -849,6 +863,17 @@
 					],
 					"description": "When to return to the primary model after a fallback",
 					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mouse": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -2124,6 +2149,17 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasksPane": {
+			"type": "object",
+			"properties": {
+				"defaultVisible": {
+					"type": "boolean",
+					"description": "Open the unified tasks pane when the interactive UI starts",
+					"default": false
 				}
 			},
 			"additionalProperties": false

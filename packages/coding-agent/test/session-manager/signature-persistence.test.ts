@@ -133,7 +133,7 @@ describe("SessionManager signature persistence", () => {
 		});
 	});
 
-	it("rehydrates assistant replay metadata in memory without rewriting the session file", async () => {
+	it("rehydrates assistant replay metadata with an append-only patch", async () => {
 		using tempDir = TempDir.createSync("@pi-session-rehydrate-persistence-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		const providerPayload = {
@@ -178,22 +178,24 @@ describe("SessionManager signature persistence", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const persistedBefore = await fs.readFile(sessionFile, "utf8");
-		const initialMtimeMs = (await fs.stat(sessionFile)).mtimeMs;
 		await session.close();
 
 		const reloaded = await SessionManager.open(sessionFile);
 		const assistant = getAssistantMessage(reloaded);
 
-		// After rehydration, assistant providerPayload must be stripped to prevent
-		// stale native history replay on warmed sessions.
 		expect(assistant.providerPayload).toBeUndefined();
 		expect(assistant.content[0]).toMatchObject({
 			type: "thinking",
 			thinking: "reasoning",
 			thinkingSignature: undefined,
 		});
-		expect(await fs.readFile(sessionFile, "utf8")).toBe(persistedBefore);
-		expect((await fs.stat(sessionFile)).mtimeMs).toBe(initialMtimeMs);
+		const persistedAfter = await fs.readFile(sessionFile, "utf8");
+		expect(persistedAfter.startsWith(persistedBefore)).toBe(true);
+		const patch = JSON.parse(persistedAfter.slice(persistedBefore.length));
+		expect(persistedAfter.slice(persistedBefore.length)).toEndWith("\n");
+		expect(patch).toMatchObject({ type: "entry_patch" });
+		expect(patch.patch.message).not.toHaveProperty("providerPayload");
+		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");
 		await reloaded.close();
 	});
 });

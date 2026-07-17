@@ -241,6 +241,10 @@ jobs:
               TARGET_ARCH: x64
               TARGET_VARIANTS: baseline
            run: bun run ci:build:native
+         - name: Verify dedicated Windows native identity and managed session-directory contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           shell: pwsh
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-windows.test.ts packages/coding-agent/test/sdk-session-directory.test.ts packages/coding-agent/test/sdk-session-directory.windows.test.ts packages/coding-agent/test/session-storage.test.ts
          - name: Smoke bun + gjc CLI (source runtime)
            if: needs.relevance.outputs.relevant == 'true'
            shell: pwsh
@@ -319,6 +323,9 @@ jobs:
               merge-multiple: true
               run-id: ${{ steps.source.outputs.run-id }}
               github-token: ${{ secrets.GITHUB_TOKEN }}
+         - name: Verify dedicated POSIX native path identity contracts
+           if: needs.relevance.outputs.relevant == 'true'
+           run: bun test packages/natives/test/path-identity.test.ts packages/natives/test/path-identity-posix.test.ts
          - name: Test workspace (TS)
            if: needs.relevance.outputs.relevant == 'true'
            env:
@@ -333,6 +340,53 @@ jobs:
            if: needs.relevance.outputs.relevant == 'true'
            run: bun run ci:test:smoke
 
+   tui-pty-matrix:
+      timeout-minutes: 20
+      needs: [relevance]
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      strategy:
+         fail-fast: false
+         matrix:
+            os: [ubuntu-22.04, macos-14]
+      runs-on: ${{ matrix.os }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - if: needs.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
+         - name: Test TUI mouse PTY matrix
+           if: needs.relevance.outputs.relevant == 'true'
+           run: PI_TUI_PTY_TESTS=1 bun --cwd packages/tui run test:pty
+
+
+   tui-perf-gates:
+      timeout-minutes: 20
+      needs: [relevance]
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - if: needs.relevance.outputs.relevant == 'true'
+           run: bun install --frozen-lockfile
+         - name: Run TUI performance gates
+           if: needs.relevance.outputs.relevant == 'true'
+           # PI_TUI_PROMOTION_GATE=1 is the separate, currently HOLD promotion evaluation and is intentionally not set in CI.
+           run: PI_TUI_PERF_GATES=1 bun --cwd=packages/tui run test:perf
    install_methods:
       timeout-minutes: 45
       needs: [relevance]

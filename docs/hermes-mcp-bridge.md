@@ -234,4 +234,4 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
 gjc mcp-serve coordinator --check --json
 ```
 
-Expected result includes `ok: true`, server name `gjc-coordinator-mcp`, and the GJC-named tool list.
+Expected result includes `ok: true`, server name `gjc-coordinator-mcp`, and the GJC-named tool list. The JSON check is discovery-only and non-mutating: it retains those legacy fields and adds `catalog: { "ready": true, "reason": null }` and `broker`. `broker.discovery_status` is `ready`, `unavailable`, or `error`, with reason `null`, `absent_or_invalid`, `unsupported_state_version`, `discovery_access_denied`, or `discovery_read_failed`. `broker.operational_ready` is always `null`; the check does not connect, ensure/bootstrap, write, repair, or delete. `bootstrap_supported` is `true` and `bootstrap_attempted` is `false`. It does not expose broker authority, path, endpoint, process metadata, token, or raw error details. `gjc mcp-serve hermes --check --json` returns the identical coordinator check payload; its human output remains the server/tools summary.

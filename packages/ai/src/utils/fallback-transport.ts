@@ -1,4 +1,4 @@
-export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "other";
+export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "unknown" | "other";
 
 export interface FallbackTrigger {
 	class: FallbackTriggerClass;
@@ -10,12 +10,23 @@ export type TransportHeaders = Headers | Record<string, string | undefined>;
 /**
  * Structured facts from an upstream HTTP or transport failure. Retry decisions
  * must use these facts rather than provider- or application-owned error text.
+ *
+ * `headers` is always a plain record limited to the retained retry-signal
+ * entries: facts travel on persisted `AssistantMessage`s and through
+ * `structuredClone` snapshots (managed fallback attempt staging), so they must
+ * never carry a live `Headers` instance — cloning one throws `DataCloneError`
+ * ("The object can not be cloned.") and masks the real provider failure.
  */
 export interface TransportFailureFacts {
 	kind: "transport";
 	status?: number;
+	/** Canonical provider error code used for fallback classification. */
 	providerCode?: string;
-	headers?: TransportHeaders;
+	/** Anthropic's typed `error.type`, preserved separately at the transport boundary. */
+	anthropicErrorType?: string;
+	/** OpenAI's typed `error.code`, preserved separately at the transport boundary. */
+	openaiErrorCode?: string;
+	headers?: Record<string, string>;
 }
 
 /** Opaque per-invocation marker required by managed fallback transport calls. */
@@ -65,7 +76,70 @@ export interface FallbackTriggerInput {
 }
 
 function isTransportHeaders(value: unknown): value is TransportHeaders {
-	return value instanceof Headers || (!!value && typeof value === "object");
+	try {
+		return value instanceof Headers || (!!value && typeof value === "object");
+	} catch {
+		return false;
+	}
+}
+
+function propertyOf(value: unknown, name: string): unknown {
+	if (!value || typeof value !== "object") return undefined;
+	try {
+		return Reflect.get(value, name);
+	} catch {
+		return undefined;
+	}
+}
+
+function finiteStatus(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+/** Retry-signal headers retained on transport facts; everything else is dropped. */
+const RETAINED_TRANSPORT_HEADERS = ["retry-after", "retry-after-ms"] as const;
+
+const RETAINED_TRANSPORT_HEADER_SET: ReadonlySet<string> = new Set(RETAINED_TRANSPORT_HEADERS);
+
+/**
+ * Reduce transport headers to the retained retry-signal entries in a plain
+ * record, so facts stay structured-cloneable and JSON-serializable and never
+ * persist arbitrary response headers into session files.
+ *
+ * Exception-safe by contract: inspection uses only `Headers.get()` results
+ * that are primitive strings or own data-descriptor record entries. Any
+ * failure omits headers instead of throwing — status/providerCode facts
+ * extracted by the caller must survive a hostile headers object.
+ */
+function retainedHeaderRecord(headers: TransportHeaders | undefined): Record<string, string> | undefined {
+	if (headers === undefined) return undefined;
+	let record: Record<string, string> | undefined;
+	try {
+		if (headers instanceof Headers) {
+			for (const name of RETAINED_TRANSPORT_HEADERS) {
+				const value = headers.get(name);
+				if (typeof value !== "string") continue;
+				record ??= {};
+				record[name] = value;
+			}
+			return record;
+		}
+		for (const key of Object.keys(headers)) {
+			const descriptor = Object.getOwnPropertyDescriptor(headers, key);
+			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") continue;
+			const name = key.toLowerCase();
+			if (!RETAINED_TRANSPORT_HEADER_SET.has(name)) continue;
+			record ??= {};
+			record[name] = descriptor.value;
+		}
+		return record;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Extracts only explicit HTTP/transport metadata; it never parses error text. */
@@ -75,40 +149,47 @@ export function transportFailureFacts(
 ): TransportFailureFacts | undefined {
 	if (!error || typeof error !== "object") return undefined;
 	const value = error as FallbackTriggerInput & { kind?: unknown; type?: unknown };
+	const response = propertyOf(value, "response");
+	const nestedError = propertyOf(value, "error");
 	const status =
-		typeof value.status === "number"
-			? value.status
-			: typeof value.response?.status === "number"
-				? value.response.status
-				: capturedResponse?.status;
+		finiteStatus(propertyOf(value, "status")) ??
+		finiteStatus(propertyOf(response, "status")) ??
+		finiteStatus(propertyOf(capturedResponse, "status"));
+	const anthropicErrorType = stringValue(propertyOf(nestedError, "type")) ?? stringValue(propertyOf(value, "type"));
+	const openaiErrorCode =
+		stringValue(propertyOf(value, "openaiErrorCode")) ?? stringValue(propertyOf(nestedError, "code"));
 	const providerCode =
-		typeof value.providerCode === "string"
-			? value.providerCode
-			: typeof value.code === "string"
-				? value.code
-				: typeof value.error?.code === "string"
-					? value.error.code
-					: typeof value.type === "string"
-						? value.type
-						: typeof value.error?.type === "string"
-							? value.error.type
-							: undefined;
-	const headers = isTransportHeaders(value.headers)
-		? value.headers
-		: isTransportHeaders(value.response?.headers)
-			? value.response.headers
-			: capturedResponse?.headers;
+		stringValue(propertyOf(value, "providerCode")) ??
+		openaiErrorCode ??
+		stringValue(propertyOf(value, "code")) ??
+		anthropicErrorType;
+	const errorHeaders = propertyOf(value, "headers");
+	const responseHeaders = propertyOf(response, "headers");
+	const capturedHeaders = propertyOf(capturedResponse, "headers");
+	const rawHeaders = isTransportHeaders(errorHeaders)
+		? errorHeaders
+		: isTransportHeaders(responseHeaders)
+			? responseHeaders
+			: isTransportHeaders(capturedHeaders)
+				? capturedHeaders
+				: undefined;
+	// Normalize BEFORE the existence gate so normalization is idempotent:
+	// facts built from an error whose headers carry no retained retry signal
+	// must not exist on the first pass and then vanish when re-normalized
+	// (consumers deliberately re-run transportFailureFacts on embedded facts).
+	const headers = retainedHeaderRecord(rawHeaders);
 	const normalizedCode = providerCode?.toLowerCase();
 	if (
 		status === undefined &&
 		headers === undefined &&
 		!isQuotaCode(normalizedCode) &&
 		!isAuthCode(normalizedCode) &&
-		!isRateLimitCode(normalizedCode)
+		!isRateLimitCode(normalizedCode) &&
+		!isContextOverflowCode(normalizedCode)
 	) {
 		return undefined;
 	}
-	return { kind: "transport", status, providerCode, headers };
+	return { kind: "transport", status, providerCode, anthropicErrorType, openaiErrorCode, headers };
 }
 
 function headersOf(headers: TransportHeaders | undefined): Headers | undefined {
@@ -130,6 +211,9 @@ function parseRetryAfterMilliseconds(value: string | null): number | undefined {
 	return Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.round(milliseconds) : undefined;
 }
 
+function isContextOverflowCode(code: string | undefined): boolean {
+	return code === "context_length_exceeded";
+}
 function isQuotaCode(code: string | undefined): boolean {
 	return (
 		code === "insufficient_quota" ||
@@ -171,7 +255,7 @@ export function classifyFallbackTrigger(
 	const retryAfterMs =
 		parseRetryAfterMilliseconds(headers?.get("retry-after-ms") ?? null) ??
 		parseRetryAfterSeconds(headers?.get("retry-after") ?? null);
-	const code = facts.providerCode?.toLowerCase();
+	const code = (facts.openaiErrorCode ?? facts.anthropicErrorType ?? facts.providerCode)?.toLowerCase();
 	const triggerClass: FallbackTriggerClass = isQuotaCode(code)
 		? "quota"
 		: facts.status === 401 || facts.status === 403 || isAuthCode(code)

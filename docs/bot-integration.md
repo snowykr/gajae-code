@@ -57,6 +57,8 @@ gjc setup hermes --root /path/to/repo --smoke --json
 gjc mcp-serve coordinator --check --json
 ```
 
+`gjc mcp-serve coordinator --check --json` (and the `hermes` compatibility alias) is a discovery-only, non-mutating catalog check. Its successful JSON payload retains `ok`, `server`, `readOnly`, and `tools`, and adds `catalog: { "ready": true, "reason": null }` plus `broker`. `broker.discovery_status` is `ready`, `unavailable`, or `error`; its reason is one of `absent_or_invalid`, `unsupported_state_version`, `discovery_access_denied`, or `discovery_read_failed` (or `null` when ready). `broker.operational_ready` is always `null`: this check observes canonical broker discovery but does not connect, ensure/bootstrap, write, repair, or delete. It reports `bootstrap_supported: true` and `bootstrap_attempted: false`, and never exposes broker paths, authority, endpoint, process, token, or raw error details. The human output remains the server/tools summary. SDK check behavior is separate and unchanged.
+
 The generated config uses these environment variables:
 
 | Variable | Purpose |

@@ -50,7 +50,7 @@ export interface StateWriterReceiptContext {
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	mutationId?: string;
 	nowIso?: string;
 	verb?: string;
@@ -267,7 +267,7 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 		content_sha256: {
 			algorithm: "sha256",
 			value: workflowEnvelopeContentSha256(envelope),
-			covered_path: filePath,
+			covered_path: path.resolve(filePath),
 			computed_at: computedAt,
 		},
 	};

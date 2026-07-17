@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, loadBuildInventory, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, loadBuildInventory, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -46,32 +46,34 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 describe("dev-ci canonical-plan workflow contract", () => {
-	test("transports and validates the planner artifact before conditional setup", async () => {
+	test("binds canonical artifacts to the run so attempt-2 consumers reuse attempt-1 producers safely", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		expect(workflow).toContain("ref: ${{ github.event.pull_request.head.sha || github.sha }}");
 		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
-		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(1);
-		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
+		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
+		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-native-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}");
+		expect(workflow).toContain("pattern: dev-affected-shard-${{ github.run_id }}-*");
+		expect(workflow).not.toContain("github.run_attempt");
+		expect(workflow.match(/overwrite: true/g)).toHaveLength(3);
+		expect(workflow.match(/dev-affected-plan-\$\{\{ github\.run_id \}\}/g)).toHaveLength(4);
+		expect(workflow.match(/dev-affected-native-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
+		expect(workflow.match(/dev-affected-shard-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
 		expect(workflow).toContain("include-hidden-files: true");
 		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
 		expect(workflow).toContain("CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}");
 		expect(workflow).toContain("CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}");
 		expect(workflow).toContain("timeout-minutes: ${{ matrix.key == 'root-check' && 30 || 90 }}");
-		expect(workflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
-		expect(workflow.indexOf("run: bun scripts/ci-dev-affected.ts --validate-plan")).toBeLessThan(workflow.indexOf("if: ${{ matrix.rust }}"));
+		expect(workflow.match(/run: bun scripts\/ci-dev-affected\.ts --validate-plan/g)).toHaveLength(3);
 		expect(workflow).toContain("if: ${{ matrix.nextest }}");
 		expect(workflow).toContain("affected-native.result != 'failure'");
 		expect(workflow).toContain("name: Affected path validation");
-		expect(workflow).toContain("has_native='${{ needs.affected-plan.outputs.has_native }}'");
-		expect(workflow).toContain("has_tasks='${{ needs.affected-plan.outputs.has_tasks }}'");
-		expect(workflow).toContain('test "$native" = success');
-		expect(workflow).toContain('test "$shards" = success');
-		expect(workflow).toContain('test "$native" = skipped');
-		expect(workflow).toContain('test "$shards" = skipped');
-		expect(workflow).toContain('case "$has_native" in true|false)');
-		expect(workflow).toContain('case "$has_tasks" in true|false)');
+		expect(workflow).toContain("CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}");
+		expect(workflow).toContain("CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}");
+		expect(workflow).toContain("--validate-aggregate");
+		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}");
+		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}");
 		expect(workflow).toContain("max-parallel: 8");
 		expect(workflow).toContain("CI_DEV_MATRIX_IDENTITY: ${{ matrix.identity }}");
 		expect(workflow).toContain("Upload shard completion receipt");
@@ -79,7 +81,43 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("--validate-shard-receipts");
 		expect(workflow).toContain("pi_natives.linux-x64-baseline.node");
 		expect(workflow).toContain("pi_natives.linux-x64-modern.node");
-		expect(workflow).toContain("dev-affected-native-v2-baseline-modern-");
+		expect(workflow).not.toContain("native-cache");
+		expect(workflow).not.toContain("pull_request_target");
+		expect(workflow).not.toContain("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830");
+		expect(workflow.match(/uses: actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830/g)).toHaveLength(4);
+		expect(workflow.match(/save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/dev' \}\}/g)).toHaveLength(3);
+		const aggregateWorkflow = workflow.slice(workflow.indexOf("  affected:\n"));
+		expect(aggregateWorkflow).toContain("name: Validate canonical affected plan");
+		expect(aggregateWorkflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
+	});
+
+	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
+		const valid: AffectedAggregateResults[] = [
+			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true" },
+			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" },
+			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false" },
+			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true" },
+		];
+		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
+
+		for (const results of [
+			{ ...valid[0]!, plan: "failure" },
+			{ ...valid[0]!, plan: "cancelled" },
+			{ ...valid[0]!, native: "failure" },
+			{ ...valid[0]!, native: "cancelled" },
+			{ ...valid[0]!, shards: "failure" },
+			{ ...valid[0]!, shards: "cancelled" },
+			{ ...valid[0]!, windowsDoctor: "failure" },
+			{ ...valid[0]!, windowsDoctor: "cancelled" },
+			{ ...valid[0]!, windowsDoctor: "skipped" },
+			{ ...valid[1]!, windowsDoctor: "success" },
+			{ ...valid[1]!, windowsDoctorRequired: "" },
+			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
+			{ ...valid[1]!, hasNative: "" },
+			{ ...valid[1]!, hasTasks: "maybe" },
+			{ ...valid[1]!, native: "success" },
+			{ ...valid[1]!, shards: "success" },
+		]) expect(() => validateAffectedAggregate(results)).toThrow();
 	});
 });
 
@@ -187,13 +225,13 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("full-workspace root-check uses the bounded CI command without native artifacts", () => {
+	test("full-workspace root-check downloads the native artifact used by generated checks", () => {
 		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
 		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
 		const rootCheck = entries.find(entry => entry.key === "root-check");
 
 		expect(nativeBuild?.nativeBuild).toBe(true);
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("rust tasks are flagged rust and need no native addon", () => {
@@ -228,6 +266,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 	const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
 	const repoRoot = path.join(import.meta.dir, "..");
 	const tempDirs: string[] = [];
+	const sourceSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
 
 	afterAll(async () => {
 		await Promise.all(tempDirs.map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -250,7 +289,8 @@ describe("--matrix-json and --task CLI fan-out", () => {
 				CI_DEV_AFFECTED_PLAN: undefined,
 				CI_DEV_PLAN_DIGEST: undefined,
 				CI_DEV_PLAN_SOURCE_SHA: undefined,
-				CI_DEV_SOURCE_SHA: undefined,
+				GITHUB_SHA: undefined,
+				CI_DEV_SOURCE_SHA: sourceSha,
 				CI_DEV_MATRIX_IDENTITY: undefined,
 				CI_DEV_MATRIX_KEY: undefined,
 				CI_DEV_MATRIX_NATIVE: undefined,
@@ -332,6 +372,31 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(missingHead.stderr).toContain("is not available");
 	});
 
+	test("PR planning uses the event base SHA when the mutable base ref has moved", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-pr-base-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		// Shard checkouts are depth-one, so use the canonical head as an available
+		// event-base commit while the mutable base ref deliberately does not exist.
+		const base = head;
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request",
+			GITHUB_BASE_REF: "ci-dev-affected-base-ref-moved",
+			GITHUB_BASE_SHA: base,
+			GITHUB_SHA: "f".repeat(40),
+			CI_DEV_SOURCE_SHA: head,
+			GITHUB_OUTPUT: outputFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(JSON.parse(result.stdout.trim())).toBeInstanceOf(Array);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain(`plan_source_sha=${head}`);
+		expect(output).toContain("plan_digest=");
+		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
+	});
+
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
@@ -362,8 +427,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 	test("package documentation changes do not schedule build shards", async () => {
 		const { stdout, exitCode } = await runScript(["--matrix-json"], "packages/coding-agent/README.md", {
 			CI_DEV_PLAN_MODE: "pr",
-			CI_DEV_SOURCE_SHA: "a".repeat(40),
-			PATH: path.dirname(Bun.which("bun") ?? process.execPath),
+			PATH: `${path.dirname(Bun.which("bun") ?? process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`,
 		});
 		expect(exitCode).toBe(0);
 		expect(JSON.parse(stdout.trim())).toEqual([]);
@@ -568,6 +632,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
+		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
+			native: true,
+			nativeBuild: false,
+		});
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -668,6 +736,8 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 
 	test("release evidence source changes select contract, dry-run, and focused evidence coverage once", () => {
@@ -687,14 +757,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("wrapper-version");
 	});
 
-	test("root-level codeish fallback uses the bounded CI command without native artifacts", () => {
+	test("root-level codeish fallback plans the native artifact required by the bounded check", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
-		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+		expect(keys).toContain("native-linux-x64");
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {
@@ -760,14 +830,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
-	test("tooling-script root-check uses the bounded CI command without native artifacts", () => {
+	test("tooling-script root-check marks the bounded check as a native consumer", () => {
 		const tasks = planTasks(["scripts/unmapped-tool.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {
@@ -781,6 +851,8 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
+		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});

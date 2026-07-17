@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
-import { getCustomThemesDir, getProjectAgentDir, Snowflake } from "@gajae-code/utils";
+import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
@@ -57,6 +57,31 @@ describe("Settings", () => {
 	afterEach(() => {
 		if (fs.existsSync(testDir)) {
 			removeTestDir();
+		}
+	});
+
+	it("does not log setting override values when initialization options differ", async () => {
+		const initialSecret = "initial-settings-secret";
+		const requestedSecret = "requested-settings-secret";
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await Settings.init({
+				inMemory: true,
+				cwd: projectDir,
+				overrides: { "auth.broker.token": initialSecret },
+			});
+			await Settings.init({
+				inMemory: true,
+				cwd: projectDir,
+				overrides: { "auth.broker.token": requestedSecret },
+			});
+
+			const logged = JSON.stringify(warning.mock.calls);
+			expect(logged).not.toContain(initialSecret);
+			expect(logged).not.toContain(requestedSecret);
+			expect(logged).toContain("auth.broker.token");
+		} finally {
+			warning.mockRestore();
 		}
 	});
 
@@ -511,5 +536,24 @@ describe("Settings", () => {
 				notifications: { telegram: { rich: { enabled: false } } },
 			});
 		});
+	});
+
+	it("loads the managed session migration policy from scoped settings", async () => {
+		await writeSettings({ session: { directoryMigration: "disabled" } });
+		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		expect(scoped.get("session.directoryMigration")).toBe("disabled");
+		expect(Settings.isolated().get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("rejects invalid managed session migration overrides", () => {
+		const invalid = Settings.isolated({ "session.directoryMigration": "merge" });
+		expect(invalid.get("session.directoryMigration")).toBe("copy-retain");
+	});
+
+	it("keeps the generated schema migration enum and default in sync", async () => {
+		const schema = JSON.parse(await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url)).text());
+		const migration = schema?.properties?.session?.properties?.directoryMigration;
+		expect(migration?.default).toBe("copy-retain");
+		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
 	});
 });

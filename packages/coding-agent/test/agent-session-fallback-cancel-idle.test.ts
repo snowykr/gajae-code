@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -45,6 +44,37 @@ function failingStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
+function typedOpaqueOverflowStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "",
+			errorStatus: 400,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
 describe("AgentSession managed fallback cancellation completion", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -60,7 +90,6 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		await session?.dispose();
 		authStorage.close();
 		tempDir.removeSync();
-		vi.restoreAllMocks();
 	});
 
 	function createSession(streamFn: AgentOptions["streamFn"]): void {
@@ -89,12 +118,16 @@ describe("AgentSession managed fallback cancellation completion", () => {
 
 	it("clears streaming state and emits one cancelled completion when aborted during an attempt", async () => {
 		const pending = new AssistantMessageEventStream();
-		createSession(() => pending);
+		const streamEntered = Promise.withResolvers<void>();
+		createSession(() => {
+			streamEntered.resolve();
+			return pending;
+		});
 		const requestTerminalSpy = vi.spyOn(session!.agent, "requestRunTerminal");
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
 		const run = session!.prompt("abort active attempt");
-		for (let i = 0; i < 20 && session!.agent.activeRunId === undefined; i += 1) await Bun.sleep(1);
+		await streamEntered.promise;
 		expect(session!.agent.activeRunId).toBeDefined();
 		await session!.abort();
 		await run;
@@ -112,23 +145,29 @@ describe("AgentSession managed fallback cancellation completion", () => {
 			),
 		).toBe(false);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
+		requestTerminalSpy.mockRestore();
 	});
 
-	it("preserves an accepted completion when a subscriber aborts after its message_end", async () => {
+	it("waitForIdle flushes an accepted agent_end deferred by a subscriber abort", async () => {
 		createSession((model, context, options) =>
 			createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options),
 		);
 		const events: AgentSessionEvent[] = [];
+		const messageEnd = Promise.withResolvers<void>();
 		let abort: Promise<void> | undefined;
 		session!.subscribe(event => {
 			events.push(event);
 			if (event.type === "message_end" && event.message.role === "assistant") {
 				abort ??= session!.abort();
+				messageEnd.resolve();
 			}
 		});
 
-		await session!.prompt("accept then abort");
+		const run = session!.prompt("accept then abort");
+		await messageEnd.promise;
+		await session!.waitForIdle();
 		await abort;
+		await run;
 		await session!.waitForIdle();
 
 		const agentEnds = events.filter(event => event.type === "agent_end");
@@ -171,24 +210,53 @@ describe("AgentSession managed fallback cancellation completion", () => {
 	});
 
 	it("clears streaming state and emits one cancelled completion when aborted during backoff", async () => {
-		let enteredBackoff!: () => void;
-		const backoff = new Promise<void>(resolve => {
-			enteredBackoff = resolve;
-		});
-		vi.spyOn(scheduler, "wait").mockImplementation(async (_delay, { signal }: { signal?: AbortSignal } = {}) => {
-			enteredBackoff();
-			await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
-		});
+		const backoff = Promise.withResolvers<void>();
 		createSession(model => failingStream(model));
 		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "auto_retry_start") backoff.resolve();
+		});
 		const run = session!.prompt("abort fallback backoff");
-		await backoff;
+		await backoff.promise;
 		await session!.abort();
 		await run;
 		await session!.waitForIdle();
 		expect(session!.isStreaming).toBe(false);
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
+	});
+
+	it("abandons the overflow-maintenance handoff before any continuation provider call", async () => {
+		const calls: string[] = [];
+		createSession((model, _context, _options) => {
+			calls.push(selector(model));
+			return typedOpaqueOverflowStream(model);
+		});
+		session!.settings.set("compaction.enabled", true);
+		const compactionStarted = Promise.withResolvers<void>();
+		const events: AgentSessionEvent[] = [];
+		let abort: Promise<void> | undefined;
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "auto_compaction_start" && event.reason === "overflow") {
+				compactionStarted.resolve();
+				abort ??= session!.abort();
+			}
+		});
+
+		const run = session!.prompt("abort overflow maintenance");
+		await compactionStarted.promise;
+		await abort;
+		await run;
+		await session!.waitForIdle();
+
+		expect(calls).toHaveLength(1);
+		expect(session!.isStreaming).toBe(false);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "agent_end")).toEqual([
+			expect.objectContaining({ stopReason: "cancelled" }),
+		]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 	});
 });

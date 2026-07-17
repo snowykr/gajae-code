@@ -11,6 +11,9 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import type { BrokerDiscovery } from "../sdk/broker/discovery";
+import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
+import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
@@ -56,6 +59,41 @@ function sinkErrorCode(error: unknown): string | undefined {
 		return undefined;
 	}
 }
+
+type CoordinatorBrokerStage = "ensure" | "read" | "connect" | "request" | "close";
+
+function toCoordinatorBrokerError(stage: CoordinatorBrokerStage, error: unknown): SdkClientError {
+	if (stage === "request" && error instanceof SdkClientError) return error;
+	if (stage === "ensure") {
+		if (error instanceof AggregateError)
+			return new SdkClientError(
+				"broker_cleanup_unverified",
+				"SDK broker bootstrap failed and cleanup was not verified.",
+			);
+		if (error instanceof UnsupportedStateVersionError)
+			return new SdkClientError(
+				"broker_discovery_unsupported",
+				"SDK broker discovery state version is unsupported.",
+			);
+		if (sinkErrorCode(error) === "EACCES" || sinkErrorCode(error) === "EPERM")
+			return new SdkClientError("broker_discovery_access_denied", "SDK broker discovery cannot be accessed.");
+		return new SdkClientError("broker_bootstrap_failed", "SDK broker bootstrap failed.");
+	}
+	if (stage === "read") {
+		if (error instanceof UnsupportedStateVersionError)
+			return new SdkClientError(
+				"broker_discovery_unsupported",
+				"SDK broker discovery state version is unsupported.",
+			);
+		if (sinkErrorCode(error) === "EACCES" || sinkErrorCode(error) === "EPERM")
+			return new SdkClientError("broker_discovery_access_denied", "SDK broker discovery cannot be accessed.");
+		return new SdkClientError("broker_discovery_unavailable", "SDK broker discovery cannot be read.");
+	}
+	return new SdkClientError(
+		stage === "request" ? "broker_request_unavailable" : "broker_transport_unavailable",
+		stage === "request" ? "SDK broker request is unavailable." : "SDK broker transport is unavailable.",
+	);
+}
 interface CoordinatorFinalResponse {
 	text: string | null;
 	format: "markdown";
@@ -78,6 +116,8 @@ interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 
 interface CoordinatorServices {
 	connectSdk?: (url: string, token: string) => Promise<SdkClient>;
+	ensureBroker?: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
+	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
@@ -2042,17 +2082,45 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		input: Record<string, unknown>,
 		idempotencyKey?: string,
 	): Promise<unknown> {
-		const discovery = await readSdkBrokerDiscovery(services.getAgentDir?.() ?? getAgentDir());
-		if (!discovery) throw new SdkClientError("not_found", "SDK broker discovery is unavailable.");
-		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-			discovery.url,
-			discovery.token,
-		);
+		const agentDir = services.getAgentDir?.() ?? getAgentDir();
 		try {
-			return await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
-		} finally {
-			await client.close();
+			await (services.ensureBroker ?? ensureBroker)({ agentDir });
+		} catch (error) {
+			throw toCoordinatorBrokerError("ensure", error);
 		}
+
+		let discovery: BrokerDiscovery | null;
+		try {
+			discovery = await (services.readSdkBrokerDiscovery ?? readSdkBrokerDiscovery)(agentDir);
+		} catch (error) {
+			throw toCoordinatorBrokerError("read", error);
+		}
+		if (!discovery) throw new SdkClientError("broker_unavailable", "SDK broker is unavailable after bootstrap.");
+
+		let client: SdkClient;
+		try {
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				discovery.url,
+				discovery.token,
+			);
+		} catch (error) {
+			throw toCoordinatorBrokerError("connect", error);
+		}
+
+		let requestError: SdkClientError | undefined;
+		let result: unknown;
+		try {
+			result = await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
+		} catch (error) {
+			requestError = toCoordinatorBrokerError("request", error);
+		}
+		try {
+			await client.close();
+		} catch (error) {
+			if (!requestError) throw toCoordinatorBrokerError("close", error);
+		}
+		if (requestError) throw requestError;
+		return result;
 	}
 
 	function brokerResult(value: unknown): Record<string, unknown> {

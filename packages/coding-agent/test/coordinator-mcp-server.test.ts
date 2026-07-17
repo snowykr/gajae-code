@@ -4,8 +4,25 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
-import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	type BrokerDiscovery,
+	brokerDiscoveryPath,
+	brokerProcessIncarnation,
+	readBrokerDiscovery,
+	writeBrokerDiscovery,
+} from "../src/sdk/broker/discovery";
+import {
+	brokerOwnerForTest,
+	type EnsureBrokerSettings,
+	startFixtureBrokerWithLeaseForTest,
+} from "../src/sdk/broker/ensure";
+import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
+import {
+	cleanupFixtureRoot,
+	createFixtureBrokerEnvironment,
+	createFixtureRootCleanup,
+} from "./helpers/fixture-broker-cleanup";
 
 const tempDirs: string[] = [];
 
@@ -14,6 +31,12 @@ async function tempRoot(): Promise<string> {
 	const canonical = await fs.realpath(dir);
 	tempDirs.push(canonical);
 	return canonical;
+}
+
+/** Real detached-broker fixtures are cleaned solely by cleanupFixtureRoot. */
+async function managedFixtureRoot(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-managed-broker-"));
+	return fs.realpath(dir);
 }
 
 afterEach(async () => {
@@ -44,6 +67,60 @@ function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
 		control => control.operation !== "session.list" && control.operation !== "session.get_endpoint",
 	);
+}
+
+type BrokerTestServices = {
+	ensureBroker: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
+	readSdkBrokerDiscovery: (agentDir: string) => Promise<BrokerDiscovery | null>;
+	connectSdk: (url: string, token: string) => Promise<SdkClient>;
+};
+
+function testBrokerDiscovery(): BrokerDiscovery {
+	return {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test-owner",
+		pid: process.pid,
+		incarnation: "test-incarnation",
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://broker.example.test",
+		token: "test-token",
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	};
+}
+
+function createBrokerTestServer(root: string, services: BrokerTestServices) {
+	return createCoordinatorMcpServer({
+		env: {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		},
+		services: { ...services, getAgentDir: () => path.join(root, "agent-global") },
+	});
+}
+function createRealBrokerServer(root: string, agentDir: string) {
+	return createCoordinatorMcpServer({
+		env: {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		},
+		services: { getAgentDir: () => agentDir },
+	});
+}
+
+function ownerLease(agentDir: string) {
+	return {
+		async close(): Promise<void> {
+			await brokerOwnerForTest(agentDir)?.stop();
+		},
+	};
 }
 
 async function createSdkControlServer(
@@ -1496,5 +1573,363 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		]);
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
+	});
+	describe("Coordinator MCP real broker lifecycle", () => {
+		for (const discoveryState of [
+			"no discovery",
+			"dead discovery",
+			"stale discovery",
+			"process incarnation mismatch",
+			"malformed JSON",
+			"canonical-shape-invalid readable discovery",
+		] as const) {
+			it(`boots and lists sessions with ${discoveryState}`, async () => {
+				const root = await managedFixtureRoot();
+				const agentDir = path.join(root, "agent-global");
+				const cleanup = createFixtureRootCleanup(root, agentDir, ownerLease(agentDir));
+				try {
+					if (discoveryState === "malformed JSON") {
+						await fs.mkdir(path.dirname(brokerDiscoveryPath(agentDir)), { recursive: true });
+						await Bun.write(brokerDiscoveryPath(agentDir), "{not-json");
+					} else if (discoveryState === "canonical-shape-invalid readable discovery") {
+						await fs.mkdir(path.dirname(brokerDiscoveryPath(agentDir)), { recursive: true });
+						await Bun.write(
+							brokerDiscoveryPath(agentDir),
+							JSON.stringify({ version: 1, protocolVersion: 3, host: "127.0.0.1", pid: process.pid }),
+						);
+					} else if (discoveryState !== "no discovery") {
+						const actualIncarnation = brokerProcessIncarnation(process.pid);
+						if (!actualIncarnation) throw new Error("Test process incarnation is unavailable.");
+						await writeBrokerDiscovery(agentDir, {
+							version: 1,
+							protocolVersion: 3,
+							packageGeneration: "test",
+							ownerId: "stale-owner",
+							pid: discoveryState === "dead discovery" ? 2_147_483_647 : process.pid,
+							incarnation:
+								discoveryState === "process incarnation mismatch"
+									? "mismatched-incarnation"
+									: actualIncarnation,
+							host: "127.0.0.1",
+							port: 1,
+							url: "ws://127.0.0.1:1",
+							token: "stale-token",
+							startedAt: Date.now() - 60_000,
+							heartbeatAt: discoveryState === "stale discovery" ? Date.now() - 60_000 : Date.now(),
+						});
+					}
+
+					const result = await createRealBrokerServer(root, agentDir).callTool(
+						"gjc_coordinator_list_sessions",
+						{},
+					);
+					expect(result).toMatchObject({ ok: true, sessions: [] });
+					const discovery = await readBrokerDiscovery(agentDir);
+					expect(discovery).not.toBeNull();
+					if (!discovery) throw new Error("Broker discovery was not published after bootstrap.");
+					if (discoveryState !== "no discovery") expect(discovery.token).not.toBe("stale-token");
+					expect(brokerOwnerForTest(agentDir)).toBeDefined();
+				} finally {
+					await cleanupFixtureRoot(cleanup);
+					expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+				}
+			}, 15_000);
+		}
+
+		it("reuses a live broker discovery without replacing its identity", async () => {
+			const root = await managedFixtureRoot();
+			const agentDir = path.join(root, "agent-global");
+			const cleanup = createFixtureRootCleanup(root, agentDir, ownerLease(agentDir));
+			try {
+				const started = await startFixtureBrokerWithLeaseForTest({
+					agentDir,
+					env: createFixtureBrokerEnvironment(root, agentDir),
+				});
+				cleanup.lease = started.lease;
+				const owner = brokerOwnerForTest(agentDir);
+				expect(owner).toBeDefined();
+				const result = await createRealBrokerServer(root, agentDir).callTool("gjc_coordinator_list_sessions", {});
+				expect(result).toMatchObject({ ok: true, sessions: [] });
+				const reused = await readBrokerDiscovery(agentDir);
+				expect(reused).toMatchObject({
+					pid: started.discovery.pid,
+					incarnation: started.discovery.incarnation,
+					ownerId: started.discovery.ownerId,
+					token: started.discovery.token,
+				});
+				expect(brokerOwnerForTest(agentDir)).toBe(owner);
+			} finally {
+				await cleanupFixtureRoot(cleanup);
+				expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+			}
+		}, 15_000);
+
+		it("routes concurrent first calls through one canonical broker owner", async () => {
+			const root = await managedFixtureRoot();
+			const agentDir = path.join(root, "agent-global");
+			const cleanup = createFixtureRootCleanup(root, agentDir, ownerLease(agentDir));
+			try {
+				const server = createRealBrokerServer(root, agentDir);
+				const results = await Promise.all([
+					server.callTool("gjc_coordinator_list_sessions", {}),
+					server.callTool("gjc_coordinator_list_sessions", {}),
+				]);
+				expect(results).toEqual([
+					{ ok: true, sessions: [] },
+					{ ok: true, sessions: [] },
+				]);
+				const owner = brokerOwnerForTest(agentDir);
+				expect(owner).toBeDefined();
+				const discovery = await readBrokerDiscovery(agentDir);
+				expect(discovery).not.toBeNull();
+				await expect(server.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
+					ok: true,
+					sessions: [],
+				});
+				expect(brokerOwnerForTest(agentDir)).toBe(owner);
+			} finally {
+				await cleanupFixtureRoot(cleanup);
+				expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+			}
+		}, 15_000);
+	});
+
+	it("ensures before re-reading broker discovery", async () => {
+		const root = await tempRoot();
+		const phases: string[] = [];
+		const server = createBrokerTestServer(root, {
+			ensureBroker: async settings => {
+				phases.push(`ensure:${settings.agentDir}`);
+				return testBrokerDiscovery();
+			},
+			readSdkBrokerDiscovery: async agentDir => {
+				phases.push(`read:${agentDir}`);
+				return testBrokerDiscovery();
+			},
+			connectSdk: async () => {
+				phases.push("connect");
+				return {
+					global: async () => ({ ok: true, result: { sessions: [] } }),
+					close: async () => {},
+				} as unknown as SdkClient;
+			},
+		});
+		await expect(server.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
+			ok: true,
+			sessions: [],
+		});
+		expect(phases).toEqual([
+			`ensure:${path.join(root, "agent-global")}`,
+			`read:${path.join(root, "agent-global")}`,
+			"connect",
+		]);
+	});
+
+	it("routes concurrent broker operations through the canonical ensure seam", async () => {
+		const root = await tempRoot();
+		let starts = 0;
+		let inFlight: Promise<BrokerDiscovery> | undefined;
+		const server = createBrokerTestServer(root, {
+			ensureBroker: async () => {
+				inFlight ??= Promise.resolve().then(() => {
+					starts += 1;
+					return testBrokerDiscovery();
+				});
+				return await inFlight;
+			},
+			readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
+			connectSdk: async () =>
+				({
+					global: async () => ({ ok: true, result: { sessions: [] } }),
+					close: async () => {},
+				}) as unknown as SdkClient,
+		});
+		await expect(
+			Promise.all([
+				server.callTool("gjc_coordinator_list_sessions", {}),
+				server.callTool("gjc_coordinator_list_sessions", {}),
+			]),
+		).resolves.toEqual([
+			{ ok: true, sessions: [] },
+			{ ok: true, sessions: [] },
+		]);
+		expect(starts).toBe(1);
+	});
+
+	it("maps injected broker failures by the explicit operational phase", async () => {
+		const root = await tempRoot();
+		const cases: Array<{
+			stage: "ensure" | "read" | "connect" | "request";
+			error: Error;
+			code: string;
+			message?: string;
+		}> = [
+			{ stage: "ensure", error: new AggregateError([new Error("token-secret")]), code: "broker_cleanup_unverified" },
+			{
+				stage: "ensure",
+				error: new UnsupportedStateVersionError("/secret/path", 2),
+				code: "broker_discovery_unsupported",
+			},
+			{
+				stage: "ensure",
+				error: Object.assign(new Error("secret"), { code: "EACCES" }),
+				code: "broker_discovery_access_denied",
+			},
+			{
+				stage: "ensure",
+				error: Object.assign(new Error("secret"), { code: "EPERM" }),
+				code: "broker_discovery_access_denied",
+			},
+			{ stage: "ensure", error: new Error("token-secret"), code: "broker_bootstrap_failed" },
+			{
+				stage: "read",
+				error: new UnsupportedStateVersionError("/secret/path", 2),
+				code: "broker_discovery_unsupported",
+			},
+			{
+				stage: "read",
+				error: Object.assign(new Error("secret"), { code: "EACCES" }),
+				code: "broker_discovery_access_denied",
+			},
+			{
+				stage: "read",
+				error: Object.assign(new Error("secret"), { code: "EPERM" }),
+				code: "broker_discovery_access_denied",
+			},
+			{
+				stage: "read",
+				error: new AggregateError([new Error("token-secret")]),
+				code: "broker_discovery_unavailable",
+			},
+			{ stage: "read", error: new Error("token-secret"), code: "broker_discovery_unavailable" },
+			{
+				stage: "connect",
+				error: new AggregateError([new Error("token-secret")]),
+				code: "broker_transport_unavailable",
+			},
+			{
+				stage: "connect",
+				error: new UnsupportedStateVersionError("/secret/path", 2),
+				code: "broker_transport_unavailable",
+			},
+			{
+				stage: "connect",
+				error: Object.assign(new Error("secret"), { code: "EACCES" }),
+				code: "broker_transport_unavailable",
+			},
+			{
+				stage: "connect",
+				error: new SdkClientError("transport_secret", "token-secret"),
+				code: "broker_transport_unavailable",
+			},
+			{
+				stage: "request",
+				error: new AggregateError([new Error("token-secret")]),
+				code: "broker_request_unavailable",
+			},
+			{
+				stage: "request",
+				error: new UnsupportedStateVersionError("/secret/path", 2),
+				code: "broker_request_unavailable",
+			},
+			{
+				stage: "request",
+				error: Object.assign(new Error("secret"), { code: "EACCES" }),
+				code: "broker_request_unavailable",
+			},
+			{ stage: "request", error: new Error("token-secret"), code: "broker_request_unavailable" },
+			{
+				stage: "request",
+				error: new SdkClientError("transport_secret", "request public message"),
+				code: "transport_secret",
+				message: "request public message",
+			},
+		];
+		for (const testCase of cases) {
+			const client = {
+				global: async () => {
+					if (testCase.stage === "request") throw testCase.error;
+					return { ok: true, result: { sessions: [] } };
+				},
+				close: async () => {},
+			} as unknown as SdkClient;
+			const server = createBrokerTestServer(root, {
+				ensureBroker: async () => {
+					if (testCase.stage === "ensure") throw testCase.error;
+					return testBrokerDiscovery();
+				},
+				readSdkBrokerDiscovery: async () => {
+					if (testCase.stage === "read") throw testCase.error;
+					return testBrokerDiscovery();
+				},
+				connectSdk: async () => {
+					if (testCase.stage === "connect") throw testCase.error;
+					return client;
+				},
+			});
+			const result = await server.callTool("gjc_coordinator_list_sessions", {});
+			expect(result).toMatchObject({ ok: false, error: { code: testCase.code } });
+			if (testCase.message) expect(result).toMatchObject({ error: { message: testCase.message } });
+			expect(JSON.stringify(result)).not.toContain("token-secret");
+			expect(JSON.stringify(result)).not.toContain("/secret/path");
+		}
+		const nullServer = createBrokerTestServer(root, {
+			ensureBroker: async () => testBrokerDiscovery(),
+			readSdkBrokerDiscovery: async () => null,
+			connectSdk: async () =>
+				({ global: async () => ({ ok: true }), close: async () => {} }) as unknown as SdkClient,
+		});
+		await expect(nullServer.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
+			ok: false,
+			error: { code: "broker_unavailable", message: "SDK broker is unavailable after bootstrap." },
+		});
+	});
+
+	it("attempts close once and preserves the primary request failure", async () => {
+		const root = await tempRoot();
+		for (const requestError of [
+			new SdkClientError("request_failed", "request public message"),
+			new Error("request-secret"),
+		]) {
+			let closeCalls = 0;
+			const server = createBrokerTestServer(root, {
+				ensureBroker: async () => testBrokerDiscovery(),
+				readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
+				connectSdk: async () =>
+					({
+						global: async () => {
+							throw requestError;
+						},
+						close: async () => {
+							closeCalls += 1;
+							throw new Error("close-secret");
+						},
+					}) as unknown as SdkClient,
+			});
+			const result = await server.callTool("gjc_coordinator_list_sessions", {});
+			expect(result).toMatchObject({
+				ok: false,
+				error: { code: requestError instanceof SdkClientError ? "request_failed" : "broker_request_unavailable" },
+			});
+			expect(closeCalls).toBe(1);
+		}
+		let closeCalls = 0;
+		const closeFailureServer = createBrokerTestServer(root, {
+			ensureBroker: async () => testBrokerDiscovery(),
+			readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
+			connectSdk: async () =>
+				({
+					global: async () => ({ ok: true, result: { sessions: [] } }),
+					close: async () => {
+						closeCalls += 1;
+						throw new SdkClientError("close_secret", "close-secret");
+					},
+				}) as unknown as SdkClient,
+		});
+		await expect(closeFailureServer.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
+			ok: false,
+			error: { code: "broker_transport_unavailable", message: "SDK broker transport is unavailable." },
+		});
+		expect(closeCalls).toBe(1);
 	});
 });

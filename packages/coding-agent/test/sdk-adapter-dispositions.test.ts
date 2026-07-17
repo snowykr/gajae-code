@@ -90,6 +90,7 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"session.export_html": "invalid_request",
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
+	"mode.plan.set": "unavailable",
 };
 const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.create": "invalid_input",
@@ -187,7 +188,7 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 		case "extension.set_enabled":
 			return { id: "missing-extension", on: true };
 		case "session.cwd.move":
-			return { path: "/missing" };
+			return { path: process.cwd() };
 		case "session.get_endpoint":
 			return { sessionId: "missing-session" };
 		case "transcript.body":
