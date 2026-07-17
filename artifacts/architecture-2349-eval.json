@@ -7,18 +7,18 @@
     "packages/coding-agent/src/prompts/tools/browser.md": {
       "beforeBytes": 8373,
       "afterBytes": 3450,
-      "beforeTokensApprox": 2076,
-      "afterTokensApprox": 857,
-      "tokenReductionApprox": 1219,
-      "tokenizer": "bytes/4 approximation applied identically to before and after"
+      "beforeTokensApprox": 2093,
+      "afterTokensApprox": 862,
+      "tokenReductionApprox": 1231,
+      "tokenizer": "floor(utf8Bytes/4) approximation applied identically to before and after"
     },
     "packages/coding-agent/src/prompts/tools/hashline.md": {
       "beforeBytes": 4839,
       "afterBytes": 3693,
-      "beforeTokensApprox": 1188,
-      "afterTokensApprox": 909,
-      "tokenReductionApprox": 279,
-      "tokenizer": "bytes/4 approximation applied identically to before and after"
+      "beforeTokensApprox": 1209,
+      "afterTokensApprox": 923,
+      "tokenReductionApprox": 286,
+      "tokenizer": "floor(utf8Bytes/4) approximation applied identically to before and after"
     }
   },
   "fullApiReference": "docs/tools/browser.md (pre-existing, verified to cover all tab.* helpers, browser kinds, CDP/profile details)",
