@@ -4,6 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import {
+	type ModelLookupRegistry,
+	resolveModelOverride,
+	resolveModelOverrideWithAuthFallback,
+} from "@gajae-code/coding-agent/config/model-resolver";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
@@ -774,6 +779,77 @@ describe("ModelRegistry", () => {
 				sessionId: "sticky-session",
 			});
 			expect(resolved).toBe(initial);
+		});
+		test("seeds isolated child canonical scopes from a concrete parent model", async () => {
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const parentRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const parentModel = parentRegistry.find("alpha", "anthropic/claude-sonnet-4.5");
+			expect(parentModel).toBeDefined();
+			const parentActiveModelPattern = `${parentModel!.provider}/${parentModel!.id}`;
+
+			// A fresh registry has no in-memory parent session stickiness, but its
+			// persisted concrete active model still seeds the child scope.
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			const childA = "subagent:parent-session:child-a";
+			const childB = "subagent:parent-session:child-b";
+			const lookup: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
+				getAvailable: () => registry.getAvailable(),
+				resolveCanonicalModel: registry.resolveCanonicalModel.bind(registry),
+				seedCanonicalVariant: registry.seedCanonicalVariant.bind(registry),
+				getApiKey: async model => (model.provider === "alpha" ? "test-key" : undefined),
+			};
+			const resumed = await resolveModelOverrideWithAuthFallback(
+				["claude-sonnet-4-5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(resumed.model).toBe(alphaModel);
+			// The child-first canonical lookup must not populate the parent scope.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable().reverse(),
+					sessionId: "parent-session",
+				}),
+			).toBe(betaModel);
+			expect(registry.seedCanonicalVariant(childB, betaModel)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable(),
+					sessionId: childB,
+				}),
+			).toBe(betaModel);
+			// Repeated attempts for a child retain its own seeded variant.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable().reverse(),
+					sessionId: childA,
+				}),
+			).toBe(alphaModel);
+
+			const explicit = resolveModelOverride(["beta/anthropic/claude-sonnet-4.5"], registry, undefined, childA);
+			expect(explicit.model).toBe(betaModel);
+			const fallback = await resolveModelOverrideWithAuthFallback(
+				["beta/anthropic/claude-sonnet-4.5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(fallback.model).toBe(alphaModel);
+			expect(fallback.authFallbackUsed).toBe(true);
 		});
 	});
 

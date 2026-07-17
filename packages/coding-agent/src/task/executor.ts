@@ -87,6 +87,11 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 		.filter(Boolean);
 }
 
+function getSubagentCanonicalScope(parentSessionId: string | undefined, subagentId: string): string | undefined {
+	if (!parentSessionId) return undefined;
+	return JSON.stringify(["subagent-canonical", parentSessionId, subagentId]);
+}
+
 function renderIrcPeerRoster(agentRegistry: AgentRegistry, selfId: string): string {
 	const peers = agentRegistry
 		.list()
@@ -1232,6 +1237,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
+
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -1250,6 +1257,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					settings,
 					options.parentSessionId,
 					{ managedFallback: true },
+					canonicalChildScope,
 				),
 			);
 			if (model) {

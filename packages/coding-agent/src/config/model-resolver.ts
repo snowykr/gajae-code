@@ -201,7 +201,7 @@ export interface ModelMatchPreferences {
 }
 
 export type CanonicalModelRegistry = Partial<
-	Pick<ModelRegistry, "resolveCanonicalModel" | "getCanonicalVariants" | "getCanonicalId">
+	Pick<ModelRegistry, "resolveCanonicalModel" | "getCanonicalVariants" | "getCanonicalId" | "seedCanonicalVariant">
 >;
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable"> & Partial<CanonicalModelRegistry>;
 type CliModelRegistry = Pick<ModelRegistry, "getAll"> & Partial<CanonicalModelRegistry>;
@@ -856,8 +856,9 @@ export async function resolveModelOverrideWithAuthFallback(
 	parentActiveModelPattern: string | undefined,
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
-	sessionId?: string,
+	authSessionId?: string,
 	options?: ModelChainResolutionOptions,
+	canonicalSessionId?: string,
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
@@ -875,12 +876,19 @@ export async function resolveModelOverrideWithAuthFallback(
 	let requestedResolution: ResolvedModelRoleValue | undefined;
 	const skips: Array<{ selector: string; reason: string }> = [];
 	let activeIndex = 0;
+	const canonicalScope = canonicalSessionId ?? authSessionId;
+	if (canonicalScope && parentActiveModelPattern) {
+		const parentActiveModel = resolveModelOverride([parentActiveModelPattern], modelRegistry, settings).model;
+		if (parentActiveModel) {
+			modelRegistry.seedCanonicalVariant?.(canonicalScope, parentActiveModel);
+		}
+	}
 	for (const pattern of modelPatterns) {
 		const candidate = resolveModelRoleValue(pattern, availableModels, {
 			settings,
 			matchPreferences,
 			modelRegistry,
-			sessionId,
+			sessionId: canonicalScope,
 		});
 		if (!requestedModel && candidate.model) {
 			requestedModel = candidate.model;
@@ -899,7 +907,7 @@ export async function resolveModelOverrideWithAuthFallback(
 				continue;
 			}
 		}
-		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
+		const key = await modelRegistry.getApiKey(candidate.model, authSessionId);
 		if (key === kNoAuth || isAuthenticated(key)) {
 			return { ...candidate, requestedModel: candidate.model, authFallbackUsed: false, activeIndex, skips };
 		}
@@ -907,10 +915,10 @@ export async function resolveModelOverrideWithAuthFallback(
 		activeIndex += 1;
 	}
 	const fallback = parentActiveModelPattern
-		? resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, sessionId)
+		? resolveModelOverride([parentActiveModelPattern], modelRegistry, settings, authSessionId)
 		: { explicitThinkingLevel: false };
 	if (fallback.model) {
-		const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
+		const fallbackKey = await modelRegistry.getApiKey(fallback.model, authSessionId);
 		if (fallbackKey === kNoAuth || isAuthenticated(fallbackKey)) {
 			const isParentSubstitution = requestedModel === undefined || !modelsAreEqual(fallback.model, requestedModel);
 			return {

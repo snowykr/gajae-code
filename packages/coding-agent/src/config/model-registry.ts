@@ -2648,6 +2648,19 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Seed a child canonical scope from a concrete parent model without touching
+	 * the parent's canonical selection.
+	 */
+	seedCanonicalVariant(sessionId: string, model: Model<Api>): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		const selector = formatCanonicalVariantSelector(model);
+		if (!this.#canonicalIndex.bySelector.has(selector.toLowerCase())) return false;
+		this.#rememberCanonicalVariant(scope, selector);
+		return true;
+	}
+
+	/**
 	 * Get only models that have auth configured.
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
