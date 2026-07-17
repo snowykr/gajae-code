@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "kind": "prompt-trim-eval-test-report",
+  "issue": 2349,
+  "baseCommit": "f229f81d",
+  "measurements": {
+    "packages/coding-agent/src/prompts/tools/browser.md": {
+      "beforeBytes": 8373,
+      "afterBytes": 3450,
+      "beforeTokensApprox": 2076,
+      "afterTokensApprox": 857,
+      "tokenReductionApprox": 1219,
+      "tokenizer": "bytes/4 approximation applied identically to before and after"
+    },
+    "packages/coding-agent/src/prompts/tools/hashline.md": {
+      "beforeBytes": 4839,
+      "afterBytes": 3693,
+      "beforeTokensApprox": 1188,
+      "afterTokensApprox": 909,
+      "tokenReductionApprox": 279,
+      "tokenizer": "bytes/4 approximation applied identically to before and after"
+    }
+  },
+  "fullApiReference": "docs/tools/browser.md (pre-existing, verified to cover all tab.* helpers, browser kinds, CDP/profile details)",
+  "editEval": {
+    "method": "Targeted edit-tool suite comparison on identical corpus: dev prompt contents (git stash baseline) vs trimmed prompt contents. The hashline template feeds the edit tool description; the suites exercise hashline parsing, native hashline, edit diffs, fallbacks, auto-generated regressions, streaming previews, and renderer contracts.",
+    "command": "bun test test/core/hashline.test.ts test/core/hashline-native.test.ts test/core/hashline-native-nul.test.ts test/edit-diff.test.ts test/edit-diff-fallback.test.ts test/edit-auto-generated-regressions.test.ts test/edit-per-file-diff-content.test.ts test/edit-streaming-preview.test.ts test/tools/edit-diff.test.ts test/tools/edit-renderer.test.ts test/system-prompt-templates.test.ts",
+    "baseline": "167 pass, 0 fail, 465 expect() calls",
+    "trimmed": "167 pass, 0 fail, 465 expect() calls",
+    "verdict": "no regression"
+  },
+  "constraintsHonored": [
+    "No browser or edit tool behavior/API changes; prompt markdown only.",
+    "Hashline retains all rules content (common-failures merged into rules without dropping obligations); two examples kept; anti-pattern section removed as duplicate of rules.",
+    "Browser prompt names the exact self-serve docs path docs/tools/browser.md."
+  ]
+}
