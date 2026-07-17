@@ -4,6 +4,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
+import {
+	buildAskGateAnswerSchema,
+	GATE_OTHER_OPTION,
+	type WorkflowGate,
+} from "../src/modes/shared/agent-wire/workflow-gate-types";
 import {
 	type BrokerDiscovery,
 	brokerDiscoveryPath,
@@ -17,6 +23,7 @@ import {
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
+
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import {
 	cleanupFixtureRoot,
@@ -67,6 +74,37 @@ function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
 		control => control.operation !== "session.list" && control.operation !== "session.get_endpoint",
 	);
+}
+
+function sharedAskGate(gateId: string, runtimeTurnId: string): WorkflowGate & { id: string; tag: "pending" } {
+	const labels = ["Continue", "Stop"];
+	const schema = buildAskGateAnswerSchema({ multi: false, allowEmpty: false }, labels);
+	return {
+		id: `pending:${gateId}`,
+		tag: "pending",
+		type: "workflow_gate",
+		gate_id: gateId,
+		runtime_turn_id: runtimeTurnId,
+		stage: "deep-interview",
+		kind: "question",
+		schema,
+		schema_hash: schemaHash(schema),
+		required: true,
+		created_at: "2026-07-17T00:00:00.000Z",
+		context: {
+			title: "Continue?",
+			prompt: "Continue?",
+			stage_state: {
+				question_id: gateId,
+				multi: false,
+				allow_empty: false,
+				options: labels,
+				other_option: GATE_OTHER_OPTION,
+				clarification_action: "clarify",
+			},
+		},
+		options: labels.map(label => ({ value: label, label })),
+	};
 }
 
 type BrokerTestServices = {
@@ -127,7 +165,7 @@ async function createSdkControlServer(
 	root: string,
 	controls: SdkControl[],
 	queries: string[] = [],
-	queryResult: (query: string) => unknown = query =>
+	queryResult: (query: string, cursor?: string) => unknown = query =>
 		query === "context.get"
 			? {
 					type: "query_response",
@@ -260,9 +298,9 @@ async function createSdkControlServer(
 						}
 						return { ok: true, result: { sessionId: String(input.sessionId ?? "visible-session") } };
 					},
-					query: async (query: string) => {
+					query: async (query: string, _input: Record<string, unknown>, cursor?: string) => {
 						queries.push(query);
-						return queryResult(query);
+						return queryResult(query, cursor);
 					},
 					close: async () => {},
 				}) as unknown as SdkClient,
@@ -334,7 +372,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
 		expect(status).toMatchObject({
 			ok: true,
-			session: { session_id: "visible-session", cwd: root },
+			session: { session_id: "visible-session" },
 			status: { authority: "sdk_broker", live: true },
 		});
 		const publicResult = JSON.stringify(status);
@@ -343,6 +381,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-endpoint-secret");
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
+		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 			{
@@ -697,7 +736,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
-		expect(queries).toEqual(["context.get"]);
+		expect(queries).toEqual(["Q12", "context.get"]);
 	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();
@@ -717,7 +756,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
-		expect(queries).toEqual(["context.get"]);
+		expect(queries).toEqual(["Q12", "context.get"]);
 	});
 
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
@@ -1078,10 +1117,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const completed = JSON.parse(await fs.readFile(registerFile, "utf8"));
 		await Bun.write(registerFile, JSON.stringify({ ...completed, state: "in_progress" }));
 		const endpointReads = controls.filter(control => control.operation === "session.get_endpoint").length;
-		await expect(registerSdkSession(server, root)).resolves.toMatchObject({
-			ok: false,
-			error: { code: "idempotency_in_progress" },
-		});
+		await expect(registerSdkSession(server, root)).resolves.toMatchObject({ ok: true, registered: true });
 		expect(controls.filter(control => control.operation === "session.get_endpoint")).toHaveLength(endpointReads);
 	});
 	it("fails closed on workspace and endpoint-generation binding changes", async () => {
@@ -1173,7 +1209,10 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					pid: 101,
 					endpointMtimeMs,
 				});
-			else sessions[0]!.endpointMtimeMs = endpointMtimeMs;
+			else {
+				sessions[0]!.endpointMtimeMs = endpointMtimeMs;
+				sessions[0]!.endpointGeneration = endpointMtimeMs;
+			}
 			await expect(
 				server.callTool("gjc_coordinator_register_session", {
 					session_id: "visible-session",
@@ -1294,27 +1333,182 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				allow_mutation: true,
 			}),
 		).toMatchObject({ ok: true, operation: "turn.abort_and_prompt", turn: { status: "active" } });
-		expect(
-			await server.callTool("gjc_coordinator_submit_question_answer", {
-				session_id: "visible-session",
-				question_id: "ask-1",
-				answer: { choice: "yes" },
-				idempotency_key: "answer-1",
-				allow_mutation: true,
-			}),
-		).toMatchObject({ ok: true, operation: "ask.answer", result: { accepted: true } });
 		expect(lifecycleControls(controls)).toEqual([
 			{ operation: "turn.prompt", input: { text: "first" }, idempotencyKey: "prompt-1" },
 			{ operation: "turn.follow_up", input: { text: "follow up" }, idempotencyKey: "prompt-2" },
 			{ operation: "turn.abort_and_prompt", input: { text: "replace" }, idempotencyKey: "prompt-3" },
-			{ operation: "ask.answer", input: { id: "ask-1", answer: { choice: "yes" } }, idempotencyKey: "answer-1" },
 		]);
 		expect(controlOptions).toEqual([
 			{ idempotencyKey: "prompt-1", timeoutMs: 17 },
 			{ idempotencyKey: "prompt-2", timeoutMs: 17 },
 			{ idempotencyKey: "prompt-3", timeoutMs: 17 },
-			{ idempotencyKey: "answer-1" },
 		]);
+	});
+
+	it("materializes a legal two-page Q12 snapshot on one connection and submits its bound shared-producer answer", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const q12Calls: Array<string | undefined> = [];
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			(query, cursor) => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				q12Calls.push(cursor);
+				return cursor
+					? {
+							ok: true,
+							page: { items: [sharedAskGate("gate-q12", runtimeTurnId)], complete: true, revision: "q12-r1" },
+						}
+					: {
+							ok: true,
+							page: {
+								items: [],
+								complete: false,
+								preview: true,
+								continuationCursor: "page-2",
+								revision: "q12-r1",
+							},
+						};
+			},
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer" ? { status: "accepted" } : undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "open gate",
+			idempotency_key: "gate-owner",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({ ok: true, reconciliation: { complete: true, revision: "q12-r1" } });
+		expect(q12Calls).toEqual([undefined, "page-2"]);
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		expect(question).toMatchObject({
+			question_id: "gate-q12",
+			status: "pending",
+		});
+		expect(JSON.stringify(question)).not.toContain("codec");
+		if (typeof question.answer_binding !== "string") throw new Error("missing answer binding");
+		expect(question.answer_binding).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+		const answer = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "gate-q12",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "answer-q12",
+			allow_mutation: true,
+		});
+		expect(answer).toMatchObject({
+			ok: true,
+			operation: "workflow.gate_answer",
+			status: "accepted",
+			replayed: false,
+		});
+		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toEqual([
+			expect.objectContaining({
+				input: { id: "gate-q12", response: { selected: ["Continue"] }, expectedSessionId: "visible-session" },
+			}),
+		]);
+		const replay = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "gate-q12",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "answer-q12",
+			allow_mutation: true,
+		});
+		expect(replay).toMatchObject({ ok: true, status: "accepted", replayed: false });
+		expect(
+			await server.callTool("gjc_coordinator_submit_question_answer", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				question_id: "gate-q12",
+				answer_binding: question.answer_binding,
+				answer: { selected: ["opt_1"] },
+				idempotency_key: "answer-q12",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+	});
+
+	it("rejects malformed complete Q12 snapshots without mutating question authority", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "unbound";
+		const gates = () => [
+			{ ...sharedAskGate("bad-runtime", runtimeTurnId), runtime_turn_id: "" },
+			{ ...sharedAskGate("unsupported", runtimeTurnId), kind: "approval" },
+		];
+		const server = await createSdkControlServer(root, controls, [], query =>
+			query === "Q12"
+				? { ok: true, page: { items: gates(), complete: true, revision: "q12-bad" } }
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "owner",
+			idempotency_key: "owner-bad",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		const first = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const second = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(first).toMatchObject({
+			questions: [],
+			diagnostics: expect.arrayContaining([expect.objectContaining({ reason: "pagination_malformed" })]),
+			reconciliation: { complete: false, reason: "pagination_malformed" },
+		});
+		expect(second).toMatchObject({ questions: [], reconciliation: { complete: false } });
+	});
+
+	it("does not fabricate stale questions from incomplete or paginated Q12 observations", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const queries: string[] = [];
+		const server = await createSdkControlServer(root, controls, queries, query => {
+			if (query === "Q12") {
+				return {
+					type: "query_response",
+					id: "q12-incomplete",
+					ok: true,
+					page: { items: [], complete: false, revision: "partial-q12" },
+				};
+			}
+			return {
+				type: "query_response",
+				id: "context",
+				ok: true,
+				page: { items: [], complete: true, revision: "context" },
+			};
+		});
+		await registerSdkSession(server, root);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({
+			ok: true,
+			schema_version: 1,
+			questions: [],
+			reconciliation: { attempted: true, complete: false, revision: "partial-q12" },
+		});
+		expect(JSON.stringify(listed)).not.toContain("answer_binding");
+		expect(queries).toEqual(["Q12"]);
 	});
 
 	it("delivers every delegation workflow through broker lifecycle and SDK control", async () => {
@@ -1932,4 +2126,69 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		});
 		expect(closeCalls).toBe(1);
 	});
+});
+
+it("repairs one terminal session without deleting another session's projections", async () => {
+	const root = await tempRoot();
+	const controls: SdkControl[] = [];
+	const sessions = [
+		{
+			sessionId: "visible-session",
+			locator: { repo: root },
+			live: true,
+			endpointGeneration: 1,
+			pid: 101,
+			endpointMtimeMs: 1,
+		},
+		{
+			sessionId: "other-session",
+			locator: { repo: root },
+			live: true,
+			endpointGeneration: 1,
+			pid: 102,
+			endpointMtimeMs: 1,
+		},
+	];
+	const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
+	await registerSdkSession(server, root);
+	await expect(
+		server.callTool("gjc_coordinator_register_session", {
+			session_id: "other-session",
+			cwd: root,
+			idempotency_key: "register-other",
+			allow_mutation: true,
+		}),
+	).resolves.toMatchObject({ ok: true });
+	const first = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "visible-session",
+		prompt: "first",
+		idempotency_key: "prompt-first-session",
+		allow_mutation: true,
+	});
+	const second = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "other-session",
+		prompt: "second",
+		idempotency_key: "prompt-second-session",
+		allow_mutation: true,
+	});
+	await expect(
+		server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: first.turn_id,
+			status: "completed",
+			summary: "done",
+			idempotency_key: "complete-first-session",
+			allow_mutation: true,
+		}),
+	).resolves.toMatchObject({ ok: true });
+	const secondTurnPath = path.join(
+		root,
+		".gjc",
+		"coordinator-state",
+		"local",
+		"repo",
+		"turns",
+		`${String(second.turn_id)}.json`,
+	);
+	await expect(fs.readFile(secondTurnPath, "utf8")).resolves.toContain("other-session");
 });

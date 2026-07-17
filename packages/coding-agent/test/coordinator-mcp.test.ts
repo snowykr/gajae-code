@@ -14,6 +14,13 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../src/coordinator/contract";
+import {
+	assertCloseAdmission,
+	coordinatorStatePaths,
+	createSessionTransaction,
+	initializeCoordinatorNamespace,
+	withNamespaceRegistry,
+} from "../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer, handleCoordinatorMcpRequest } from "../src/coordinator-mcp/server";
 import { brokerDiscoveryPath, brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
@@ -81,6 +88,29 @@ describe("canonical SDK coordinator compatibility handler", () => {
 				(tool: { name: string }) => tool.name === "gjc_coordinator_send_prompt",
 			);
 			expect(promptTool.inputSchema.required).toEqual(expect.arrayContaining(["idempotency_key", "allow_mutation"]));
+		});
+	});
+
+	it("requires the complete public question-answer correlation tuple", async () => {
+		await withTempRoot(async root => {
+			const response = await handleCoordinatorMcpRequest(
+				{ jsonrpc: "2.0", id: 3, method: "tools/list" },
+				{ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } },
+			);
+			const tool = response.result.tools.find(
+				(candidate: { name: string }) => candidate.name === "gjc_coordinator_submit_question_answer",
+			);
+			expect(tool.inputSchema.required).toEqual(
+				expect.arrayContaining([
+					"session_id",
+					"turn_id",
+					"question_id",
+					"answer_binding",
+					"answer",
+					"idempotency_key",
+					"allow_mutation",
+				]),
+			);
 		});
 	});
 
@@ -319,6 +349,61 @@ describe("mcp serve check command compatibility", () => {
 				expect(after.ino).toBe(before.ino);
 			}
 			expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+		});
+	});
+});
+
+describe("coordinator question-state direct contracts", () => {
+	it("persists the creation-session snapshot and rejects post-close admissions", async () => {
+		await withTempRoot(async root => {
+			const paths = coordinatorStatePaths(path.join(root, "state"), "namespace-2550");
+			await initializeCoordinatorNamespace(paths);
+			const session = {
+				schema_version: 1 as const,
+				namespace_id: "namespace-2550",
+				session_id: "session-2550",
+				cwd: root,
+				created_at: "2026-07-17T00:00:00.000Z",
+				updated_at: "2026-07-17T00:00:00.000Z",
+				mpreset: null,
+				source: "coordinator",
+				model: null,
+				tmux: { session: null, window: null, pane: null },
+				broker: {
+					workspace: root,
+					endpoint_url: "ws://private.example.test",
+					endpoint_generation: 1,
+					endpoint_incarnation: "incarnation-1",
+				},
+				ephemeral: false,
+				visible: true,
+			};
+			const transaction = await createSessionTransaction(paths, {
+				kind: "register",
+				session,
+				initial_state: "ready_for_input",
+				initial_events: [],
+			});
+			expect(transaction.canonical.session).toEqual(session);
+			await withNamespaceRegistry(paths, async registry => {
+				registry.deletions["close-2550"] = {
+					deletion_id: "close-2550",
+					session_id: session.session_id,
+					endpoint_incarnation: session.broker.endpoint_incarnation,
+					operation_id: "operation-2550",
+					key_digest: "key",
+					request_digest: "request",
+					close_key: "close",
+					phase: "intent",
+					cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+					authority_digest: "authority",
+					created_at: session.created_at,
+					updated_at: session.updated_at,
+				};
+				expect(() => assertCloseAdmission(registry, transaction)).toThrow("session_closing");
+				registry.deletions["close-2550"].phase = "completed";
+				expect(() => assertCloseAdmission(registry, transaction)).toThrow("session_closing");
+			});
 		});
 	});
 });

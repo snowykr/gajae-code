@@ -244,29 +244,29 @@ GJC does not currently expose a structured stop-reason field on `agent_end`; int
 
 ### Answer structured questions
 
-List pending questions:
+Pull questions for one required session; every call reconciles durable pending `workflow.gates.list` rows before returning a bounded `questions`, `diagnostics`, and `reconciliation` snapshot. Filter `status: "pending"`; legacy `status: "open"` remains a compatibility alias for pending. A session can return multiple questions, so handle every pending row independently. The public rows include only the safe question shape and a per-pending-row `answer_binding`; they never expose private gate payloads or gate values.
 
 ```json
-{
-  "session_id": "gjc-demo",
-  "status": "pending"
-}
+{ "session_id": "gjc-demo", "status": "pending" }
 ```
 
-Then answer by id:
+Submit the exact identifiers and binding from one pending row. `answer` uses public option ids (`opt_0`, etc.), or the advertised `other`/`clarify` form:
 
 ```json
 {
   "session_id": "gjc-demo",
   "turn_id": "turn-00000000-0000-0000-0000-000000000000",
   "question_id": "question-1",
-  "answer": { "decision": "approve" },
+  "answer_binding": "<binding returned by list_questions>",
+  "answer": { "selected": ["opt_0"] },
   "idempotency_key": "answer-gjc-demo-1",
   "allow_mutation": true
 }
 ```
 
-Always answer the advertised shape. Do not synthesize approvals for destructive actions unless your bot policy explicitly permits that action.
+`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`; it resolves through `workflow.gate_answer`, never generic `ask.answer`. It revalidates against a complete fresh snapshot after restart and before resolution. Incomplete reconciliation returns `terminal_uncertain`; stale, terminal, absent, or ownership-mismatched rows are not answerable. Retry only an identical request with the same idempotency key: it replays the accepted result; reusing that key with conflicting arguments returns `idempotency_conflict`. Always answer the advertised shape; do not synthesize destructive approvals unless bot policy permits them.
+
+This Coordinator MCP pull loop is separate from #2549/#2551 and unattended plain-CLI behavior; those paths do not gain coordinator gate access.
 
 ### Read artifacts and reports
 

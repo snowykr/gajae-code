@@ -869,6 +869,7 @@ interface SessionRuntime {
 	disposeAckRecoveryParticipant: () => void;
 	disposeGateEmitterListener: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
 	redact: boolean;
@@ -1668,11 +1669,18 @@ function hasTerminalArbitrationCapability(
 	Required<
 		Pick<
 			WorkflowGateEmitter,
-			"resolveGate" | "prepareTerminalization" | "clearPreparedTerminalization" | "registerGateTerminalController"
+			| "resolveGate"
+			| "recoverAcceptedGates"
+			| "lookupCompletedResolution"
+			| "prepareTerminalization"
+			| "clearPreparedTerminalization"
+			| "registerGateTerminalController"
 		>
 	> {
 	return (
 		typeof workflowGate?.resolveGate === "function" &&
+		typeof workflowGate.recoverAcceptedGates === "function" &&
+		typeof workflowGate.lookupCompletedResolution === "function" &&
 		typeof workflowGate.prepareTerminalization === "function" &&
 		typeof workflowGate.clearPreparedTerminalization === "function" &&
 		typeof workflowGate.registerGateTerminalController === "function"
@@ -2026,7 +2034,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2039,6 +2047,26 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = {
+				gate_id: id,
+				answer: response,
+				idempotency_key: idempotencyKey ?? id,
+			};
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
@@ -2047,31 +2075,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow gate lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: response,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.gate_answer", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
@@ -2080,7 +2099,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.gate_answer",
@@ -2104,6 +2123,22 @@ function sdkControlSurface(
 				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
 					code: "resource_gone",
 				});
+			const workflowGate = ctx.workflowGate;
+			if (!hasTerminalArbitrationCapability(workflowGate))
+				throw Object.assign(new Error("Workflow gates are unavailable for this session."), {
+					code: "resource_gone",
+				});
+			const gateResponse = { gate_id: id, answer: choice, idempotency_key: id };
+			const completed = workflowGate.lookupCompletedResolution(gateResponse);
+			if (completed.kind === "completed") return completed.resolution;
+			if (completed.kind === "accepted_incomplete") {
+				await trackGateResolution(workflowGate.recoverAcceptedGates());
+				const recovered = workflowGate.lookupCompletedResolution(gateResponse);
+				if (recovered.kind === "completed") return recovered.resolution;
+				throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
 			const prepared = presentations.prepareDirectControl(id);
 			if (!prepared || prepared.status === "stale")
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
@@ -2112,31 +2147,22 @@ function sdkControlSurface(
 			if (prepared.status !== "queued" && prepared.status !== "retired")
 				throw new Error(`Unexpected direct control preparation: ${prepared.status}`);
 			if (
-				ctx.workflowGate?.prepareTerminalization?.(
-					id,
-					prepared.status === "queued" ? "not_published" : "retired",
-				) !== true
+				workflowGate.prepareTerminalization(id, prepared.status === "queued" ? "not_published" : "retired") !== true
 			) {
 				presentations.finishDirectControl(id, prepared, "rejected");
 				throw Object.assign(new Error("Workflow plan lacks a terminalization proof."), { code: "resource_gone" });
 			}
 			try {
-				const resolution = await trackGateResolution(
-					ctx.workflowGate?.resolveGate?.({
-						gate_id: id,
-						answer: choice,
-						idempotency_key: id,
-					}) ?? unavailable("workflow.plan_approve", "workflow gates are unavailable for this session")(),
-				);
+				const resolution = await trackGateResolution(workflowGate.resolveGate(gateResponse));
 				const status = (resolution as { status?: unknown }).status;
 				if (status === "accepted" || status === "rejected") {
-					if (status === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+					if (status === "rejected") workflowGate.clearPreparedTerminalization(id);
 					presentations.finishDirectControl(id, prepared, status);
 					return resolution;
 				}
 			} catch (error) {
 				const outcome = reconcileDirectControlFailure(id);
-				if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+				if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 				presentations.finishDirectControl(id, prepared, outcome);
 				if (outcome === "unknown")
 					throw Object.assign(new Error("Workflow plan resolution outcome is uncertain."), {
@@ -2145,7 +2171,7 @@ function sdkControlSurface(
 				throw error;
 			}
 			const outcome = reconcileDirectControlFailure(id);
-			if (outcome === "rejected") ctx.workflowGate?.clearPreparedTerminalization?.(id);
+			if (outcome === "rejected") workflowGate.clearPreparedTerminalization(id);
 			presentations.finishDirectControl(id, prepared, outcome);
 			logger.warn("workflow_gate_direct_control_uncertain_outcome", {
 				operation: "workflow.plan_approve",
@@ -2443,6 +2469,9 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			rt.disposeGateListener();
+		} catch {}
+		try {
+			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
 		await rt.waitForGateResolutionQuiescence();
 		try {
@@ -2797,6 +2826,11 @@ export function createNotificationsExtension(
 			submission.failed = true;
 			submission.error = error;
 			removePendingPromptCorrelation(correlation);
+			if (
+				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
+				runtime.activePromptCorrelation.turnId === correlation.turnId
+			)
+				runtime.activePromptCorrelation = undefined;
 			emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
@@ -3013,6 +3047,7 @@ export function createNotificationsExtension(
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
 			disposeGateEmitterListener: () => {},
+			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
 			},
@@ -3548,6 +3583,7 @@ export function createNotificationsExtension(
 			const attachWorkflowGate = (gate: WorkflowGateEmitter | undefined): void => {
 				if (activeRuntime.workflowGate === gate) return;
 				activeRuntime.disposeGateListener();
+				activeRuntime.workflowGate?.setRuntimeTurnProvider?.(null);
 				activeRuntime.disposeAckRecoveryParticipant();
 				gatePresentations.dispose();
 				activeRuntime.disposeGateTerminalController();
@@ -3560,6 +3596,7 @@ export function createNotificationsExtension(
 					return;
 				}
 				activeRuntime.workflowGate = gate;
+				gate.setRuntimeTurnProvider?.(() => activeRuntime.activePromptCorrelation?.turnId);
 				if (hasTerminalArbitrationCapability(gate)) {
 					const controller: WorkflowGateTerminalController = {
 						completeGateInteractions: gateId => gatePresentations.complete(gateId),
@@ -3613,7 +3650,9 @@ export function createNotificationsExtension(
 					});
 					activeRuntime.disposeAckRecoveryParticipant = () => gate.setAckRecoveryParticipant?.(null);
 				}
-				void gate.recoverAcceptedGates?.();
+				void (typeof gate.recoverAcceptedGates === "function"
+					? trackGateResolution(gate.recoverAcceptedGates()).catch(() => {})
+					: Promise.resolve());
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
@@ -3847,6 +3886,7 @@ export function createNotificationsExtension(
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		rt.activePromptCorrelation = undefined;
 		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
@@ -3854,7 +3894,9 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: activity (idle) failed: ${String(e)}`);
 		}
 		if (!rt.notificationsActive) return;
-		void rt.workflowGate?.recoverAcceptedGates?.();
+		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
+			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
+			: Promise.resolve());
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The

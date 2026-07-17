@@ -141,7 +141,8 @@ External coordinators should treat turns, not terminal scrollback, as the unit o
 2. Call `gjc_coordinator_send_prompt` with `allow_mutation: true` and `idempotency_key`.
 3. Store the returned `turn_id`.
 4. Poll `gjc_coordinator_read_turn`, or call bounded `gjc_coordinator_await_turn`, until the turn is terminal.
-5. If `gjc_coordinator_list_questions` shows a question for that turn, answer with `gjc_coordinator_submit_question_answer`.
+5. Pull `gjc_coordinator_list_questions` with the required `session_id`; it reconciles pending `workflow.gates.list` rows and returns bounded questions, diagnostics, and reconciliation state. Submit each pending row with `gjc_coordinator_submit_question_answer`.
+
 6. Use `gjc_coordinator_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
    Use `status: "cancelled"` for coordinator-policy cancellation, and `status: "failed"` plus `blocker` for provider/tool/task failures.
 
@@ -193,6 +194,14 @@ Coordinator cancellation is recorded through `gjc_coordinator_report_status` wit
 The coordinator MCP bridge is currently a durable polling/await surface. It does not expose a push subscription stream; external coordinators should poll `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` instead of waiting for server-sent push events.
 
 External `session_id`, `turn_id`, and `question_id` values are validated before path use, and loaded records must match the requested session/turn owner.
+
+### Coordinator question pull loop
+
+`gjc_coordinator_list_questions` requires `session_id` and reconciles the session's pending `workflow.gates.list` rows on every call. Its bounded response contains public `questions`, `diagnostics`, and `reconciliation`; `status: "pending"` selects pending rows, while `status: "open"` remains a compatibility alias. More than one pending question may be returned. Public rows expose only the safe question shape, public option ids, and a fresh `answer_binding` for each pending row—never raw/private gate payloads or values.
+
+`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`. Copy the identifiers and binding from the pending row and use the advertised answer shape. The bridge re-reconciles and revalidates ownership, pending state, and the binding before calling `workflow.gate_answer`; it never invokes generic `ask.answer`. An incomplete snapshot fails as `terminal_uncertain`; stale, terminal, missing, or ownership-mismatched rows are non-answerable. Restart can remint or quarantine gates, so re-list instead of reusing old rows. Identical idempotent replay returns the original accepted result; the same key with different arguments fails `idempotency_conflict`.
+
+This pull-loop contract is independent of #2549/#2551 and unattended plain-CLI handling.
 
 ## Coordinator event journal
 
