@@ -211,12 +211,16 @@ describe("sessions dashboard", () => {
 		setAgentDir(agentDir);
 		try {
 			const sessionsRoot = path.join(agentDir, "sessions");
-			const older = path.join(sessionsRoot, "project-a", "older.jsonl");
-			const newer = path.join(sessionsRoot, "project-b", "newer.jsonl");
+			const cwdA = path.join(agentDir, "workspaces", "a");
+			const cwdB = path.join(agentDir, "workspaces", "b");
+			fs.mkdirSync(cwdA, { recursive: true });
+			fs.mkdirSync(cwdB, { recursive: true });
+			const older = path.join(SessionManager.getDefaultSessionDir(cwdA, agentDir), "older.jsonl");
+			const newer = path.join(SessionManager.getDefaultSessionDir(cwdB, agentDir), "newer.jsonl");
 			fs.mkdirSync(path.dirname(older), { recursive: true });
 			fs.mkdirSync(path.dirname(newer), { recursive: true });
-			fs.writeFileSync(older, sessionText("older", "/projects/a", "Older", "first"));
-			fs.writeFileSync(newer, sessionText("newer", "/projects/b", "Newer", "second"));
+			fs.writeFileSync(older, sessionText("older", cwdA, "Older", "first"));
+			fs.writeFileSync(newer, sessionText("newer", cwdB, "Newer", "second"));
 			fs.writeFileSync(`${older}.presence.json`, "{");
 			fs.utimesSync(older, new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-01T00:00:00.000Z"));
 			fs.utimesSync(newer, new Date("2026-01-02T00:00:00.000Z"), new Date("2026-01-02T00:00:00.000Z"));

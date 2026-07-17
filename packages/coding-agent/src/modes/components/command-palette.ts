@@ -1,158 +1,168 @@
 import {
+	type Component,
 	Container,
-	Ellipsis,
+	fuzzyFilter,
 	Input,
 	matchesKey,
 	padding,
-	Spacer,
-	Text,
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { fuzzyFilter } from "@gajae-code/tui/fuzzy";
 import { sanitizeStatusText } from "../shared";
 import { theme } from "../theme/theme";
 import { DynamicBorder } from "./dynamic-border";
 
-export type CommandPaletteEntry = {
+export interface CommandPaletteAction {
 	id: string;
 	label: string;
-	category: string;
+	handler: () => void | Promise<void>;
+}
+
+export interface CommandPaletteEntry {
+	id: string;
+	label: string;
 	description?: string;
+	category?: string;
+	keybinding?: string;
 	bindingHint?: string;
+	searchText?: string;
+	handler?: () => void | Promise<void>;
 	disabled?: boolean;
-};
+}
 
 function sanitizePaletteText(text: string): string {
 	return sanitizeStatusText(text.toWellFormed());
 }
 
-function isExecutableEntry(entry: CommandPaletteEntry): boolean {
-	return /^(?:action:[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*|slash:\/[a-zA-Z0-9][a-zA-Z0-9:_.-]*)$/.test(entry.id);
+function isSafePaletteEntryId(id: string): boolean {
+	return id.length > 0 && !/[\s\u0000-\u001f\u007f-\u009f]/u.test(id);
 }
 
-class CommandPaletteResults {
-	#entries: readonly CommandPaletteEntry[] = [];
-	#selectedIndex = -1;
-	#viewportStart = 0;
+class CommandPaletteList implements Component {
+	#entries: CommandPaletteEntry[];
+	#filteredEntries: CommandPaletteEntry[];
+	#selectedIndex = 0;
+	readonly #searchInput = new Input();
+	onSelect?: (entry: CommandPaletteEntry) => void;
+	onCancel?: () => void;
 
-	setEntries(entries: readonly CommandPaletteEntry[], selectedIndex: number, viewportStart: number): void {
-		this.#entries = entries;
-		this.#selectedIndex = selectedIndex;
-		this.#viewportStart = viewportStart;
+	constructor(entries: CommandPaletteEntry[]) {
+		this.#entries = entries.map(entry => ({
+			...entry,
+			label: sanitizePaletteText(entry.label),
+			description: sanitizePaletteText(entry.description ?? entry.category ?? ""),
+			category: entry.category === undefined ? undefined : sanitizePaletteText(entry.category),
+			keybinding:
+				entry.keybinding === undefined && entry.bindingHint === undefined
+					? undefined
+					: sanitizePaletteText(entry.keybinding ?? entry.bindingHint ?? ""),
+			bindingHint: entry.bindingHint === undefined ? undefined : sanitizePaletteText(entry.bindingHint),
+			searchText: entry.searchText === undefined ? undefined : sanitizePaletteText(entry.searchText),
+		}));
+		this.#filteredEntries = this.#entries;
+	}
+
+	#filter(query: string): void {
+		this.#filteredEntries = fuzzyFilter(this.#entries, query, entry =>
+			[entry.label, entry.description, entry.keybinding ?? "", entry.searchText ?? ""].join(" "),
+		);
+		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#filteredEntries.length - 1));
 	}
 
 	invalidate(): void {}
 
+	getEntries(): readonly CommandPaletteEntry[] {
+		return this.#filteredEntries;
+	}
+
 	render(width: number): string[] {
-		if (this.#entries.length === 0) return [theme.fg("muted", "  No matching commands")];
-		return this.#entries.slice(this.#viewportStart, this.#viewportStart + 10).map((entry, index) => {
-			const entryIndex = this.#viewportStart + index;
-			const prefix =
-				entryIndex === this.#selectedIndex
-					? theme.fg("accent", `${theme.nav.cursor} `)
-					: padding(visibleWidth(theme.nav.cursor) + 1);
-			const hint = entry.bindingHint ? theme.fg("muted", `  ${entry.bindingHint}`) : "";
-			const secondary = entry.description ?? entry.category;
-			const text = `${prefix}${entry.label}${theme.fg("muted", `  ${secondary}`)}${hint}`;
-			return entry.disabled
-				? theme.fg("muted", truncateToWidth(text, width, Ellipsis.Omit))
-				: truncateToWidth(text, width, Ellipsis.Omit);
-		});
+		const lines = [theme.fg("muted", "  Search commands"), ...this.#searchInput.render(width), ""];
+		if (this.#filteredEntries.length === 0) {
+			lines.push(theme.fg("muted", "  No matching commands"));
+			return lines;
+		}
+
+		const maxVisible = 8;
+		const start = Math.max(
+			0,
+			Math.min(this.#selectedIndex - Math.floor(maxVisible / 2), this.#filteredEntries.length - maxVisible),
+		);
+		const end = Math.min(start + maxVisible, this.#filteredEntries.length);
+		for (let index = start; index < end; index += 1) {
+			const entry = this.#filteredEntries[index];
+			if (!entry) continue;
+			const selected = index === this.#selectedIndex;
+			const cursor = `${theme.nav.cursor} `;
+			const prefix = selected ? theme.fg("accent", cursor) : padding(visibleWidth(cursor));
+			const keybinding = entry.keybinding ? theme.fg("muted", entry.keybinding) : "";
+			const availableLabelWidth = Math.max(
+				1,
+				width - visibleWidth(prefix) - visibleWidth(keybinding) - (keybinding ? 1 : 0),
+			);
+			const label = truncateToWidth(entry.label, availableLabelWidth);
+			const labelPadding = padding(Math.max(0, availableLabelWidth - visibleWidth(label)));
+			const renderedLabel = selected ? theme.bold(label) : label;
+			lines.push(
+				entry.disabled
+					? theme.fg("muted", prefix + renderedLabel + labelPadding + (keybinding ? ` ${keybinding}` : ""))
+					: prefix + renderedLabel + labelPadding + (keybinding ? ` ${keybinding}` : ""),
+			);
+			lines.push(theme.fg("dim", truncateToWidth(`  ${entry.description ?? ""}`, width)));
+		}
+		if (start > 0 || end < this.#filteredEntries.length) {
+			lines.push(theme.fg("muted", `  (${this.#selectedIndex + 1}/${this.#filteredEntries.length})`));
+		}
+		lines.push("", theme.fg("muted", "  [Enter to run, Esc to close]"));
+		return lines;
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "escape")) {
+			this.onCancel?.();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.#selectedIndex = Math.max(0, this.#selectedIndex - 1);
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.#selectedIndex = Math.min(this.#filteredEntries.length - 1, this.#selectedIndex + 1);
+			return;
+		}
+		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			const entry = this.#filteredEntries[this.#selectedIndex];
+			if (entry && !entry.disabled && isSafePaletteEntryId(entry.id)) this.onSelect?.(entry);
+			return;
+		}
+		this.#searchInput.handleInput(data);
+		this.#filter(this.#searchInput.getValue());
 	}
 }
 
-/** Modal, fuzzy-searchable action palette. The host owns close-then-execute ordering. */
-export class CommandPalette extends Container {
-	readonly #input = new Input();
-	readonly #results = new CommandPaletteResults();
-	#filtered: readonly CommandPaletteEntry[] = [];
-	#selectedIndex = -1;
-	#viewportStart = 0;
+export class CommandPaletteComponent extends Container {
+	#list: CommandPaletteList;
 
-	readonly #entries: readonly CommandPaletteEntry[];
-	readonly #onSelect: (entry: CommandPaletteEntry) => void;
-	readonly #onCancel: () => void;
-
-	constructor(
-		entries: readonly CommandPaletteEntry[],
-		onSelect: (entry: CommandPaletteEntry) => void,
-		onCancel: () => void,
-	) {
+	constructor(entries: CommandPaletteEntry[], onSelect: (entry: CommandPaletteEntry) => void, onCancel: () => void) {
 		super();
-		this.#entries = entries.map(entry => ({
-			...entry,
-			label: sanitizePaletteText(entry.label),
-			category: sanitizePaletteText(entry.category),
-			description: entry.description === undefined ? undefined : sanitizePaletteText(entry.description),
-			bindingHint: entry.bindingHint === undefined ? undefined : sanitizePaletteText(entry.bindingHint),
-		}));
-		this.#onSelect = onSelect;
-		this.#onCancel = onCancel;
-		this.#input.onEscape = onCancel;
 		this.addChild(new DynamicBorder());
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.bold("Command palette"), 1, 0));
-		this.addChild(new Spacer(1));
-		this.addChild(this.#input);
-		this.addChild(new Spacer(1));
-		this.addChild(this.#results);
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("muted", "type to filter  up/down navigate  enter select  esc close"), 1, 0));
-		this.addChild(new Spacer(1));
+		this.#list = new CommandPaletteList(entries);
+		this.#list.onSelect = onSelect;
+		this.#list.onCancel = onCancel;
+		this.addChild(this.#list);
 		this.addChild(new DynamicBorder());
-		this.#updateResults();
+	}
+
+	override render(width: number): string[] {
+		return super.render(width).map(line => truncateToWidth(line, width));
+	}
+	handleInput(data: string): void {
+		this.#list.handleInput(data);
 	}
 
 	getEntries(): readonly CommandPaletteEntry[] {
-		return this.#filtered;
-	}
-
-	handleInput(keyData: string): void {
-		if (matchesKey(keyData, "escape")) return this.#onCancel();
-		if (matchesKey(keyData, "up")) return this.#move(-1);
-		if (matchesKey(keyData, "down")) return this.#move(1);
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
-			const entry = this.#filtered[this.#selectedIndex];
-			if (entry && !entry.disabled && isExecutableEntry(entry)) this.#onSelect(entry);
-			return;
-		}
-		this.#input.handleInput(keyData);
-		this.#updateResults();
-	}
-
-	#updateResults(): void {
-		const query = this.#input.getValue();
-		this.#filtered = fuzzyFilter([...this.#entries], query, entry =>
-			[entry.label, entry.category, entry.description, entry.bindingHint].filter(Boolean).join(" "),
-		);
-		this.#selectedIndex = this.#firstEnabledIndex();
-		this.#viewportStart = 0;
-		this.#results.setEntries(this.#filtered, this.#selectedIndex, this.#viewportStart);
-	}
-
-	#firstEnabledIndex(): number {
-		return this.#filtered.findIndex(entry => !entry.disabled);
-	}
-
-	#viewportStartFor(selectedIndex: number): number {
-		if (selectedIndex < this.#viewportStart) return selectedIndex;
-		if (selectedIndex >= this.#viewportStart + 10) return selectedIndex - 9;
-		return this.#viewportStart;
-	}
-
-	#move(direction: -1 | 1): void {
-		if (this.#filtered.length === 0) return;
-		for (let step = 1; step <= this.#filtered.length; step++) {
-			const index =
-				(((this.#selectedIndex + direction * step) % this.#filtered.length) + this.#filtered.length) %
-				this.#filtered.length;
-			if (!this.#filtered[index]?.disabled) {
-				this.#selectedIndex = index;
-				this.#viewportStart = this.#viewportStartFor(index);
-				this.#results.setEntries(this.#filtered, index, this.#viewportStart);
-				return;
-			}
-		}
+		return this.#list.getEntries();
 	}
 }
+
+/** Backward-compatible name retained for extensions and existing call sites. */
+export class CommandPalette extends CommandPaletteComponent {}

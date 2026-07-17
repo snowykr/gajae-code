@@ -210,6 +210,17 @@ describe("SDK query pagination", () => {
 		await store.close();
 	});
 
+	it("settles in-progress spill writes before terminal cleanup", async () => {
+		for (let index = 0; index < 3; index++) {
+			const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-close-race-"));
+			const store = new RevisionStore(`close-race-${index}`, Date.now, { storageDir: stateRoot });
+			const write = store.createRevision("large", "id", { body: "x".repeat(8 * 1024 * 1024) });
+			const close = store.close();
+			await expect(write).resolves.toBe("1");
+			await expect(close).resolves.toBeUndefined();
+		}
+	});
+
 	it("splits large CJK and emoji snapshots at UTF-8 boundaries", async () => {
 		const stateRoot = await mkdtemp(join(tmpdir(), "gjc-sdk-query-test-"));
 		const snapshotDir = join(stateRoot, "sdk", "snapshots", "s1");
@@ -370,6 +381,33 @@ it("keeps artifact range responses below the serialized one MiB ceiling", async 
 	expect(requested).toBeLessThan(1024 * 1024);
 	expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
 	expect((response.result as { complete: boolean }).complete).toBe(false);
+});
+it("keeps random-sized paginated responses below the one MiB ceiling", async () => {
+	for (let seed = 1; seed <= 24; seed++) {
+		let state = seed;
+		const next = () => {
+			state = (state * 16_807) % 2_147_483_647;
+			return state;
+		};
+		const diff = Array.from({ length: 32 }, (_, index) => ({
+			id: String(index),
+			body: "x".repeat(next() % 180_000),
+		}));
+		const store = new RevisionStore(`page-${seed}`);
+		const query = new QueryHandlers(
+			{ ...surface([]), getDiff: () => diff },
+			`page-${seed}`,
+			store,
+			new CursorRegistry("token", store),
+		);
+		let response = await query.dispatch({ query: "Q06", connectionId: "c" });
+		while (response.page) {
+			expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(1024 * 1024);
+			if (response.page.complete) break;
+			response = await query.dispatch({ query: "Q06", cursor: response.page.continuationCursor, connectionId: "c" });
+		}
+		await store.close();
+	}
 });
 
 it("describes an arbitrarily large indexed item from manifest metadata before reading its body", async () => {

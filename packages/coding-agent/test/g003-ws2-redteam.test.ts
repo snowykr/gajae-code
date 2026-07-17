@@ -133,14 +133,14 @@ describe("G003 WS2 red-team: command palette", () => {
 		expect(narrow.render(20).every(line => visibleWidth(line) <= 20)).toBe(true);
 	});
 
-	it("guards nonempty composers and closes/restores focus before a throwing action reports its error", async () => {
+	it("allows action browsing with a nonempty composer and closes/restores focus before a throwing action reports its error", async () => {
 		const statuses: string[] = [];
 		const nonempty = createControllerContext({
 			editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
 			showStatus: status => statuses.push(status),
 		});
 		new InputController(nonempty).openCommandPalette();
-		expect(statuses).toEqual(["Command palette opens from an empty prompt. Type / for inline commands."]);
+		expect(statuses).toEqual([]);
 
 		const order: string[] = [];
 		let palette: CommandPalette | undefined;

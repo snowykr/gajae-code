@@ -2,9 +2,10 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
-import type { Component, OverlayHandle } from "@gajae-code/tui";
+import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
+import { type AppKeybinding, formatKeyHints } from "../../config/keybindings";
 import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
@@ -69,6 +70,8 @@ import {
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
+import { getTreeForInternalRead } from "../../session/session-manager-internal";
+
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -110,6 +113,11 @@ import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import {
+	type CommandPaletteAction,
+	CommandPaletteComponent,
+	type CommandPaletteEntry,
+} from "../components/command-palette";
+import {
 	CustomModelPresetWizardComponent,
 	type CustomModelPresetWizardSubmit,
 } from "../components/custom-model-preset-wizard";
@@ -141,11 +149,11 @@ import { SessionObserverOverlayComponent } from "../components/session-observer-
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
 import { SettingsSelectorComponent } from "../components/settings-selector";
-import type { StatusLineSettings } from "../components/status-line";
 import { TasksPaneComponent } from "../components/tasks-pane";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ThinkingSelectorComponent } from "../components/thinking-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
+import type { StatusLineSettings } from "../components/tool-status-header";
 import { TranscriptViewerOverlay, transcriptViewerEntries } from "../components/transcript-viewer-overlay";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
@@ -754,6 +762,52 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void {
+		const seenCommands = new Set<string>();
+		const entries: CommandPaletteEntry[] = [
+			...actions.map(action => ({
+				id: `action:${action.id}`,
+				label: action.label,
+				description: action.id,
+				keybinding: formatKeyHints(this.ctx.keybindings.getKeys(action.id as AppKeybinding)) || undefined,
+				searchText: action.id,
+				handler: action.handler,
+			})),
+			...commands
+				.filter(command => {
+					if (seenCommands.has(command.name)) return false;
+					seenCommands.add(command.name);
+					return true;
+				})
+				.map(command => ({
+					id: `command:${command.name}`,
+					label: `/${command.name}`,
+					description: command.description ?? "Slash command",
+					searchText: command.name,
+					handler: () => executeSlashCommand(command.name),
+				})),
+		];
+
+		this.showSelector(done => {
+			const selector = new CommandPaletteComponent(
+				entries,
+				entry => {
+					done();
+					void Promise.resolve()
+						.then(() => entry.handler?.())
+						.catch(error => {
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+						});
+				},
+				done,
+			);
+			return { component: selector, focus: selector };
+		});
+	}
 	showProviderOnboarding(): void {
 		this.showSelector(done => {
 			const selector = new ProviderOnboardingSelectorComponent(
@@ -996,6 +1050,7 @@ export class SelectorController {
 					await this.ctx.session.modelRegistry.refresh("offline");
 					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(formatProviderSetupResult(result));
+					wizard.complete();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -1814,7 +1869,7 @@ export class SelectorController {
 	}
 
 	showTreeSelector(): void {
-		const tree = this.ctx.sessionManager.getTree();
+		const tree = getTreeForInternalRead(this.ctx.sessionManager);
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
 		if (tree.length === 0) {
@@ -1940,7 +1995,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.list(
+		const sessions = await SessionManager.listForResumePickerReadOnly(
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
@@ -1962,9 +2017,9 @@ export class SelectorController {
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
-					const storage = new FileSessionStorage();
 					try {
-						await storage.deleteSessionWithArtifacts(session.path);
+						await this.#deleteSession(session.path);
+
 						return true;
 					} catch (err) {
 						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
@@ -2000,6 +2055,15 @@ export class SelectorController {
 		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
 	}
 
+	async #deleteSession(sessionPath: string): Promise<void> {
+		const sessionManager = this.ctx.sessionManager as { dropSession?: (path: string) => Promise<void> };
+		if (sessionManager.dropSession) {
+			await sessionManager.dropSession(sessionPath);
+			return;
+		}
+		await new FileSessionStorage().deleteSessionWithArtifacts(sessionPath);
+	}
+
 	async #detachActiveSessionBeforeDeletion(sessionPath: string): Promise<boolean> {
 		const currentSessionFile = this.ctx.sessionManager.getSessionFile();
 		if (currentSessionFile !== sessionPath) {
@@ -2028,9 +2092,12 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
+		const migrationPolicy =
+			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
 
 		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(sessionPath))) return;
+		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 		this.#refreshSessionTerminalTitle();
@@ -2075,8 +2142,7 @@ export class SelectorController {
 			return;
 		}
 
-		// Delete the session file and artifacts directory
-		await storage.deleteSessionWithArtifacts(sessionFile);
+		await this.#deleteSession(sessionFile);
 
 		// Show session selector
 		this.ctx.showStatus("Current session transcript and artifacts deleted");
@@ -2301,7 +2367,10 @@ export class SelectorController {
 								if (handledCandidates || (secondCandidates.length === 0 && secondSourceFailures.length === 0)) {
 									let persisted = false;
 									try {
-										persisted = await stateStore.write({ initialImportResolution: "accepted" });
+										persisted = await stateStore.write({
+											initialImportResolution: "accepted",
+											lastImportVersion: VERSION,
+										});
 									} catch {
 										logger.warn("Credential auto-import state persistence failed", {
 											classification: "state-write-failed",
