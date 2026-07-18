@@ -94,25 +94,25 @@ describe("InteractiveMode plan review rendering", () => {
 	it("routes SDK plan toggles through the complete interactive lifecycle", async () => {
 		const enabled = await session.setSdkPlanMode(true);
 		expect(enabled).toMatchObject({ enabled: true, planFilePath: "local://PLAN.md" });
-		expect(mode.planModeEnabled).toBe(true);
+		expect(mode.planModeController.enabled).toBe(true);
 		expect(session.getActiveToolNames()).toEqual(["test_read", "test_write", "resolve"]);
 		expect(session.peekStandingResolveHandler()).toBeDefined();
 
 		expect(await session.setSdkPlanMode(false)).toBeUndefined();
-		expect(mode.planModeEnabled).toBe(false);
+		expect(mode.planModeController.enabled).toBe(false);
 		expect(session.getActiveToolNames()).toEqual(["test_read", "test_write"]);
 		expect(session.peekStandingResolveHandler()).toBeUndefined();
 	});
 
 	it("fails SDK plan toggles closed when the interactive lifecycle refuses them", async () => {
-		mode.goalModeEnabled = true;
+		mode.goalModeController.setEnabledForCompatibility(true);
 		await expect(session.setSdkPlanMode(true)).rejects.toMatchObject({ code: "conflict" });
 		expect(session.getPlanModeState()).toBeUndefined();
-		mode.goalModeEnabled = false;
+		mode.goalModeController.setEnabledForCompatibility(false);
 
-		mode.planModePaused = true;
+		mode.planModeController.setPausedForCompatibility(true);
 		await expect(session.setSdkPlanMode(false)).rejects.toMatchObject({ code: "conflict" });
-		mode.planModePaused = false;
+		mode.planModeController.setPausedForCompatibility(false);
 	});
 	afterEach(async () => {
 		vi.restoreAllMocks();
@@ -131,8 +131,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# First plan\n\nalpha");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview")
 			.mockResolvedValueOnce({
 				action: "Refine plan",
@@ -148,7 +148,7 @@ describe("InteractiveMode plan review rendering", () => {
 			});
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -163,7 +163,7 @@ describe("InteractiveMode plan review rendering", () => {
 		mode.chatContainer.addChild(marker);
 		await Bun.write(resolvedPlanPath, "# Second plan\n\nbeta");
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -188,8 +188,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		const selector = vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Refine plan",
 			comments: [],
@@ -198,7 +198,7 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -225,8 +225,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, plan);
 		const snapshotHash = planSnapshotHash(plan);
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Refine plan",
 			comments: [{ id: "review", startLine: 3, endLine: 3, text: "Clarify scope", snapshotHash, createdAt: 1 }],
@@ -234,7 +234,12 @@ describe("InteractiveMode plan review rendering", () => {
 			snapshotHash,
 		});
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath: planFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath: planFilePath,
+		});
 		const block = `Plan review comments (snapshot ${snapshotHash.slice(0, 8)}):\n- L3: Clarify scope\n> Revise this.\nKeep it small.`;
 		expect(prompt).toHaveBeenCalledWith(`${block}\n\nPlease refine the plan using these review comments.`);
 		const audit = mode.chatContainer.children.at(-1)?.render(120).join("\n");
@@ -261,8 +266,8 @@ describe("InteractiveMode plan review rendering", () => {
 		for (const decision of decisions) {
 			await Bun.write(resolvedPlanPath, reviewedPlan);
 			const snapshotHash = planSnapshotHash(reviewedPlan);
-			mode.planModeEnabled = true;
-			mode.planModePlanFilePath = planFilePath;
+			mode.planModeController.setEnabledForCompatibility(true);
+			mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 			selector
 				.mockReset()
 				.mockImplementationOnce(async () => {
@@ -296,7 +301,7 @@ describe("InteractiveMode plan review rendering", () => {
 			).length;
 			const promptCount = prompt.mock.calls.length;
 
-			await mode.handlePlanApproval({
+			await mode.planModeController.handleApproval({
 				planFilePath,
 				planExists: true,
 				title: "PLAN",
@@ -328,8 +333,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, plan);
 		const snapshotHash = planSnapshotHash(plan);
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Refine plan",
 			comments: [{ id: "review", startLine: 3, endLine: 3, text: "Clarify scope", snapshotHash, createdAt: 1 }],
@@ -338,7 +343,12 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath: planFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath: planFilePath,
+		});
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(prompt.mock.calls[0]).toHaveLength(1);
@@ -375,8 +385,8 @@ describe("InteractiveMode plan review rendering", () => {
 			for (const withComments of [false, true]) {
 				await Bun.write(resolvedPlanPath, plan);
 				const snapshotHash = planSnapshotHash(plan);
-				await mode.handlePlanModeCommand();
-				expect(mode.planModeEnabled).toBe(true);
+				await mode.planModeController.handleCommand();
+				expect(mode.planModeController.enabled).toBe(true);
 				expect(session.getActiveToolNames()).toEqual(["test_read", "test_write", "resolve"]);
 				const clearCalls = clear.mock.calls.length;
 				const compactCalls = compact.mock.calls.length;
@@ -398,7 +408,7 @@ describe("InteractiveMode plan review rendering", () => {
 					snapshotHash,
 				});
 
-				await mode.handlePlanApproval({
+				await mode.planModeController.handleApproval({
 					planFilePath,
 					planExists: true,
 					title: "PLAN",
@@ -407,9 +417,9 @@ describe("InteractiveMode plan review rendering", () => {
 				const promptCall = prompt.mock.calls.at(-1);
 				transitions.push({
 					mode: {
-						enabled: mode.planModeEnabled,
-						paused: mode.planModePaused,
-						planFilePath: mode.planModePlanFilePath,
+						enabled: mode.planModeController.enabled,
+						paused: mode.planModeController.paused,
+						planFilePath: mode.planModeController.planFilePath,
 					},
 					tools: [...session.getActiveToolNames()],
 					sessionPlanState: session.getPlanModeState(),
@@ -438,8 +448,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, plan);
 		const snapshotHash = planSnapshotHash(plan);
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and keep context",
 			comments: [{ id: "review", startLine: 3, endLine: 3, text: "Confirm rollout.", snapshotHash, createdAt: 1 }],
@@ -448,7 +458,12 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath: planFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath: planFilePath,
+		});
 
 		const audit =
 			mode.chatContainer.children
@@ -499,8 +514,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nKeep context.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and keep context",
 			comments: [],
@@ -510,7 +525,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue(true);
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -533,8 +548,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nClear context.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and execute",
 			comments: [],
@@ -544,7 +559,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue(true);
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -565,8 +580,8 @@ describe("InteractiveMode plan review rendering", () => {
 			getSessionId: () => session.sessionManager.getSessionId(),
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nDo not dispatch in the retained session.");
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and execute",
 			comments: [],
@@ -577,7 +592,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 		const warning = vi.spyOn(mode, "showWarning");
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -600,8 +615,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nCompact and execute.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and compact context",
 			comments: [],
@@ -612,7 +627,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const markSentSpy = vi.spyOn(session, "markPlanReferenceSent");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -648,8 +663,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		const reviewed = "# Plan\n\nReviewed bytes.";
 		await Bun.write(resolvedPlanPath, reviewed);
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and keep context",
 			comments: [],
@@ -663,7 +678,12 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
 
 		expect(await Bun.file(resolvedFinalPath).text()).toBe(reviewed);
 	});
@@ -677,8 +697,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		const reviewed = "# Plan\n\nDispatch ordering.";
 		await Bun.write(resolvedPlanPath, reviewed);
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and keep context",
 			comments: [],
@@ -690,7 +710,12 @@ describe("InteractiveMode plan review rendering", () => {
 			expect(markSent).not.toHaveBeenCalled();
 		});
 
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
 
 		expect(markSent).toHaveBeenCalledTimes(1);
 	});
@@ -708,8 +733,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nCancel mid-compact.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and compact context",
 			comments: [],
@@ -722,7 +747,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const markSentSpy = vi.spyOn(session, "markPlanReferenceSent");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -756,8 +781,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nFail mid-compact.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and compact context",
 			comments: [],
@@ -768,7 +793,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const markSentSpy = vi.spyOn(session, "markPlanReferenceSent");
 		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -794,8 +819,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nQueue race.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and compact context",
 			comments: [],
@@ -811,7 +836,7 @@ describe("InteractiveMode plan review rendering", () => {
 			return "ok";
 		});
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -852,8 +877,8 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nBody.");
 
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and compact context",
 			comments: [],
@@ -867,7 +892,7 @@ describe("InteractiveMode plan review rendering", () => {
 		}
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",
@@ -915,8 +940,8 @@ describe("InteractiveMode plan review rendering", () => {
 			getSessionId: () => session.sessionManager.getSessionId(),
 		});
 		await Bun.write(resolvedPlanPath, "# Plan\n\nBody.");
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Approve and execute",
 			comments: [],
@@ -926,7 +951,7 @@ describe("InteractiveMode plan review rendering", () => {
 		const markSpy = vi.spyOn(session, "markPlanCompactAbortPending");
 		vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
 
-		await mode.handlePlanApproval({
+		await mode.planModeController.handleApproval({
 			planFilePath,
 			planExists: true,
 			title: "PLAN",

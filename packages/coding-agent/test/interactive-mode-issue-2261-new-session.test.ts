@@ -62,8 +62,8 @@ describe("Issue #2261 InteractiveMode session-switch preparation", () => {
 			getSessionId: () => session.sessionManager.getSessionId(),
 		});
 		await Bun.write(resolvedPath, "# Plan\n\nKeep this review open.");
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
 		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
 			action: "Refine plan",
 			comments: [],
@@ -71,7 +71,12 @@ describe("Issue #2261 InteractiveMode session-switch preparation", () => {
 			snapshotHash: planSnapshotHash("# Plan\n\nKeep this review open."),
 		});
 		vi.spyOn(session, "abort").mockResolvedValue(undefined);
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath: planFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath: planFilePath,
+		});
 	}
 
 	for (const [command, method] of [

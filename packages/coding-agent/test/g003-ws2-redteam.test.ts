@@ -31,9 +31,8 @@ function createControllerContext(overrides: Partial<InteractiveModeContext> = {}
 			hasForegroundBashBackgroundRequestHandler: () => false,
 		},
 		chatContainer: { children: [] },
-		goalModeEnabled: false,
-		planModeEnabled: true,
-		handlePlanModeCommand: () => {},
+		goalModeController: { enabled: false, paused: false, handleCommand: () => {} },
+		planModeController: { enabled: true, paused: false, handleCommand: () => {} },
 		showError: () => {},
 		showStatus: () => {},
 		historyStorage: { getRecent: () => [] },
@@ -157,10 +156,12 @@ describe("G003 WS2 red-team: command palette", () => {
 				},
 				requestRender: () => {},
 			} as never,
-			handlePlanModeCommand: (() => {
-				order.push("execute");
-				throw new Error("boom");
-			}) as never,
+			planModeController: {
+				handleCommand: (() => {
+					order.push("execute");
+					throw new Error("boom");
+				}) as never,
+			} as never,
 			showError: () => order.push("error"),
 		});
 		new InputController(ctx).openCommandPalette();
@@ -222,9 +223,8 @@ describe("G003 WS2 red-team: status hints and mode availability", () => {
 			let executed = 0;
 			const ctx = createControllerContext({
 				settings: { get: (key: string) => key === "plan.enabled" && planEnabled } as never,
-				goalModeEnabled,
-				goalModePaused,
-				handlePlanModeCommand: (() => executed++) as never,
+				goalModeController: { enabled: goalModeEnabled, paused: goalModePaused } as never,
+				planModeController: { handleCommand: (() => executed++) as never } as never,
 			});
 			const controller = new InputController(ctx);
 			expect(controller.actionRegistry.isAvailable("app.mode.cycle")).toBe(false);

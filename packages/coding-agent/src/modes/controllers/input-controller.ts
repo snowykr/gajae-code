@@ -36,7 +36,7 @@ interface Expandable {
 	setManuallyExpanded?(expanded: boolean): void;
 }
 
-const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+export const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
@@ -97,8 +97,8 @@ export class InputController {
 			"app.session.dashboard": () => this.ctx.showSessionsDashboard(),
 			"app.transcript.browse": () => this.ctx.showTranscriptViewer(),
 			"app.jobs.open": () => this.ctx.showJobsOverlay(),
-			"app.plan.toggle": () => this.ctx.handlePlanModeCommand(),
-			"app.mode.cycle": () => this.ctx.handlePlanModeCommand(),
+			"app.plan.toggle": () => this.ctx.planModeController.handleCommand(),
+			"app.mode.cycle": () => this.ctx.planModeController.handleCommand(),
 			"app.history.search": () => this.ctx.showHistorySearch(),
 			"app.stt.toggle": () => this.ctx.handleSTTToggle(),
 			"app.irc.sidebar.toggle": () => this.ctx.toggleIrcSidebar(),
@@ -155,7 +155,7 @@ export class InputController {
 			case "app.session.fork":
 				return this.ctx.session.messages.length > 0;
 			case "app.plan.toggle":
-				return this.ctx.planModeEnabled && !this.ctx.goalModeEnabled;
+				return this.ctx.planModeController.enabled && !this.ctx.goalModeController.enabled;
 			case "app.history.search":
 				return (this.ctx.historyStorage?.getRecent(1).length ?? 0) > 0;
 			case "app.stt.toggle":
@@ -167,7 +167,9 @@ export class InputController {
 				return getUserMessageViewportAnchorIds(this.ctx.session.messages).length > 0;
 			case "app.mode.cycle":
 				return (
-					Boolean(this.ctx.settings.get("plan.enabled")) && !this.ctx.goalModeEnabled && !this.ctx.goalModePaused
+					Boolean(this.ctx.settings.get("plan.enabled")) &&
+					!this.ctx.goalModeController.enabled &&
+					!this.ctx.goalModeController.paused
 				);
 			case "app.queue.togglePane":
 				return true;
@@ -619,7 +621,7 @@ export class InputController {
 			});
 		}
 
-		const togglePlanMode = () => this.ctx.handlePlanModeCommand();
+		const togglePlanMode = () => this.ctx.planModeController.handleCommand();
 		this.#registerCommandPaletteAction("app.plan.toggle", togglePlanMode);
 		for (const key of this.ctx.keybindings.getKeys("app.plan.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {

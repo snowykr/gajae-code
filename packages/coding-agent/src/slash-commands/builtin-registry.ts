@@ -633,7 +633,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// — including the first-time `/goal set <objective>` case where goal
 			// mode was not yet active. A previous `wasGoalModeEnabled` guard dropped
 			// that first-time case from history (up/down-arrow recall).
-			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
+			await runtime.ctx.goalModeController.handleCommand(command.args || undefined);
 			if (command.args) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}

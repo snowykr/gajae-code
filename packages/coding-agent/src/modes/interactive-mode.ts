@@ -1,34 +1,19 @@
-/**
- * Interactive mode for the coding agent.
- * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
- */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { type Agent, type AgentMessage, type AgentToolResult, ThinkingLevel } from "@gajae-code/agent-core";
+import { type Agent, type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
-import {
-	type AssistantMessage,
-	type ImageContent,
-	type Message,
-	type Model,
-	modelsAreEqual,
-	type UsageReport,
-} from "@gajae-code/ai";
+import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
 import type { Component, EditorTheme, SlashCommand } from "@gajae-code/tui";
 import {
 	Container,
 	clearRenderCache,
 	getRenderCacheRetainedBytes,
 	Loader,
-	Markdown,
 	onImageProtocolChanged,
 	ProcessTerminal,
 	Spacer,
 	Text,
 	TUI,
-	visibleWidth,
 } from "@gajae-code/tui";
-import { APP_NAME, adjustHsv, getProjectDir, hsvToRgb, isEnoent, logger, postmortem, prompt } from "@gajae-code/utils";
+import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import { type AppKeybinding, KeybindingsManager } from "../config/keybindings";
@@ -43,49 +28,26 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
-import { consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
-import {
-	canonicalArgsKey,
-	classifyToolOutcome,
-	decideTimeoutHold,
-	type TimeoutToolOutcome,
-	toResultText,
-	turnTimeoutFingerprint,
-} from "../goals/continuation-timeout-guard";
-import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
-import { resolveLocalUrlToPath } from "../internal-urls";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import { humanizePlanTitle, type PlanApprovalDetails, resolvePlanTitle } from "../plan-mode/approved-plan";
-import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" with { type: "text" };
-import planModeCompactInstructionsPrompt from "../prompts/system/plan-mode-compact-instructions.md" with {
-	type: "text",
-};
 import {
 	createStarReminderBeforeAgentStartContributor,
 	scheduleLaunchStarReminderAfterFirstRender,
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
-import type { AgentSession, AgentSessionEvent, TemporaryProviderSessionScope } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
-import { formatDuration } from "../slash-commands/helpers/format";
-import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
-import { normalizeLocalScheme } from "../tools/path-utils";
-import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName } from "../tools/todo-write";
-import { ToolError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
-import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CommandPaletteAction } from "./components/command-palette";
 import { CustomEditor } from "./components/custom-editor";
-import { DynamicBorder } from "./components/dynamic-border";
 import type { EvalExecutionComponent } from "./components/eval-execution";
 import { GajaePetWidget, type PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
@@ -98,7 +60,6 @@ import {
 	isPetCapabilityProbePending,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
-import { planSnapshotHash, serializePlanReviewComments } from "./components/plan-preview-overlay";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { StatusLineComponent } from "./components/tool-status-header";
 import {
@@ -110,9 +71,13 @@ import { BtwController } from "./controllers/btw-controller";
 import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
 import { ExtensionUiController } from "./controllers/extension-ui-controller";
+import { GoalModeController } from "./controllers/goal-mode-controller";
 import { InputController } from "./controllers/input-controller";
+import { ModeGate } from "./controllers/mode-gate";
+import { PlanModeController } from "./controllers/plan-mode-controller";
 import { SelectorController } from "./controllers/selector-controller";
 import { SSHCommandController } from "./controllers/ssh-command-controller";
+import { SttModeController } from "./controllers/stt-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
 import { IrcObservationLedger } from "./irc-observation-ledger";
 import { JobsObserver } from "./jobs-observer";
@@ -123,14 +88,7 @@ import { shouldShowExtensionCommand } from "./slash-command-visibility";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
-import {
-	getEditorTheme,
-	getMarkdownTheme,
-	getSymbolTheme,
-	onTerminalAppearanceChange,
-	onThemeChange,
-	theme,
-} from "./theme/theme";
+import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
 	type CompactionQueuedMessage,
@@ -146,7 +104,6 @@ import {
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
 
-const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
 const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
 export const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Ctrl+R: Search history · Shift+Tab: Reasoning`;
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
@@ -277,22 +234,6 @@ function formatHudNoteMarker(count: number): string {
 	return theme.fg("dim", chalk.italic(` \u207a${sub}`));
 }
 
-type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
-
-const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
-
-function parseGoalSubcommand(args: string): { sub: GoalSubcommand | undefined; rest: string } {
-	const trimmed = args.trim();
-	if (!trimmed) return { sub: undefined, rest: "" };
-	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed);
-	if (!match) return { sub: undefined, rest: trimmed };
-	const first = match[1].toLowerCase();
-	if (GOAL_SUBCOMMANDS.has(first as GoalSubcommand)) {
-		return { sub: first as GoalSubcommand, rest: match[2]?.trim() ?? "" };
-	}
-	return { sub: undefined, rest: trimmed };
-}
-
 export type WelcomeBannerSettingMode = "auto" | "unicode" | "square" | "ascii";
 
 export function resolveWelcomeLogoMode(
@@ -351,11 +292,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	isBashNoContext = false;
 	toolOutputExpanded = false;
 	todoExpanded = false;
-	planModeEnabled = false;
-	planModePaused = false;
-	goalModeEnabled = false;
-	goalModePaused = false;
-	planModePlanFilePath: string | undefined = undefined;
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
 	pendingImages: ImageContent[] = [];
@@ -410,25 +346,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#petUnavailableWarningDisposer?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
-	#planModePreviousTools: string[] | undefined;
-	#goalModePreviousTools: string[] | undefined;
-	#goalContinuationTimer: NodeJS.Timeout | undefined;
-	#goalTurnHadToolCalls = false;
-	#goalContinuationTurnInFlight = false;
-	#goalSuppressNextContinuation = false;
-	#goalTurnToolStarts = new Map<string, { toolName: string; argsKey: string }>();
-	#goalTurnOutcomes: TimeoutToolOutcome[] = [];
-	#goalTurnUnpaired = false;
-	#goalTurnSnapshotKey: string | undefined;
-	#goalHeldSnapshotKey: string | undefined;
-	#goalTimeoutFingerprint: string | undefined;
-	#goalIdenticalTimeoutStreak = 0;
-	#planModePreviousModelState: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
-	#pendingModelSwitch: { model: Model; thinkingLevel?: ThinkingLevel } | undefined;
-	#planModeProviderSessionScope: TemporaryProviderSessionScope | undefined;
-	#planModeHasEntered = false;
-	#planReviewContainer: Container | undefined;
-	#planApprovalDispatchPending = false;
+
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: import("../runtime-mcp").MCPManager;
 	readonly #toolUiContextSetter: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
@@ -441,14 +359,22 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #inputController: InputController;
 	readonly #selectorController: SelectorController;
 	readonly #uiHelpers: UiHelpers;
-	#sttController: STTController | undefined;
-	#voiceAnimationInterval: NodeJS.Timeout | undefined;
-	#voiceHue = 0;
-	#voicePreviousShowHardwareCursor: boolean | null = null;
-	#voicePreviousUseTerminalCursor: boolean | null = null;
+	readonly #modeGate = new ModeGate();
+	readonly #goalModeController: GoalModeController;
+	readonly #planModeController: PlanModeController;
+	#sttController: SttModeController | undefined;
 	#resizeHandler?: () => void;
 	#observerRegistry: SessionObserverRegistry;
 	#transcriptRegistry = new TranscriptItemRegistry();
+
+	/** Direct controller capabilities for consumers that coordinate mode transitions. */
+	get planModeController(): PlanModeController {
+		return this.#planModeController;
+	}
+
+	get goalModeController(): GoalModeController {
+		return this.#goalModeController;
+	}
 
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
@@ -471,12 +397,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.session.setSdkPlanModeHandler(async on => {
-			if (on) await this.#enterPlanMode();
-			else await this.#exitPlanMode();
+			if (on && (this.#goalModeController.enabled || this.#goalModeController.paused)) {
+				throw Object.assign(new Error("mode.plan.set could not enter plan mode while goal mode is active."), {
+					code: "conflict",
+				});
+			}
+			if (on) await this.#planModeController.enter();
+			else await this.#planModeController.exit();
 			const state = this.session.getPlanModeState();
 			const applied = on
-				? this.planModeEnabled && state?.enabled === true
-				: !this.planModeEnabled && !this.planModePaused && state === undefined;
+				? this.#planModeController.enabled && state?.enabled === true
+				: !this.#planModeController.enabled && !this.#planModeController.paused && state === undefined;
 			if (!applied) {
 				throw Object.assign(
 					new Error(`mode.plan.set could not ${on ? "enter" : "exit"} plan mode in the current lifecycle state.`),
@@ -500,6 +431,67 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
 		this.#eventBus = eventBus;
+		const thisMode = this;
+		this.#goalModeController = new GoalModeController({
+			session: this.session,
+			sessionManager: this.sessionManager,
+			modeGate: this.#modeGate,
+			get planModeActive() {
+				return thisMode.#planModeController.enabled || thisMode.#planModeController.paused;
+			},
+			get inputCallback() {
+				return thisMode.onInputCallback;
+			},
+			get hasPendingSubmission() {
+				return thisMode.#pendingSubmittedInput !== undefined;
+			},
+			get hasPendingImages() {
+				return thisMode.pendingImages.length > 0;
+			},
+			get editorText() {
+				return thisMode.editor.getText();
+			},
+			startPendingSubmission: input => thisMode.startPendingSubmission(input),
+			showStatus: message => this.showStatus(message),
+			showWarning: message => this.showWarning(message),
+			showError: message => this.showError(message),
+			showHookConfirm: (title, message) => this.showHookConfirm(title, message),
+			showHookSelector: (title, options) => this.showHookSelector(title, options),
+			showHookEditor: (title, options) => this.showHookEditor(title, undefined, undefined, options),
+			updateGoalModeStatus: () => this.#updateGoalModeStatus(),
+		});
+		this.#planModeController = new PlanModeController({
+			session: this.session,
+			sessionManager: this.sessionManager,
+			modeGate: this.#modeGate,
+			get chatContainer() {
+				return thisMode.chatContainer;
+			},
+			get inputCallback() {
+				return thisMode.onInputCallback;
+			},
+			get externalEditorKey() {
+				return thisMode.keybindings.getDisplayString("app.editor.external");
+			},
+			get externalEditorKeys() {
+				return thisMode.keybindings.getKeys("app.editor.external");
+			},
+			startPendingSubmission: input => thisMode.startPendingSubmission(input),
+			addChatChild: child => addChatChild(thisMode, child),
+			requestRender: full => thisMode.ui.requestRender(full),
+			stopUi: () => thisMode.ui.stop(),
+			startUi: () => thisMode.ui.start(),
+			showStatus: message => thisMode.showStatus(message),
+			showWarning: message => thisMode.showWarning(message),
+			showError: message => thisMode.showError(message),
+			showHookConfirm: (title, message) => thisMode.showHookConfirm(title, message),
+			showPlanPreview: (content, options) => thisMode.#selectorController.showPlanPreview(content, options),
+			flushCompactionQueue: options => thisMode.flushCompactionQueue(options),
+			updatePlanModeStatus: status => thisMode.#updatePlanModeStatus(status),
+			handleClearCommand: () => thisMode.handleClearCommand(),
+			handleCompactCommand: instructions => thisMode.handleCompactCommand(instructions),
+			updateEditorChrome: () => thisMode.updateEditorChrome(),
+		});
 		if (eventBus) {
 			this.#eventBusUnsubscribers.push(
 				eventBus.on(LSP_STARTUP_EVENT_CHANNEL, data => {
@@ -880,66 +872,15 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async getUserInput(): Promise<SubmittedUserInput> {
 		if (this.session.getGoalModeState()?.mode === "exiting") {
-			await this.#exitGoalMode({ reason: "completed", silent: true });
+			await this.#goalModeController.beforeGetUserInput();
 		}
 		const { promise, resolve } = Promise.withResolvers<SubmittedUserInput>();
 		this.onInputCallback = input => {
 			this.onInputCallback = undefined;
 			resolve(input);
 		};
-		this.#scheduleGoalContinuation();
+		this.#goalModeController.scheduleContinuation();
 		return promise;
-	}
-
-	#scheduleGoalContinuation(): void {
-		this.#cancelGoalContinuation();
-		if (!this.onInputCallback) return;
-		if (!this.session.settings.get("goal.continuationModes").includes("interactive")) return;
-		if (this.planModeEnabled || this.planModePaused) return;
-		if (!this.goalModeEnabled || this.goalModePaused) return;
-		if (this.#goalSuppressNextContinuation) return;
-		if (this.#pendingSubmittedInput) return;
-		if (this.editor.getText().trim().length > 0) return;
-		if ((this.pendingImages?.length ?? 0) > 0) return;
-		const state = this.session.getGoalModeState();
-		if (!state?.enabled || state.goal.status !== "active") return;
-		const prompt = this.session.goalRuntime.buildContinuationPrompt();
-		if (!prompt) return;
-		this.#goalContinuationTimer = setTimeout(() => {
-			this.#goalContinuationTimer = undefined;
-			if (!this.onInputCallback) return;
-			if (!this.goalModeEnabled || this.goalModePaused) return;
-			if (this.#pendingSubmittedInput) return;
-			if (this.editor.getText().trim().length > 0) return;
-			if ((this.pendingImages?.length ?? 0) > 0) return;
-			// Never fire an autonomous continuation prompt() while the session is
-			// busy. A wedged/orphaned subagent turn can leave isStreaming stuck true;
-			// firing prompt() here throws AgentBusyError, which submitInteractiveInput
-			// surfaces as a red "Error: Agent is already processing…" and then loops
-			// back to getUserInput(), re-arming this timer — an infinite error spam.
-			// Re-arm and only fire once the session returns to idle.
-			if (this.session.isStreaming || this.session.isCompacting) {
-				this.#scheduleGoalContinuation();
-				return;
-			}
-			const latestState = this.session.getGoalModeState();
-			if (!latestState?.enabled || latestState.goal.status !== "active") return;
-			this.#goalContinuationTurnInFlight = true;
-			this.onInputCallback(
-				this.startPendingSubmission({
-					text: prompt,
-					customType: "goal-continuation",
-					display: false,
-				}),
-			);
-		}, 800);
-	}
-
-	#cancelGoalContinuation(): void {
-		if (this.#goalContinuationTimer) {
-			clearTimeout(this.#goalContinuationTimer);
-			this.#goalContinuationTimer = undefined;
-		}
 	}
 
 	recordLocalSubmission(text: string, imageCount = 0): () => void {
@@ -985,7 +926,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		};
 		this.#pendingSubmittedInput = submission;
 		if (!submission.customType) {
-			this.#resetGoalContinuationSuppression();
+			this.#goalModeController.onUserSubmission();
 			const imageCount = submission.images?.length ?? 0;
 			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
 			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
@@ -1019,9 +960,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionDispose?.();
 		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
-		if (submission.customType === "goal-continuation") {
-			this.#goalContinuationTurnInFlight = false;
-		}
+		this.#goalModeController.onPendingSubmissionFinished(submission.customType);
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
@@ -1052,9 +991,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingSubmittedInput = undefined;
 			this.#pendingSubmissionDispose = undefined;
 		}
-		if (input.customType === "goal-continuation") {
-			this.#goalContinuationTurnInFlight = false;
-		}
+		this.#goalModeController.onPendingSubmissionFinished(input.customType);
 
 		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
 			this.optimisticUserMessageSignature = undefined;
@@ -1304,29 +1241,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#renderTodoList();
 	}
 
-	async #getPlanFilePath(): Promise<string> {
-		return "local://PLAN.md";
-	}
-
-	#resolvePlanFilePath(planFilePath: string): string {
-		if (planFilePath.startsWith("local:")) {
-			const normalized = normalizeLocalScheme(planFilePath);
-			return resolveLocalUrlToPath(normalized, {
-				getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-				getSessionId: () => this.sessionManager.getSessionId(),
-			});
-		}
-		return path.resolve(this.sessionManager.getCwd(), planFilePath);
-	}
-
-	#updatePlanModeStatus(): void {
-		const status =
-			this.planModeEnabled || this.planModePaused
-				? {
-						enabled: this.planModeEnabled,
-						paused: this.planModePaused,
-					}
-				: undefined;
+	#updatePlanModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.statusLine.setPlanModeStatus(status);
 		this.updateEditorChrome();
 		this.ui.requestRender();
@@ -1334,1010 +1249,23 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#updateGoalModeStatus(): void {
 		const status =
-			this.goalModeEnabled || this.goalModePaused
-				? { enabled: this.goalModeEnabled, paused: this.goalModePaused }
+			this.#goalModeController.enabled || this.#goalModeController.paused
+				? { enabled: this.#goalModeController.enabled, paused: this.#goalModeController.paused }
 				: undefined;
 		this.statusLine.setGoalModeStatus(status);
 		this.updateEditorChrome();
 		this.ui.requestRender();
 	}
 
-	#resetGoalTimeoutHold(): void {
-		this.#goalTurnToolStarts.clear();
-		this.#goalTurnOutcomes = [];
-		this.#goalTurnUnpaired = false;
-		this.#goalTurnSnapshotKey = undefined;
-		this.#goalHeldSnapshotKey = undefined;
-		this.#goalTimeoutFingerprint = undefined;
-		this.#goalIdenticalTimeoutStreak = 0;
-	}
-
-	#resetGoalContinuationSuppression(): void {
-		this.#goalSuppressNextContinuation = false;
-		this.#resetGoalTimeoutHold();
-	}
-
-	#getPausedGoalState(): GoalModeState | undefined {
-		const state = this.session.getGoalModeState();
-		if (!state?.goal || state.enabled || state.goal.status !== "paused") {
-			return undefined;
-		}
-		return state;
-	}
-
-	#goalFromModeData(modeData: SessionContext["modeData"]): Goal | undefined {
-		return normalizeGoal(modeData?.goal) ?? undefined;
-	}
-
 	async #handleGoalSessionEvent(event: AgentSessionEvent): Promise<void> {
-		if (event.type === "agent_start") {
-			this.#goalTurnHadToolCalls = false;
-			this.#goalTurnToolStarts.clear();
-			this.#goalTurnOutcomes = [];
-			this.#goalTurnUnpaired = false;
-			const goal = this.session.getGoalModeState()?.goal;
-			this.#goalTurnSnapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
-			this.#cancelGoalContinuation();
-			return;
-		}
-		if (event.type === "tool_execution_start") {
-			this.#goalTurnHadToolCalls = true;
-			this.#goalTurnToolStarts.set(event.toolCallId, {
-				toolName: event.toolName,
-				argsKey: canonicalArgsKey(event.args),
-			});
-			if (!this.#goalContinuationTurnInFlight) {
-				this.#resetGoalContinuationSuppression();
-			}
-			return;
-		}
-		if (event.type === "tool_execution_end") {
-			const start = this.#goalTurnToolStarts.get(event.toolCallId);
-			if (!start) {
-				this.#goalTurnHadToolCalls = true;
-				this.#goalTurnUnpaired = true;
-			} else {
-				this.#goalTurnOutcomes.push({
-					...start,
-					kind: classifyToolOutcome(event.isError, toResultText(event.result)),
-				});
-				this.#goalTurnToolStarts.delete(event.toolCallId);
-			}
-			return;
-		}
-		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
-			this.#resetGoalContinuationSuppression();
-			return;
-		}
-		if (event.type === "goal_updated") {
-			// Handle drop before clearing goalModeEnabled so #exitGoalMode can
-			// still restore the previous tool set while the flag is true.
-			if (event.state?.goal?.status === "dropped") {
-				await this.#exitGoalMode({ reason: "dropped", silent: true });
-				return;
-			}
-			const goal = event.state?.goal;
-			const snapshotKey = goal ? `${goal.id}\u0000${goal.objective}` : undefined;
-			if (this.#goalHeldSnapshotKey !== undefined && this.#goalHeldSnapshotKey !== snapshotKey) {
-				this.#resetGoalContinuationSuppression();
-			}
-			if (event.state?.enabled === true && !this.#goalModePreviousTools) {
-				this.#goalModePreviousTools = this.session.getActiveToolNames();
-			}
-			this.goalModeEnabled = event.state?.enabled === true;
-			this.goalModePaused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
-			if (!event.state?.enabled) {
-				this.#resetGoalContinuationSuppression();
-				this.#cancelGoalContinuation();
-			}
-			this.#updateGoalModeStatus();
-			return;
-		}
-		if (event.type !== "agent_end") {
-			return;
-		}
-		if (this.#goalContinuationTurnInFlight) {
-			this.#goalSuppressNextContinuation = !this.#goalTurnHadToolCalls;
-			const fingerprint =
-				this.#goalTurnToolStarts.size > 0 || this.#goalTurnUnpaired
-					? null
-					: turnTimeoutFingerprint(this.#goalTurnOutcomes);
-			const decision = decideTimeoutHold(
-				{
-					heldSnapshotKey: this.#goalHeldSnapshotKey,
-					fingerprint: this.#goalTimeoutFingerprint,
-					streak: this.#goalIdenticalTimeoutStreak,
-				},
-				{ snapshotKey: this.#goalTurnSnapshotKey ?? "", fingerprint },
-			);
-			if (fingerprint === null) {
-				this.#resetGoalTimeoutHold();
-			} else {
-				this.#goalHeldSnapshotKey = decision.next.heldSnapshotKey;
-				this.#goalTimeoutFingerprint = decision.next.fingerprint;
-				this.#goalIdenticalTimeoutStreak = decision.next.streak;
-			}
-			if (decision.hold) {
-				this.#goalSuppressNextContinuation = true;
-				this.showStatus(
-					`Goal paused for attention: repeated identical timeout from ${this.#goalTurnOutcomes[0]?.toolName ?? "tool"}. Send a message to continue.`,
-				);
-			}
-			this.#goalContinuationTurnInFlight = false;
-		} else {
-			this.#resetGoalTimeoutHold();
-		}
-		if (this.session.getGoalModeState()?.mode === "exiting") {
-			await this.#exitGoalMode({ reason: "completed", silent: true });
-			return;
-		}
-		this.#scheduleGoalContinuation();
+		await this.#goalModeController.handleSessionEvent(event);
 	}
 
-	async #applyPlanModeModel(): Promise<void> {
-		const resolved = this.session.resolveRoleModelWithThinking("plan");
-		if (!resolved.model) return;
-
-		const currentModel = this.session.model;
-		const sameModel = modelsAreEqual(currentModel, resolved.model);
-		const planThinkingLevel = resolved.explicitThinkingLevel ? resolved.thinkingLevel : undefined;
-
-		this.#planModePreviousModelState = currentModel
-			? { model: currentModel, thinkingLevel: this.session.thinkingLevel }
-			: undefined;
-
-		if (!sameModel) {
-			if (this.session.isStreaming) {
-				this.#pendingModelSwitch = { model: resolved.model, thinkingLevel: planThinkingLevel };
-				return;
-			}
-			try {
-				this.#planModeProviderSessionScope = this.session.beginTemporaryProviderSessionScope("plan-mode");
-				await this.session.setModelTemporary(resolved.model, planThinkingLevel, {
-					cause: "temporary-operation",
-					reason: "plan-mode",
-					providerSessionScope: this.#planModeProviderSessionScope,
-				});
-			} catch (error) {
-				const scope = this.#planModeProviderSessionScope;
-				if (scope) {
-					this.session.restoreTemporaryProviderSessionScope(scope);
-					this.#planModeProviderSessionScope = undefined;
-				}
-				this.showWarning(
-					`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		} else if (planThinkingLevel) {
-			this.session.setThinkingLevel(planThinkingLevel);
-		}
-	}
-
-	/** Apply any deferred model switch after the current stream ends. */
-	async flushPendingModelSwitch(): Promise<void> {
-		const pending = this.#pendingModelSwitch;
-		if (!pending) return;
-		this.#pendingModelSwitch = undefined;
-		try {
-			this.#planModeProviderSessionScope ??= this.session.beginTemporaryProviderSessionScope("plan-mode");
-			await this.session.setModelTemporary(pending.model, pending.thinkingLevel, {
-				cause: "temporary-operation",
-				reason: "plan-mode",
-				providerSessionScope: this.#planModeProviderSessionScope,
-			});
-		} catch (error) {
-			const scope = this.#planModeProviderSessionScope;
-			if (scope) {
-				this.session.restoreTemporaryProviderSessionScope(scope);
-				this.#planModeProviderSessionScope = undefined;
-			}
-			this.showWarning(
-				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
-	}
-
-	/** Restore mode state from session entries on resume (e.g. plan mode). */
+	/** Restore mode state from session entries on resume. */
 	async #restoreModeFromSession(): Promise<void> {
 		const sessionContext = this.sessionManager.buildSessionContext();
-		const goalEnabled = this.session.settings.get("goal.enabled");
-		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
-			this.sessionManager.appendModeChange("none");
-			return;
-		}
-		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
-			const goal = this.#goalFromModeData(sessionContext.modeData);
-			if (!goal) {
-				this.sessionManager.appendModeChange("none");
-				return;
-			}
-			this.session.setGoalModeState({
-				enabled: sessionContext.mode === "goal",
-				mode: "active",
-				goal,
-			});
-			const restored = await this.session.goalRuntime.onThreadResumed();
-			this.goalModeEnabled = restored?.enabled === true;
-			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
-			// Keep `goal` armed on resumed threads; it is part of the default active tool set.
-			if (restored?.goal) {
-				const previousTools = this.session.getActiveToolNames();
-				this.#goalModePreviousTools = previousTools;
-				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
-			}
-			this.#updateGoalModeStatus();
-			return;
-		}
-		const pendingGoal = goalEnabled
-			? await consumePendingGoalModeRequest(this.sessionManager.getCwd(), this.sessionManager.getSessionId())
-			: null;
-		if (pendingGoal) {
-			await this.#enterGoalMode({ objective: pendingGoal.objective, silent: true });
-			this.#scheduleGoalContinuation();
-			return;
-		}
-		if (!this.session.settings.get("plan.enabled")) {
-			// Clear stale plan/plan_paused mode so re-enabling the setting
-			// later doesn't unexpectedly restore an old plan session.
-			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused") {
-				this.sessionManager.appendModeChange("none");
-			}
-			return;
-		}
-		if (sessionContext.mode === "plan") {
-			const planFilePath = sessionContext.modeData?.planFilePath as string | undefined;
-			await this.#enterPlanMode({ planFilePath });
-		} else if (sessionContext.mode === "plan_paused") {
-			this.planModePaused = true;
-			this.#planModeHasEntered = true;
-			this.#updatePlanModeStatus();
-		}
-	}
-
-	async #enterPlanMode(options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> {
-		if (this.planModeEnabled) {
-			return;
-		}
-		if (this.goalModeEnabled || this.goalModePaused) {
-			this.showWarning("Exit goal mode first.");
-			return;
-		}
-
-		this.planModePaused = false;
-
-		const planFilePath = options?.planFilePath ?? (await this.#getPlanFilePath());
-		const previousTools = this.session.getActiveToolNames();
-		const hasResolveTool = this.session.getToolByName("resolve") !== undefined;
-		const planTools = hasResolveTool ? [...previousTools, "resolve"] : previousTools;
-		const uniquePlanTools = [...new Set(planTools)];
-
-		this.#planModePreviousTools = previousTools;
-		this.planModePlanFilePath = planFilePath;
-		this.planModeEnabled = true;
-
-		await this.session.setActiveToolsByName(uniquePlanTools);
-		this.session.setPlanModeState({
-			enabled: true,
-			planFilePath,
-			workflow: options?.workflow ?? "parallel",
-			reentry: this.#planModeHasEntered,
-		});
-		this.session.setStandingResolveHandler?.(input => this.#runPlanApprovalResolve(input));
-		if (this.session.isStreaming) {
-			await this.session.sendPlanModeContext({ deliverAs: "steer" });
-		}
-		this.#planModeHasEntered = true;
-		await this.#applyPlanModeModel();
-		this.#updatePlanModeStatus();
-		this.sessionManager.appendModeChange("plan", { planFilePath });
-		this.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
-	}
-
-	/** Standing resolve dispatcher registered while plan mode is active. The agent
-	 *  submits the finalized plan by calling `resolve { action: "apply", extra: { title } }`;
-	 *  this handler validates the plan file exists, normalizes the title, and shapes the
-	 *  payload that `event-controller` forwards to `handlePlanApproval`. */
-	#runPlanApprovalResolve(input: unknown): Promise<AgentToolResult<ResolveToolDetails>> {
-		return runResolveInvocation(input as Parameters<typeof runResolveInvocation>[0], {
-			sourceToolName: "plan_approval",
-			label: "Plan ready for approval",
-			apply: async (_reason, extra) => {
-				const state = this.session.getPlanModeState?.();
-				if (!state?.enabled) {
-					throw new ToolError("Plan mode is not active.");
-				}
-				const planFilePath = state.planFilePath;
-				const planContent = await this.#readPlanFile(planFilePath);
-				if (planContent === null) {
-					throw new ToolError(
-						`Plan file not found at ${planFilePath}. Write the finalized plan to ${planFilePath} before requesting approval.`,
-					);
-				}
-				const normalized = resolvePlanTitle({
-					suppliedTitle: extra?.title,
-					planContent,
-					planFilePath,
-				});
-				const details: PlanApprovalDetails = {
-					planFilePath,
-					finalPlanFilePath: `local://${normalized.fileName}`,
-					title: normalized.title,
-					planExists: true,
-				};
-				return {
-					content: [{ type: "text" as const, text: "Plan ready for approval." }],
-					details,
-				};
-			},
-		});
-	}
-
-	async #exitPlanMode(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
-		if (!this.planModeEnabled) {
-			return;
-		}
-
-		// Leaving plan mode invalidates the plan-mode steering and standing
-		// resolve handler that the in-flight turn may still be acting on. Abort
-		// before clearing that state so the model cannot continue from stale
-		// plan-mode context and retry `resolve` against a retired handler.
-		await this.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS });
-
-		const previousTools = this.#planModePreviousTools;
-		if (previousTools && previousTools.length > 0) {
-			await this.session.setActiveToolsByName(previousTools);
-		}
-		const scope = this.#planModeProviderSessionScope;
-		if (scope && !this.session.isStreaming) {
-			const restored = this.session.restoreTemporaryProviderSessionScope(scope);
-			if (restored) this.#planModeProviderSessionScope = undefined;
-		} else if (this.#planModePreviousModelState) {
-			const prev = this.#planModePreviousModelState;
-			if (modelsAreEqual(this.session.model, prev.model)) {
-				this.session.setThinkingLevel(prev.thinkingLevel);
-			} else if (this.session.isStreaming) {
-				this.#pendingModelSwitch = { model: prev.model, thinkingLevel: prev.thinkingLevel };
-			} else {
-				await this.session.setModelTemporary(prev.model, prev.thinkingLevel, {
-					cause: "restore",
-					reason: "plan-mode",
-				});
-			}
-		}
-		// If #applyPlanModeModel queued a deferred switch to the plan-role model
-		// (because the session was streaming on entry), drop it now: we are
-		// leaving plan mode, so flushing it on the next agent_end would land the
-		// session on the plan-role model after the user has exited plan mode
-		// (issue #816). Only clear when the pending target matches the plan-role
-		// model — leave any unrelated user-queued switch intact.
-		const pending = this.#pendingModelSwitch;
-		if (pending) {
-			const planResolution = this.session.resolveRoleModelWithThinking("plan");
-			if (planResolution.model && modelsAreEqual(pending.model, planResolution.model)) {
-				this.#pendingModelSwitch = undefined;
-			}
-		}
-		this.session.setStandingResolveHandler?.(null);
-		this.session.setPlanModeState(undefined);
-		this.planModeEnabled = false;
-		this.planModePaused = options?.paused ?? false;
-		this.planModePlanFilePath = undefined;
-		this.#planModePreviousTools = undefined;
-		this.#planModePreviousModelState = undefined;
-		this.#updatePlanModeStatus();
-		const paused = options?.paused ?? false;
-		this.sessionManager.appendModeChange(paused ? "plan_paused" : "none");
-		if (!options?.silent) {
-			this.showStatus(paused ? "Plan mode paused." : "Plan mode disabled.");
-		}
-	}
-
-	async #enterGoalMode(options: { objective?: string; resume?: boolean; silent?: boolean }): Promise<void> {
-		if (this.goalModeEnabled) {
-			return;
-		}
-		if (this.planModeEnabled || this.planModePaused) {
-			this.showWarning("Exit plan mode first.");
-			return;
-		}
-		const previousTools = this.session.getActiveToolNames();
-		const goalTools = [...new Set([...previousTools, "goal"])];
-		this.#goalModePreviousTools = previousTools;
-		this.goalModePaused = false;
-		const state = options.resume
-			? await this.session.goalRuntime.resumeGoal()
-			: await this.session.goalRuntime.createGoal({ objective: options.objective ?? "" });
-		await this.session.setActiveToolsByName(goalTools);
-		this.session.setGoalModeState(state);
-		this.goalModeEnabled = true;
-		this.#resetGoalContinuationSuppression();
-		this.#updateGoalModeStatus();
-		if (this.session.isStreaming) {
-			await this.session.sendGoalModeContext({ deliverAs: "steer" });
-		}
-		if (!options.silent) {
-			this.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
-		}
-	}
-
-	async #exitGoalMode(options?: {
-		silent?: boolean;
-		paused?: boolean;
-		reason?: "completed" | "paused" | "dropped";
-	}): Promise<void> {
-		const previousTools = this.#goalModePreviousTools;
-		// Drop keeps the `goal` tool callable so the agent can immediately create a new
-		// goal in the same session without a leader-side cleanup. Complete (and pause)
-		// exit goal mode and restore the pre-goal tool set even when the goal_updated
-		// event has already cleared goalModeEnabled (see #completeGoalFromTool emitting
-		// state.enabled = false before #exitGoalMode runs). Spec: deep-interview-ultragoal-goal-tool-wiring AC1+AC2.
-		const shouldRestoreTools =
-			previousTools &&
-			options?.reason !== "dropped" &&
-			(this.goalModeEnabled || options?.reason === "completed" || options?.paused === true);
-		if (shouldRestoreTools) {
-			await this.session.setActiveToolsByName(previousTools);
-		}
-		const currentState = this.session.getGoalModeState();
-		if (options?.reason === "completed") {
-			this.session.setGoalModeState(undefined);
-			this.sessionManager.appendModeChange("none");
-			this.sessionManager.appendCustomEntry("goal-completed", {
-				objective: currentState?.goal?.objective,
-				tokensUsed: currentState?.goal?.tokensUsed,
-				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
-			});
-		}
-		this.goalModeEnabled = false;
-		this.goalModePaused = options?.paused ?? false;
-		this.#goalModePreviousTools = undefined;
-		this.#goalContinuationTurnInFlight = false;
-		this.#resetGoalContinuationSuppression();
-		this.#cancelGoalContinuation();
-		this.#updateGoalModeStatus();
-		if (!options?.silent) {
-			if (options?.reason === "completed") {
-				this.showStatus("Goal mode completed.");
-			} else if (options?.reason === "dropped") {
-				this.showStatus("Goal dropped.");
-			} else if (options?.paused) {
-				this.showStatus("Goal mode paused.");
-			} else {
-				this.showStatus("Goal mode disabled.");
-			}
-		}
-	}
-
-	async #readPlanFile(planFilePath: string): Promise<string | null> {
-		const resolvedPath = this.#resolvePlanFilePath(planFilePath);
-		try {
-			return await Bun.file(resolvedPath).text();
-		} catch (error) {
-			if (isEnoent(error)) {
-				return null;
-			}
-			throw error;
-		}
-	}
-
-	async #finalizeApprovedPlan(planContent: string, planFilePath: string, finalPlanFilePath: string): Promise<void> {
-		if (!planFilePath.startsWith("local:") || !finalPlanFilePath.startsWith("local:")) {
-			throw new Error("Approved plan source and destination paths must use the local: scheme.");
-		}
-		const sourcePath = this.#resolvePlanFilePath(planFilePath);
-		const destinationPath = this.#resolvePlanFilePath(finalPlanFilePath);
-		const temporaryPath = `${destinationPath}.approval-${crypto.randomUUID()}`;
-		try {
-			await fs.writeFile(temporaryPath, planContent, { encoding: "utf8", flag: "wx" });
-			if (sourcePath === destinationPath) await fs.rename(temporaryPath, destinationPath);
-			else {
-				try {
-					await fs.link(temporaryPath, destinationPath);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-						throw new Error(
-							`Plan destination already exists at ${finalPlanFilePath}. Choose a different title and submit the plan for approval again.`,
-						);
-					}
-					throw error;
-				}
-				await fs.unlink(temporaryPath);
-				await fs.unlink(sourcePath);
-			}
-			const destinationContent = await Bun.file(destinationPath).text();
-			if (planSnapshotHash(destinationContent) !== planSnapshotHash(planContent)) {
-				throw new Error(
-					`Approved plan destination hash did not match the reviewed snapshot at ${finalPlanFilePath}.`,
-				);
-			}
-		} finally {
-			await fs.unlink(temporaryPath).catch(() => {});
-		}
-	}
-
-	#renderPlanPreview(planContent: string, options?: { append?: boolean }): void {
-		const existingContainer = this.#planReviewContainer;
-		// Only reuse the existing preview when it is still attached to the chat container;
-		// a collapsed/disposed container must be re-added, not mutated in place.
-		const stillAttached = existingContainer !== undefined && this.chatContainer.children.includes(existingContainer);
-		const replaceExisting = options?.append !== true && stillAttached;
-		const planReviewContainer = replaceExisting && existingContainer ? existingContainer : new Container();
-		planReviewContainer.clear();
-		planReviewContainer.addChild(new Spacer(1));
-		planReviewContainer.addChild(new DynamicBorder());
-		planReviewContainer.addChild(new Text(theme.bold(theme.fg("accent", "Plan Review")), 1, 1));
-		planReviewContainer.addChild(new Spacer(1));
-		planReviewContainer.addChild(new Markdown(planContent, 1, 1, getMarkdownTheme()));
-		planReviewContainer.addChild(new DynamicBorder());
-		if (!replaceExisting) {
-			addChatChild(this, planReviewContainer);
-		}
-		this.#planReviewContainer = planReviewContainer;
-		this.ui.requestRender();
-	}
-
-	#getEditorTerminalPath(): string | null {
-		if (process.platform === "win32") {
-			return null;
-		}
-		return "/dev/tty";
-	}
-
-	async #openEditorTerminalHandle(): Promise<fs.FileHandle | null> {
-		const terminalPath = this.#getEditorTerminalPath();
-		if (!terminalPath) {
-			return null;
-		}
-		try {
-			return await fs.open(terminalPath, "r+");
-		} catch {
-			return null;
-		}
-	}
-
-	async #openPlanInExternalEditor(planFilePath: string): Promise<string | null> {
-		const editorCmd = getEditorCommand();
-		if (!editorCmd) {
-			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
-			return null;
-		}
-
-		const resolvedPath = this.#resolvePlanFilePath(planFilePath);
-		let currentText: string;
-		try {
-			currentText = await Bun.file(resolvedPath).text();
-		} catch (error) {
-			if (isEnoent(error)) {
-				this.showError(`Plan file not found at ${planFilePath}`);
-				return null;
-			}
-			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
-			return null;
-		}
-
-		let ttyHandle: fs.FileHandle | null = null;
-		try {
-			ttyHandle = await this.#openEditorTerminalHandle();
-			this.ui.stop();
-
-			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = ttyHandle
-				? [ttyHandle.fd, ttyHandle.fd, ttyHandle.fd]
-				: ["inherit", "inherit", "inherit"];
-			const result = await openInEditor(editorCmd, currentText, {
-				extension: path.extname(resolvedPath) || ".md",
-				stdio,
-				trimTrailingNewline: false,
-			});
-			if (result !== null) {
-				await Bun.write(resolvedPath, result);
-				this.showStatus("Plan updated in external editor.");
-				return result;
-			}
-			return null;
-		} catch (error) {
-			this.showWarning(`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`);
-			return null;
-		} finally {
-			if (ttyHandle) {
-				await ttyHandle.close();
-			}
-			this.ui.start();
-			this.ui.requestRender(true);
-		}
-	}
-
-	async #approvePlan(
-		planContent: string,
-		options: {
-			planFilePath: string;
-			finalPlanFilePath: string;
-			title: string;
-			preserveContext?: boolean;
-			compactBeforeExecute?: boolean;
-			reviewerComments?: string;
-		},
-	): Promise<void> {
-		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
-		const previousTools = this.#planModePreviousTools ?? this.session.getActiveToolNames();
-
-		// Mark the pending abort caused by the plan-mode → compaction transition as
-		// silent BEFORE #exitPlanMode raises it. The `finally` below clears the
-		// flag on every terminal compaction outcome (ok / cancelled / failed /
-		// throw) so a leaked flag cannot silence a later unrelated abort.
-		// Branchless mark+clear when !compactBeforeExecute: mark is gated; clear
-		// is unconditional and idempotent.
-		if (options.compactBeforeExecute) {
-			this.session.markPlanCompactAbortPending();
-		}
-		let sessionSwitchCompleted = true;
-		let compactOutcome: CompactionOutcome | undefined;
-		try {
-			await this.#exitPlanMode({ silent: true, paused: false });
-
-			if (!options.preserveContext) {
-				sessionSwitchCompleted = await this.handleClearCommand();
-				if (sessionSwitchCompleted) {
-					// The new session has a fresh local:// root — persist the approved plan there
-					// so `local://<title>.md` resolves correctly in the execution session.
-					const newLocalPath = resolveLocalUrlToPath(options.finalPlanFilePath, {
-						getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
-						getSessionId: () => this.sessionManager.getSessionId(),
-					});
-					await Bun.write(newLocalPath, planContent);
-				}
-			} else if (options.compactBeforeExecute) {
-				// Distill the plan-mode transcript before the execution turn is queued so
-				// the plan-approved synthetic prompt lands as a fresh cache anchor.
-				// Outcome is consumed after tool-restoration and plan-reference-path
-				// bookkeeping below; `markPlanReferenceSent` is intentionally deferred
-				// past the cancel guard — see the comment at the cancel branch.
-				// Cancellation skips the synthetic-prompt dispatch (operator's explicit
-				// abort is honored); failure proceeds best-effort — approval intent stands.
-				const compactionPrompt = prompt.render(planModeCompactInstructionsPrompt, {
-					planFilePath: options.finalPlanFilePath,
-				});
-				this.session.setPlanReferencePath(options.finalPlanFilePath);
-				this.#planApprovalDispatchPending = true;
-				try {
-					compactOutcome = await this.handleCompactCommand(compactionPrompt);
-				} catch (error) {
-					this.#planApprovalDispatchPending = false;
-					await this.flushCompactionQueue({ willRetry: false });
-					throw error;
-				}
-			}
-		} finally {
-			// Unconditional clear. Idempotent: a no-op when the flag was never set
-			// (i.e., the !compactBeforeExecute branch), and a no-op when the flag
-			// was already consumed by AgentSession.#handleAgentEvent's aborted
-			// message_end stamping. Guarantees the flag is dead at every exit.
-			this.session.clearPlanCompactAbortPending();
-		}
-
-		// Tool restoration runs on every path — the plan mode tools must be
-		// retired regardless of whether the synthetic prompt fires.
-		if (previousTools.length > 0) {
-			await this.session.setActiveToolsByName(previousTools);
-		}
-		if (!sessionSwitchCompleted) {
-			this.showWarning("Plan approved, but the new session could not be created — execution was not dispatched.");
-			return;
-		}
-		this.session.setPlanReferencePath(options.finalPlanFilePath);
-
-		if (compactOutcome === "cancelled") {
-			this.#planApprovalDispatchPending = false;
-			await this.flushCompactionQueue({ willRetry: false });
-			this.showWarning(
-				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
-			);
-			return;
-		}
-
-		// Approved plans land in a fresh (or compacted) session whose first user-visible
-		// turn is the synthetic plan-approved prompt — that path bypasses the
-		// input-controller's title generation. Seed an auto-name from the plan title
-		// so the session is not left unnamed. `setSessionName("auto")` is a no-op
-		// when the user has already chosen a name (preserveContext paths).
-		const seededName = humanizePlanTitle(options.title);
-		if (seededName && !this.sessionManager.getSessionName()) {
-			const applied = await this.sessionManager.setSessionName(seededName, "auto");
-			if (applied) {
-				setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
-				this.updateEditorChrome();
-			}
-		}
-
-		const planModePrompt = prompt.render(planModeApprovedPrompt, {
-			planContent,
-			finalPlanFilePath: options.finalPlanFilePath,
-			contextPreserved: options.preserveContext === true,
-			tools: this.session.getActiveToolNames(),
-			reviewerComments: options.reviewerComments,
-		});
-		try {
-			await this.session.prompt(planModePrompt, { synthetic: true });
-			this.session.markPlanReferenceSent();
-		} finally {
-			if (this.#planApprovalDispatchPending) {
-				this.#planApprovalDispatchPending = false;
-				await this.flushCompactionQueue({ willRetry: false });
-			}
-		}
-	}
-
-	async handlePlanModeCommand(initialPrompt?: string): Promise<void> {
-		if (this.goalModeEnabled || this.goalModePaused) {
-			this.showWarning("Exit goal mode first.");
-			return;
-		}
-		if (this.planModeEnabled) {
-			const confirmed = await this.showHookConfirm(
-				"Exit plan mode?",
-				"This exits plan mode without approving a plan.",
-			);
-			if (!confirmed) return;
-			await this.#exitPlanMode({ paused: true });
-			return;
-		}
-		if (!this.session.settings.get("plan.enabled")) {
-			this.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
-			return;
-		}
-		await this.#enterPlanMode();
-		if (initialPrompt && this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: initialPrompt }));
-		}
-	}
-
-	async handleGoalModeCommand(rest?: string): Promise<void> {
-		try {
-			if (this.planModeEnabled || this.planModePaused) {
-				this.showWarning("Exit plan mode first.");
-				return;
-			}
-			if (!this.session.settings.get("goal.enabled")) {
-				this.showWarning("Goal mode is disabled. Enable it in settings (goal.enabled).");
-				return;
-			}
-			const { sub, rest: subRest } = parseGoalSubcommand(rest ?? "");
-			if (sub) {
-				await this.#dispatchGoalSubcommand(sub, subRest);
-				return;
-			}
-			if (this.goalModeEnabled) {
-				if (subRest) {
-					this.showStatus("Goal mode is already active. Use /goal to manage it, or /goal drop to start over.");
-					return;
-				}
-				await this.#openGoalMenu("active");
-				return;
-			}
-			const pausedState = this.#getPausedGoalState();
-			if (pausedState) {
-				if (subRest) {
-					this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
-					return;
-				}
-				await this.#openGoalMenu("paused");
-				return;
-			}
-			if (subRest) {
-				await this.#startGoalFromObjective(subRest);
-				return;
-			}
-			const objective = (
-				await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true })
-			)?.trim();
-			if (!objective) return;
-			await this.#startGoalFromObjective(objective);
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-		}
-	}
-
-	async #dispatchGoalSubcommand(sub: GoalSubcommand, rest: string): Promise<void> {
-		switch (sub) {
-			case "set":
-				await this.#handleGoalSetSubcommand(rest);
-				return;
-			case "show":
-				this.#showGoalDetails();
-				return;
-			case "pause":
-				await this.#pauseGoalAction();
-				return;
-			case "resume":
-				await this.#resumeGoalAction();
-				return;
-			case "drop":
-				await this.#confirmAndDropGoal();
-				return;
-		}
-	}
-
-	async #openGoalMenu(state: "active" | "paused"): Promise<void> {
-		const goal = this.session.getGoalModeState()?.goal;
-		if (!goal) return;
-		const summary = goal.objective.length > 48 ? `${goal.objective.slice(0, 47)}…` : goal.objective;
-		const title = state === "active" ? `Goal: ${summary} (${goal.status})` : `Goal paused: ${summary}`;
-		const items = state === "active" ? ["Show details", "Pause", "Drop"] : ["Resume", "Show details", "Drop"];
-		const choice = await this.showHookSelector(title, items);
-		if (!choice) return;
-		switch (choice) {
-			case "Show details":
-				this.#showGoalDetails();
-				return;
-			case "Pause":
-				await this.#pauseGoalAction();
-				return;
-			case "Resume":
-				await this.#resumeGoalAction();
-				return;
-			case "Drop":
-				await this.#confirmAndDropGoal();
-				return;
-		}
-	}
-
-	#showGoalDetails(): void {
-		const state = this.session.getGoalModeState();
-		const goal = state?.goal;
-		if (!goal) {
-			this.showStatus("No goal set.");
-			return;
-		}
-		const used = goal.tokensUsed.toLocaleString();
-		const lines = [
-			`Objective: ${goal.objective}`,
-			`Status: ${goal.status}${state?.enabled ? "" : " (paused)"}`,
-			`Tokens used: ${used}`,
-			`Time spent: ${formatDuration(goal.timeUsedSeconds * 1000)}`,
-		];
-		this.showStatus(lines.join("\n"));
-	}
-
-	async #pauseGoalAction(): Promise<void> {
-		if (!this.goalModeEnabled) {
-			this.showWarning("No active goal to pause.");
-			return;
-		}
-		await this.session.goalRuntime.pauseGoal();
-		await this.#exitGoalMode({ paused: true, reason: "paused" });
-	}
-
-	async #resumeGoalAction(): Promise<void> {
-		if (!this.#getPausedGoalState()) {
-			this.showWarning("No paused goal to resume.");
-			return;
-		}
-		await this.#enterGoalMode({ resume: true, silent: true });
-		this.showStatus("Goal mode resumed.");
-		this.#scheduleGoalContinuation();
-	}
-
-	async #confirmAndDropGoal(): Promise<void> {
-		if (!this.goalModeEnabled && !this.#getPausedGoalState()) {
-			this.showWarning("No goal to drop.");
-			return;
-		}
-		const confirmed = await this.showHookConfirm(
-			"Drop goal?",
-			"This removes the goal record. Accumulated usage stays in the session log.",
-		);
-		if (!confirmed) return;
-		await this.session.goalRuntime.dropGoal();
-		await this.#exitGoalMode({ reason: "dropped" });
-	}
-
-	async #startGoalFromObjective(objective: string): Promise<void> {
-		await this.#enterGoalMode({ objective, silent: true });
-		this.#resetGoalContinuationSuppression();
-		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective }));
-		}
-	}
-
-	async #replaceGoalFromObjective(objective: string): Promise<void> {
-		const state = await this.session.goalRuntime.replaceGoal({ objective });
-		this.session.setGoalModeState(state);
-		this.goalModeEnabled = true;
-		this.goalModePaused = false;
-		this.#resetGoalContinuationSuppression();
-		this.#updateGoalModeStatus();
-		if (this.session.isStreaming) {
-			await this.session.sendGoalModeContext({ deliverAs: "steer" });
-		}
-		if (this.onInputCallback) {
-			this.onInputCallback(this.startPendingSubmission({ text: objective }));
-		}
-	}
-
-	async #handleGoalSetSubcommand(rest: string): Promise<void> {
-		if (!this.goalModeEnabled && this.#getPausedGoalState()) {
-			this.showWarning("Resume the current goal first, or drop it before setting a new objective.");
-			return;
-		}
-		const objective = rest.trim()
-			? rest.trim()
-			: (await this.showHookEditor("Goal objective", undefined, undefined, { promptStyle: true }))?.trim();
-		if (!objective) return;
-		if (this.goalModeEnabled) {
-			await this.#replaceGoalFromObjective(objective);
-			return;
-		}
-		await this.#startGoalFromObjective(objective);
-	}
-
-	async handlePlanApproval(details: PlanApprovalDetails): Promise<void> {
-		if (!this.planModeEnabled) {
-			this.showWarning("Plan mode is not active.");
-			return;
-		}
-
-		// Abort the agent to prevent it from continuing (e.g., re-submitting the
-		// plan) while the popup is showing. The event listener fires asynchronously
-		// (agent's #emit is fire-and-forget), so without this the model sees
-		// "Plan ready for approval." and immediately re-invokes `resolve` in a loop.
-		await this.session.abort({ timeoutMs: INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS });
-
-		const planFilePath = details.planFilePath || this.planModePlanFilePath || (await this.#getPlanFilePath());
-		this.planModePlanFilePath = planFilePath;
-		const planContent = await this.#readPlanFile(planFilePath);
-		const review = await this.#selectorController.showPlanPreview(planContent, {
-			externalEditorKey: this.keybindings.getDisplayString("app.editor.external"),
-			externalEditorKeys: this.keybindings.getKeys("app.editor.external"),
-			onExternalEditor: () => this.#openPlanInExternalEditor(planFilePath),
-		});
-		if (!review.action) return;
-
-		const latestPlanContent = await this.#readPlanFile(planFilePath);
-		// Every decision is bound to the reviewed bytes. Do this before serializing,
-		// auditing, or dispatching so neither comments nor notes leak across revisions.
-		if (review.snapshotHash !== planSnapshotHash(latestPlanContent ?? "")) {
-			this.showWarning(
-				"Plan changed while reviewing; comments and notes were discarded. Confirm the decision again.",
-			);
-			return this.handlePlanApproval(details);
-		}
-		const commentBlock = serializePlanReviewComments(
-			latestPlanContent ?? "",
-			review.snapshotHash,
-			review.comments,
-			review.notes,
-		);
-		// Audit is deliberately decision-time only: the overlay replaces pre-decision reading,
-		// while scrollback retains the exact snapshot, path, SHA-256, decision, and reviewer guidance.
-		this.#renderPlanPreview(
-			`## Plan approval audit\n\nDecision: ${review.action}\n\nPath: \`${planFilePath}\`\n\nSnapshot SHA-256: \`${review.snapshotHash}\`\n\n${latestPlanContent ?? "*(missing plan.md)*"}${commentBlock ? `\n\n${commentBlock}` : ""}`,
-			{ append: true },
-		);
-
-		if (review.action === "Refine plan") {
-			// Refine with no review material preserves the existing composer return path:
-			// no prompt is dispatched. Review material is instead sent as a plain, non-synthetic
-			// AgentSession prompt so the model can revise the plan from the operator's feedback.
-			if (!commentBlock) return;
-			await this.session.prompt(`${commentBlock}\n\nPlease refine the plan using these review comments.`);
-			return;
-		}
-		if (!latestPlanContent) {
-			this.showError(`Plan file not found at ${planFilePath}`);
-			return;
-		}
-		const finalPlanFilePath = details.finalPlanFilePath || planFilePath;
-		try {
-			await this.#approvePlan(latestPlanContent, {
-				planFilePath,
-				finalPlanFilePath,
-				title: details.title,
-				preserveContext: review.action !== "Approve and execute",
-				compactBeforeExecute: review.action === "Approve and compact context",
-				reviewerComments: commentBlock,
-			});
-		} catch (error) {
-			this.showError(`Failed to finalize approved plan: ${error instanceof Error ? error.message : String(error)}`);
-		}
+		if (await this.#goalModeController.restoreFromSession(sessionContext)) return;
+		await this.#planModeController.restoreFromSession(sessionContext);
 	}
 
 	stop(): void {
@@ -2353,12 +1281,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#welcomeComponent?.dispose();
 		this.#welcomeComponent = undefined;
-		this.#cleanupMicAnimation();
-		this.#cancelGoalContinuation();
 		if (this.#sttController) {
-			this.#sttController.dispose();
+			this.#sttController.dispose(this);
 			this.#sttController = undefined;
 		}
+		this.#goalModeController.cancelContinuation();
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
@@ -2632,7 +1559,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.#planApprovalDispatchPending) return Promise.resolve();
 		return this.#uiHelpers.flushCompactionQueue(options);
 	}
 
@@ -2755,7 +1681,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#btwController.dispose();
 		if (cleanupPreviousSessionUi) cleanupPreviousSessionUi();
 		else this.#extensionUiController.clearExtensionTerminalInputListeners();
-		this.#planReviewContainer = undefined;
+		this.#planModeController.clearReview();
 	}
 
 	async handleClearCommand(): Promise<boolean> {
@@ -2799,75 +1725,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Speech-to-text is disabled. Enable it in settings: stt.enabled");
 			return;
 		}
-		if (!this.#sttController) {
-			this.#sttController = new STTController();
-		}
-		await this.#sttController.toggle(this.editor, {
-			showWarning: (msg: string) => this.showWarning(msg),
-			showStatus: (msg: string) => this.showStatus(msg),
-			onStateChange: (state: SttState) => {
-				if (state === "recording") {
-					this.#voicePreviousShowHardwareCursor = this.ui.getShowHardwareCursor();
-					this.#voicePreviousUseTerminalCursor = this.editor.getUseTerminalCursor();
-					this.ui.setShowHardwareCursor(false);
-					this.editor.setUseTerminalCursor(false);
-					this.#startMicAnimation();
-				} else if (state === "transcribing") {
-					this.#stopMicAnimation();
-					this.#setMicCursor({ r: 200, g: 200, b: 200 });
-				} else {
-					this.#cleanupMicAnimation();
-				}
-				this.updateEditorChrome();
-				this.ui.requestRender();
-			},
-		});
-	}
-
-	#setMicCursor(color: { r: number; g: number; b: number }): void {
-		this.editor.cursorOverride = `\x1b[38;2;${color.r};${color.g};${color.b}m${theme.icon.mic}\x1b[0m`;
-		// Theme symbols can be wide (for example, 🎤), so measure the rendered override.
-		this.editor.cursorOverrideWidth = visibleWidth(this.editor.cursorOverride);
-	}
-
-	#updateMicIcon(): void {
-		const { r, g, b } = hsvToRgb({ h: this.#voiceHue, s: 0.9, v: 1.0 });
-		this.#setMicCursor({ r, g, b });
-	}
-
-	#startMicAnimation(): void {
-		if (this.#voiceAnimationInterval) return;
-		this.#voiceHue = 0;
-		this.#updateMicIcon();
-		this.#voiceAnimationInterval = setInterval(() => {
-			this.#voiceHue = (this.#voiceHue + 8) % 360;
-			this.#updateMicIcon();
-			this.ui.requestRender();
-		}, 60);
-	}
-
-	#stopMicAnimation(): void {
-		if (this.#voiceAnimationInterval) {
-			clearInterval(this.#voiceAnimationInterval);
-			this.#voiceAnimationInterval = undefined;
-		}
-	}
-
-	#cleanupMicAnimation(): void {
-		if (this.#voiceAnimationInterval) {
-			clearInterval(this.#voiceAnimationInterval);
-			this.#voiceAnimationInterval = undefined;
-		}
-		this.editor.cursorOverride = undefined;
-		this.editor.cursorOverrideWidth = undefined;
-		if (this.#voicePreviousShowHardwareCursor !== null) {
-			this.ui.setShowHardwareCursor(this.#voicePreviousShowHardwareCursor);
-			this.#voicePreviousShowHardwareCursor = null;
-		}
-		if (this.#voicePreviousUseTerminalCursor !== null) {
-			this.editor.setUseTerminalCursor(this.#voicePreviousUseTerminalCursor);
-			this.#voicePreviousUseTerminalCursor = null;
-		}
+		this.#sttController ??= new SttModeController();
+		await this.#sttController.toggle(this);
 	}
 
 	showDebugSelector(): void {

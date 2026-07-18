@@ -803,7 +803,7 @@ export class EventController {
 			if (details?.sourceToolName === "plan_approval" && details.action === "apply") {
 				const planDetails = details.sourceResultDetails as PlanApprovalDetails | undefined;
 				if (planDetails) {
-					await this.ctx.handlePlanApproval(planDetails);
+					await this.ctx.planModeController.handleApproval(planDetails);
 				}
 			}
 		}
@@ -820,7 +820,7 @@ export class EventController {
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}
-		await this.ctx.flushPendingModelSwitch();
+		await this.ctx.planModeController.flushPendingModelSwitch();
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {
 			if (!this.#backgroundToolCallIds.has(toolCallId)) {
 				this.ctx.pendingTools.delete(toolCallId);
