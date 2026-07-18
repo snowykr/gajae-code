@@ -37,10 +37,9 @@ There are two different listing pipelines:
    - Sorts by file `mtime` descending.
 
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads full session files.
-   - Builds `SessionInfo` objects (`id`, `cwd`, `title`, `messageCount`, `firstMessage`, `allMessagesText`, timestamps).
-   - Drops sessions with zero `message` entries.
-   - Sorts by `modified` descending.
+   - Reads a bounded 4KB prefix plus at most 16KB of trailing v4 header patches for file-backed sessions.
+   - Builds `SessionInfo` objects from bounded metadata and preview extraction; buried patches outside the tail budget deliberately fall back to line-1 header metadata.
+   - Drops sessions with zero `message` entries and sorts by `modified` descending.
 
 ### Metadata fallback behavior
 
@@ -97,12 +96,12 @@ No match -> throws error (`Session "..." not found.`).
 
 Handled after initial session-manager construction:
 
-1. list local sessions with `SessionManager.list(cwd, parsed.sessionDir)`
+1. list local candidates through the bounded read-only resume-picker path
 2. if empty: print `No sessions found` and exit early
-3. open TUI picker (`selectSession`)
-4. if canceled: print `No session selected` and exit early
-5. if selected: `SessionManager.open(selectedPath)`
-
+3. open the TUI picker; cancellation prints `No session selected` and exits without writes
+4. inspect the selected transcript read-only and confirm resumable tail state when required
+5. strictly open the approved identity, rechecking ownership before any replay-sanitization persistence
+6. publish the terminal breadcrumb only after strict-open sanitation succeeds, then continue startup from the opened manager
 ### `--continue`
 
 Uses `SessionManager.continueRecent(...)` directly (breadcrumb-first behavior above).

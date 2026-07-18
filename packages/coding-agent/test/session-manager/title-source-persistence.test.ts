@@ -168,6 +168,18 @@ describe("session title source persistence", () => {
 			title: "Patched title",
 			titleSource: "user",
 		});
+		const listed = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listed.find(candidate => candidate.path === sessionFile)?.title).toBe("Patched title");
+		const oversizedTitle = "界".repeat(10_000);
+		await session.setSessionName(oversizedTitle, "user");
+		expect(session.getSessionName()).toBe("界".repeat(1_000));
+		const listedAfterOversizedTitle = await SessionManager.listForResumePickerReadOnly(
+			cwd,
+			path.dirname(sessionFile),
+		);
+		expect(listedAfterOversizedTitle.find(candidate => candidate.path === sessionFile)?.title).toBe(
+			"界".repeat(1_000),
+		);
 
 		const v3 = [
 			{ type: "session", version: 3, id: "old", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/old" },
@@ -176,12 +188,58 @@ describe("session title source persistence", () => {
 		]
 			.map(record => JSON.stringify(record))
 			.join("\n");
-		expect(parseSessionEntries(v3)[0]).toMatchObject({ version: 3, cwd: "/new", title: "Final title" });
-
+		expect(parseSessionEntries(v3)[0]).not.toHaveProperty("title");
 		const ignoredPatches = `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "strict", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/original" })}\n${JSON.stringify({ type: "message", id: "message", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "original", timestamp: 1 } })}\n${JSON.stringify({ type: "header_patch", patch: { title: "ignored", unexpected: true }, outerUnexpected: true })}\n${JSON.stringify({ type: "entry_patch", entryId: "message", patch: { message: { role: "user", content: "ignored", timestamp: 1 }, unexpected: true }, outerUnexpected: true })}\n`;
 		expect(parseSessionEntries(ignoredPatches)).toMatchObject([
 			{ type: "session", cwd: "/original" },
 			{ type: "message", message: { content: "original" } },
+		]);
+	});
+
+	it("replays only ordered, valid v4 patches", () => {
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "ordered",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: "/original",
+		};
+		const message = {
+			type: "message",
+			id: "message",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: "original", timestamp: 1 },
+		};
+		const content = [
+			{ type: "header_patch", patch: { title: "forward" } },
+			header,
+			{
+				type: "entry_patch",
+				entryId: "message",
+				patch: { message: { role: "user", content: "forward", timestamp: 1 } },
+			},
+			message,
+			{ type: "header_patch", patch: { title: "first" } },
+			{ type: "header_patch", patch: { title: "last" } },
+			{
+				type: "entry_patch",
+				entryId: "message",
+				patch: { message: { role: "user", content: "first", timestamp: 1 } },
+			},
+			{
+				type: "entry_patch",
+				entryId: "message",
+				patch: { message: { role: "user", content: "last", timestamp: 1 } },
+			},
+			'{"type":"header_patch","patch":',
+		]
+			.map(record => (typeof record === "string" ? record : JSON.stringify(record)))
+			.join("\n");
+
+		expect(parseSessionEntries(content)).toMatchObject([
+			{ type: "session", title: "last" },
+			{ type: "message", message: { content: "last" } },
 		]);
 	});
 
