@@ -13,6 +13,7 @@ saveTextLockfile = true
 ".lark" = "text"
 
 [test]
+preload = ["./scripts/test-preload.ts"]
 pathIgnorePatterns = [
   "**/node_modules/**",
   ".wt/**",

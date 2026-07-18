@@ -54,6 +54,7 @@ import {
 	resolveTextBlobSync,
 } from "./blob-store";
 import {
+	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	type ManagedMigrationPolicy,
@@ -3722,6 +3723,13 @@ export class SessionManager {
 		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
 			this.storage.ensureDirSync(sessionDir);
+			// Canonicalize the trusted session directory (single choke point for every
+			// creation path: create/open/moveTo/fork/SDK) so benign ancestor symlinks
+			// (e.g. macOS `/var -> /private/var`, a symlinked `$HOME`) are resolved to a
+			// symlink-free root before the strict owner-only and reparse guards run.
+			if (this.storage instanceof FileSessionStorage) {
+				this.sessionDir = canonicalizeTrustedPath(sessionDir);
+			}
 		}
 		// Note: call _initSession() or _initSessionFile() after construction
 	}
@@ -6384,6 +6392,11 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 	): Promise<SessionManager> {
+		// Canonicalize benign ancestor symlinks in the caller-supplied path (e.g.
+		// macOS `/var -> /private/var`, a symlinked `$HOME`/project) so explicit
+		// session files land under a symlink-free trusted root that the strict
+		// owner-only and reparse guards accept.
+		if (storage instanceof FileSessionStorage) filePath = canonicalizeTrustedPath(filePath);
 		if (sessionDir || !(storage instanceof FileSessionStorage)) {
 			const entries = await loadEntriesFromFile(filePath, storage);
 			const header = entries.find(entry => entry.type === "session") as SessionHeader | undefined;

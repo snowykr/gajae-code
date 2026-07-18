@@ -149,6 +149,31 @@ function identityFor(cwd: string): NativeIdentity {
 	return canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
 }
 
+/**
+ * Resolve benign symlinks in the deepest existing ancestor of a trusted storage
+ * root (e.g. macOS `/var -> /private/var`, or a symlinked `$HOME`) while keeping
+ * any not-yet-created tail verbatim. The native owner-only primitive and the
+ * session-storage reparse guard traverse with `O_NOFOLLOW` and reject every
+ * symlink component, so the trusted root must be canonical before it reaches
+ * them; canonicalizing only the existing prefix never follows an
+ * attacker-plantable component below the root.
+ */
+export function canonicalizeTrustedPath(target: string): string {
+	let base = path.resolve(target);
+	const suffix: string[] = [];
+	for (;;) {
+		const identity = canonicalExistingDirectoryIdentity(base) as NativeIdentity;
+		if (identity.ok) {
+			return suffix.length === 0 ? identity.canonicalPath : path.join(identity.canonicalPath, ...suffix);
+		}
+		if (identity.code !== "not_found" && identity.code !== "not_directory") return path.resolve(target);
+		const parent = path.dirname(base);
+		if (parent === base) return path.resolve(target);
+		suffix.unshift(path.basename(base));
+		base = parent;
+	}
+}
+
 function nativeFailure(code: NativeIdentityFailureCode): ManagedScopeResolution {
 	if (code === "not_found")
 		return { kind: "error", code: "cwd_missing", message: "The workspace directory does not exist." };
@@ -231,21 +256,23 @@ export function resolveManagedScope(input: {
 }): ManagedScopeResolution {
 	const identity = identityFor(input.cwd);
 	if (!identity.ok) return nativeFailure(identity.code);
+	const sessionsRoot = canonicalizeTrustedPath(input.sessionsRoot);
+	const agentDir = canonicalizeTrustedPath(input.agentDir);
 	const digest = scopeDigest(identity.platform, identity.canonicalPath);
 	const scope: ManagedScope = {
 		apiVersion: 1,
 		layoutVersion: MANAGED_SESSION_LAYOUT_VERSION,
 		identityVersion: MANAGED_SESSION_IDENTITY_VERSION,
-		agentDir: input.agentDir,
-		sessionsRoot: input.sessionsRoot,
+		agentDir,
+		sessionsRoot,
 		canonicalCwd: identity.canonicalPath,
 		legacyLexicalCwd: path.resolve(input.cwd),
 		directoryName: `v2-${digest}`,
-		directoryPath: path.join(input.sessionsRoot, `v2-${digest}`),
+		directoryPath: path.join(sessionsRoot, `v2-${digest}`),
 		platform: identity.platform,
 	};
 	try {
-		const root = fs.lstatSync(input.sessionsRoot);
+		const root = fs.lstatSync(sessionsRoot);
 		if (!root.isDirectory() || root.isSymbolicLink()) {
 			return {
 				kind: "error",
