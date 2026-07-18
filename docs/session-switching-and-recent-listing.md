@@ -31,8 +31,8 @@ Default writes are v2-only. Legacy discovery/migration is lazy, validates identi
 There are two different listing pipelines:
 
 1. `getRecentSessions(sessionDir, limit)` (welcome/summary view)
-   - Reads only a 4KB prefix (`readTextPrefix(..., 4096)`) from each file.
-   - Parses header + earliest user text preview.
+   - Reads a bounded 4KB prefix plus bounded trailing v4 header patches from each file.
+   - Parses header metadata, applicable tail patches, and the earliest user text preview.
    - Returns lightweight `RecentSessionInfo` with lazy `name` and `timeAgo` getters.
    - Sorts by file `mtime` descending.
 
@@ -98,7 +98,7 @@ Handled after initial session-manager construction:
 
 1. list local candidates through the bounded read-only resume-picker path
 2. if empty: print `No sessions found` and exit early
-3. open the TUI picker; cancellation prints `No session selected` and exits without writes
+3. open the TUI picker; cancellation returns silently and exits without writes
 4. inspect the selected transcript read-only and confirm resumable tail state when required
 5. strictly open the approved identity, rechecking ownership before any replay-sanitization persistence
 6. publish the terminal breadcrumb only after strict-open sanitation succeeds, then continue startup from the opened manager
@@ -120,7 +120,7 @@ Uses `SessionManager.continueRecent(...)` directly (breadcrumb-first behavior ab
 
 Flow:
 
-1. fetch sessions from current session dir via `SessionManager.list(currentCwd, currentSessionDir)`
+1. fetch sessions from the current session directory via `SessionManager.listForResumePickerReadOnly(currentCwd, currentSessionDir)`
 2. mount `SessionSelectorComponent` in editor area using `showSelector(...)`
 3. callbacks:
    - select -> close selector and call `handleResumeSession(sessionPath)`
@@ -212,7 +212,7 @@ So visible conversation/todo state is rebuilt from the new session file.
 
 ### Cancellation paths
 
-- CLI picker cancel -> returns `null`, caller prints `No session selected`, process exits early.
+- CLI picker cancel -> returns `null`; bare resume exits silently without writes.
 - Interactive picker cancel -> editor restored, no session change.
 - Hook cancellation (`session_before_switch`) -> `switchSession()` returns `false`.
 
