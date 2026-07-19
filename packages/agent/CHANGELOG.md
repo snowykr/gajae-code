@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-07-19
+
 ### Fixed
 - Pre-compaction pruning now preserves bounded, actionable error evidence instead of discarding it, while enforcing exact positive-savings admission and accounting so a prune is only applied when it demonstrably reduces context cost (#2635).
 

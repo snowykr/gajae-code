@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.3] - 2026-07-19
 ### Fixed
 
 - Suppressed slash-command and skill autocomplete inside line-local single-backtick code spans while preserving path completion and ordinary slash matching outside literals (#2619).
