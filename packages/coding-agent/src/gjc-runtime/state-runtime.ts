@@ -1950,9 +1950,16 @@ async function handleHandoff(
 	positionalSkill: string | undefined,
 ): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, positionalSkill, "handoff");
-	return withWorkflowStateLock(path.relative(cwd, activeStateFile(cwd, selectors.gjcSessionId)), async () =>
-		handleHandoffUnlocked(args, cwd, positionalSkill),
-	);
+	// Serialize concurrent handoffs on a dedicated sentinel lock, NOT on the
+	// derived `skill-active-state.json` cache. The inner transaction
+	// (applyHandoffToActiveState / syncSkillActiveState -> rebuildActiveSnapshot)
+	// re-locks that cache file, and `withFileLock` is not reentrant: holding the
+	// active-state lock here made the inner rebuild self-contend and fail after
+	// all retries whenever `cwd === process.cwd()` (the real CLI case). Pass
+	// `{ cwd }` so the sentinel resolves against the handoff cwd rather than
+	// `process.cwd()`.
+	const handoffLock = path.join(sessionStateDir(cwd, selectors.gjcSessionId), "handoff");
+	return withWorkflowStateLock(handoffLock, async () => handleHandoffUnlocked(args, cwd, positionalSkill), { cwd });
 }
 
 async function handleContract(

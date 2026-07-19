@@ -461,6 +461,40 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("completes promptly when the handoff cwd equals process.cwd() (no self-locked active-state)", async () => {
+		await withTempCwd(async cwd => {
+			// Regression: handleHandoff must not hold the `skill-active-state.json`
+			// lock across the inner rebuild, which re-locks the same file. That
+			// self-contention only manifests when the handoff cwd is also the
+			// process cwd (the real CLI case) — otherwise the outer lock resolves
+			// against process.cwd() and lands on a different, unused path.
+			const priorCwd = process.cwd();
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			process.chdir(cwd);
+			try {
+				const started = Date.now();
+				const result = await runNativeStateCommand(
+					["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+					cwd,
+				);
+				const elapsed = Date.now() - started;
+				expect(result.status).toBe(0);
+				// A self-locked rebuild would exhaust 50 retries (~5s) before failing.
+				expect(elapsed).toBeLessThan(3000);
+				const callee = await readJson(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"));
+				expect(callee?.active).toBe(true);
+				expect(callee?.handoff_from).toBe("deep-interview");
+			} finally {
+				process.chdir(priorCwd);
+			}
+		});
+	});
+
 	it("supports backward chain ultragoal -> ralplan", async () => {
 		await withTempCwd(async cwd => {
 			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"), {
