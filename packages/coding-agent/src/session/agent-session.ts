@@ -1526,6 +1526,13 @@ export class AgentSession {
 	#resetRetryReplaySafety(): void {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
+		if (
+			this.#extensionRunner?.hasHandlers("context") ||
+			this.#extensionRunner?.hasHandlers("before_provider_request") ||
+			this.#extensionRunner?.hasHandlers("after_provider_response")
+		) {
+			this.#markRetryReplayUnsafe();
+		}
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -4767,6 +4774,7 @@ export class AgentSession {
 				continuationSkipReason: event.continuationSkipReason,
 			});
 		} else if (event.type === "auto_retry_start") {
+			if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
 			await this.#extensionRunner.emit({
 				type: "auto_retry_start",
 				attempt: event.attempt,

@@ -188,22 +188,27 @@ describe("AgentSession resilient retry", () => {
 	// This mirrors the real-world default and guards the regression where
 	// provider stream timeouts silently failed without retrying (agent idle).
 	function buildBareRetrySession(options: {
-		responses: Array<{ throw: string } | { content: string[] }>;
+		responses: Array<{ throw: string; responseHeaders?: Record<string, string> } | { content: string[] }>;
 		requestedModels?: string[];
 		onStreamStart?: (agent: Agent) => void;
+		emitProviderPayload?: boolean;
 		extensionRunner?: ExtensionRunner;
 	}): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 		const mock = createMockModel({ responses: options.responses });
+		const extensionRunner = options.extensionRunner;
 		const requestedModels = options.requestedModels ?? [];
 		const sessionManager = SessionManager.inMemory();
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			transformContext: extensionRunner ? messages => extensionRunner.emitContext(messages) : undefined,
+			onPayload: extensionRunner ? payload => extensionRunner.emitBeforeProviderRequest(payload) : undefined,
 			streamFn: (requestedModel, context, opts) => {
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				options.onStreamStart?.(agent);
+				if (options.emitProviderPayload) void opts?.onPayload?.({});
 				return mock.stream(requestedModel, context, opts);
 			},
 		});
@@ -215,7 +220,12 @@ describe("AgentSession resilient retry", () => {
 			sessionManager,
 			settings,
 			modelRegistry,
-			extensionRunner: options.extensionRunner,
+			extensionRunner,
+			onResponse: extensionRunner
+				? async (response, model) => {
+					await extensionRunner.emitAfterProviderResponse(response, model);
+				}
+				: undefined,
 		});
 	}
 	function createExtensionRunner(handlers = new Map<string, Array<() => Promise<void>>>()) {
@@ -818,6 +828,67 @@ describe("AgentSession resilient retry", () => {
 		expect(hookCalls).toBe(1);
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
+		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
+			let hookCalls = 0;
+			const requestedModels: string[] = [];
+			session = buildBareRetrySession({
+				responses: [
+					{
+						throw: "Example Provider Watchdog stream timed out while waiting for the first event",
+						...(eventType === "after_provider_response" ? { responseHeaders: { "x-request-id": "test" } } : {}),
+					},
+					{ content: ["should-not-reach"] },
+				],
+				requestedModels,
+				emitProviderPayload: eventType === "before_provider_request",
+				extensionRunner: createExtensionRunner(
+					new Map([[eventType, [async () => {
+						hookCalls++;
+					}]]]),
+				),
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+			const { retryStartEvents } = track(session);
+
+			await session.prompt(`bare-config ${eventType} lifecycle watchdog`);
+			await session.waitForIdle();
+
+			expect(hookCalls).toBe(1);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(requestedModels).toHaveLength(1);
+			expect(lastAssistant(session).stopReason).toBe("error");
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not replay a second bare-default watchdog after auto_retry_start handlers participate", async () => {
+		let hookCalls = 0;
+		const requestedModels: string[] = [];
+		session = buildBareRetrySession({
+			responses: [
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ throw: "Example Provider Watchdog stream timed out while waiting for the first event" },
+				{ content: ["should-not-reach"] },
+			],
+			requestedModels,
+			extensionRunner: createExtensionRunner(
+				new Map([["auto_retry_start", [async () => {
+					hookCalls++;
+				}]]]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-config auto-retry lifecycle watchdog");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(requestedModels).toHaveLength(2);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	});
 
