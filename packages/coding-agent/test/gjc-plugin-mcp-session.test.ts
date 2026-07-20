@@ -80,6 +80,64 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		expect(mcpManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
+	test("keeps always-on plugin MCP tools active across newSession and switchSession resume", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-resume-"));
+		tempDirs.push(cwd);
+		await installGjcPluginBundle(mcpBundle, { scope: "project", cwd });
+
+		// File-backed manager so switchSession can resume a real session file. Generic
+		// discovery is fully enabled to prove the plugin tool is mandatory, not selectable.
+		const sessionManager = SessionManager.create(cwd, cwd);
+		const sessionSettings = Settings.isolated();
+		sessionSettings.set("tools.discoveryMode", "all");
+		const { session, mcpManager } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager,
+			settings: sessionSettings,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		const lookup = "mcp__domain_docs_lookup";
+		try {
+			expect(mcpManager?.getConnectedServers()).toContain("domain_docs");
+			expect(session.getActiveToolNames()).toContain(lookup);
+			expect(session.getSelectedMCPToolNames()).not.toContain(lookup);
+
+			const originalSessionFile = session.sessionFile;
+			expect(originalSessionFile).toBeDefined();
+
+			// /new: a fresh session recomputes selection but keeps the plugin tool always-on.
+			expect(await session.newSession()).toBe(true);
+			expect(session.sessionFile).not.toBe(originalSessionFile);
+			expect(session.getActiveToolNames()).toContain(lookup);
+			expect(session.getSelectedMCPToolNames()).not.toContain(lookup);
+
+			// Resume: switchSession restores MCP selections; the always-on plugin tool
+			// must survive #restoreMCPSelectionsForSessionContext, not be gated behind
+			// the (empty) restored MCP selection.
+			expect(await session.switchSession(originalSessionFile as string)).toBe(true);
+			expect(session.getActiveToolNames()).toContain(lookup);
+			expect(session.getSelectedMCPToolNames()).not.toContain(lookup);
+
+			// The owned manager is not re-spawned or torn down by session lifecycle ops.
+			expect(mcpManager?.getConnectedServers()).toContain("domain_docs");
+		} finally {
+			await session.dispose();
+		}
+
+		// Only disposing the owner tears the manager down (no leaked processes).
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
+	}, 30_000);
+
 	test("filters an explicitly requested mandatory plugin tool from persisted selection authority", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-explicit-"));
 		tempDirs.push(cwd);
