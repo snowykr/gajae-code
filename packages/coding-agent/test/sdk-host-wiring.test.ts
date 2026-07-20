@@ -1363,6 +1363,14 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 			),
 		"correlated assistant message event",
 	);
+	observer.send(JSON.stringify({ type: "event_replay", id: "observer-replay", sinceSeq: 0 }));
+	await waitFor(
+		() => observerFrames.some(frame => frame.type === "event_replay_result" && frame.id === "observer-replay"),
+		"observer event replay",
+	);
+	const observerReplay = observerFrames.find(
+		frame => frame.type === "event_replay_result" && frame.id === "observer-replay",
+	) as { events?: Array<Record<string, unknown>> };
 	const correlation = {
 		commandId: acknowledgement.result?.commandId,
 		turnId: acknowledgement.result?.turnId,
@@ -1375,6 +1383,7 @@ test("SDK host directly delivers correlated lifecycle frames for an accepted pro
 	]);
 	expect(observerFrames.some(frame => frame.type === "agent_start" || frame.type === "agent_end")).toBe(false);
 	expect(observerFrames.some(frame => frame.type === "event" && frame.kind === "message_update")).toBe(false);
+	expect(observerReplay.events?.some(frame => frame.kind === "message_update")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 

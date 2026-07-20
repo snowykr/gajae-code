@@ -3210,11 +3210,12 @@ export function createNotificationsExtension(
 			const correlation = runtime.activePromptCorrelation;
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.abandoned) return;
-			const frame = runtime.host.emitEvent({
+			const frame = {
+				type: "event",
 				kind: event.type,
 				payload: toAgentWireEventPayload(event),
 				...correlation,
-			});
+			};
 			if (!submission.acknowledged) {
 				submission.bufferedFrames.push(frame);
 				return;
