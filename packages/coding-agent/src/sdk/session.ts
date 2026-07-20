@@ -1752,17 +1752,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// product decision holds for subagent sessions too.
 			const singleton = MCPManager.instance();
 			const inherited = mcpManager ?? (singleton?.isToolsOnly() ? undefined : singleton);
-			const pluginServers = inherited ? pluginMcpManagerServers.get(inherited) : undefined;
-			if (inherited && pluginServers) {
+			if (inherited) {
 				try {
-					const inheritedTools = inherited.getTools().filter(tool => {
-						const serverName = tool.mcpServerName;
-						return serverName !== undefined && pluginServers.has(serverName);
-					});
+					const inheritedTools = inherited.getTools();
 					if (inheritedTools.length > 0) customTools.push(...(inheritedTools as CustomTool[]));
-					pluginMcpToolNames.push(...inheritedTools.map(tool => tool.name));
+					const pluginServers = pluginMcpManagerServers.get(inherited);
+					if (pluginServers) {
+						pluginMcpToolNames.push(
+							...inheritedTools
+								.filter(tool => tool.mcpServerName !== undefined && pluginServers.has(tool.mcpServerName))
+								.map(tool => tool.name),
+						);
+					}
 				} catch (error) {
-					logger.warn("Failed to inherit plugin MCP tools in subagent", { error });
+					logger.warn("Failed to inherit MCP tools in subagent", { error });
 				}
 			}
 		}

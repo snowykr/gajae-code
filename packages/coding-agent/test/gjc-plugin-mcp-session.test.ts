@@ -238,7 +238,12 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			mcpManager: callerManager,
 		});
 		try {
-			expect(child.session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(child.session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
+			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(callerManager.isConnectionSetSealed()).toBe(false);
+			await child.session.setActiveToolsByName(["mcp__domain_docs_lookup"]);
+			expect(child.session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+			await child.session.setActiveToolsByName([]);
 			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
 			expect(child.mcpManager).toBe(callerManager);
 		} finally {
