@@ -231,6 +231,30 @@ describe("SDK session index", () => {
 		]);
 		expect(replay.indexSeq).toBe(3);
 	});
+	it("preserves the repaired valid-prefix watermark after a historical overlap", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-watermark-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("one"));
+		await index.append(event("two"));
+		await index.append(event("three"));
+		await index.snapshot();
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
+		const snapshot = JSON.parse(await fs.readFile(snapshotFile, "utf8"));
+		snapshot.indexSeq = 99;
+		await fs.writeFile(snapshotFile, JSON.stringify(snapshot));
+		const log = path.join(sessionsDir, "index.jsonl");
+		await fs.appendFile(log, "broken\n");
+
+		const repair = await index.repair();
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 3 });
+		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8"))).toMatchObject({
+			indexSeq: repair.validPrefixSeq,
+			events: [{ indexSeq: 1 }, { indexSeq: 2 }, { indexSeq: 3 }],
+		});
+		expect((await new SessionIndex(dir).open()).indexSeq).toBe(repair.validPrefixSeq);
+		expect((await index.append(event("after-repair"))).indexSeq).toBe(repair.validPrefixSeq + 1);
+	});
 	it("tolerates Windows permission errors while opening and syncing the snapshot directory", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const index = await new SessionIndex(dir).open();
@@ -497,6 +521,34 @@ describe("SDK session index", () => {
 		expect(replay.indexSeq).toBe(5);
 		const appended = await replay.append(event("c"));
 		expect(appended.indexSeq).toBe(6);
+	});
+	it("repairs a compacted high-watermark snapshot with historical overlap and remains appendable", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-watermark-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const signed = (indexSeq: number, sessionId: string) => {
+			const unsigned = { ...event(sessionId), version: SDK_STATE_VERSION, indexSeq, ts: 1 };
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]) };
+		};
+		const history = Array.from({ length: 5 }, (_, index) => signed(index + 1, `history-${index + 1}`));
+		const tail = signed(6, "tail");
+		await fs.writeFile(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({ version: 2, indexSeq: 5, events: [history[0], history[2]] }),
+		);
+		await fs.writeFile(
+			path.join(sessionsDir, "index.jsonl"),
+			`${[...history, tail].map(row => JSON.stringify(row)).join("\n")}\nbroken\n`,
+		);
+
+		const index = await new SessionIndex(dir).open();
+		const repair = await index.repair();
+
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 6 });
+		expect(JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8"))).toMatchObject({
+			indexSeq: 6,
+		});
+		expect((await index.append(event("resumed"))).indexSeq).toBe(repair.validPrefixSeq + 1);
 	});
 	it("rejects a non-monotonic snapshot as invalid", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

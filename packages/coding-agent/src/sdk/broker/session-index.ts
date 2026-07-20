@@ -429,10 +429,11 @@ export class SessionIndex {
 					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
 				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
 				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
+				const events = [...scan.snapshotEvents, ...scan.validLogEvents];
 				const snapshot = JSON.stringify({
 					version: SESSION_INDEX_SNAPSHOT_VERSION,
-					indexSeq: scan.snapshotEvents.at(-1)?.indexSeq ?? 0,
-					events: scan.snapshotEvents,
+					indexSeq: scan.diagnosis.validPrefixSeq,
+					events,
 				});
 				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
 				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
