@@ -775,6 +775,30 @@ type RetryErrorClassification =
 	| "local_unavailable"
 	| "unknown";
 
+const BARE_DEFAULT_WATCHDOG_ERROR =
+	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+
+function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boolean {
+	if (message.errorKind !== undefined || message.errorStatus !== undefined) return true;
+	const facts = message.transportFailure;
+	if (!facts) return false;
+	if (classifyFallbackTrigger(facts).class !== "other") return true;
+	return (
+		facts.status !== undefined ||
+		facts.providerCode !== undefined ||
+		facts.anthropicErrorType !== undefined ||
+		facts.openaiErrorCode !== undefined ||
+		(facts.headers !== undefined && Object.keys(facts.headers).length > 0)
+	);
+}
+
+function assistantMessageHasVisibleOrToolContent(message: AssistantMessage): boolean {
+	return message.content.some(content => {
+		if (content.type === "text") return content.text.length > 0;
+		return content.type === "thinking" || content.type === "redactedThinking" || content.type === "toolCall";
+	});
+}
+
 function isLocalModelEndpoint(model: Model | undefined): boolean {
 	if (!model) return false;
 	if (model.provider === "ollama" || model.provider === "lm-studio" || model.provider === "llama.cpp") {
@@ -1495,6 +1519,30 @@ export class AgentSession {
 	#lastMidRunMaintenanceAnchorSignature: string | undefined = undefined;
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#retainedMemorySampler: (() => RetainedMemorySample) | undefined;
+
+	/** Replay safety for the currently admitted top-level prompt/custom-message run. */
+	#retryReplayEpoch = 0;
+	#retryReplayUnsafeEpoch: number | undefined;
+
+	#resetRetryReplaySafety(): void {
+		this.#retryReplayEpoch++;
+		this.#retryReplayUnsafeEpoch = undefined;
+		if (
+			this.#extensionRunner?.hasHandlers("context") ||
+			this.#extensionRunner?.hasHandlers("before_provider_request") ||
+			this.#extensionRunner?.hasHandlers("after_provider_response")
+		) {
+			this.#markRetryReplayUnsafe();
+		}
+	}
+
+	#markRetryReplayUnsafe(): void {
+		if (this.#retryReplayEpoch > 0) this.#retryReplayUnsafeEpoch = this.#retryReplayEpoch;
+	}
+
+	get #hasCleanRetryReplaySafety(): boolean {
+		return this.#retryReplayEpoch > 0 && this.#retryReplayUnsafeEpoch !== this.#retryReplayEpoch;
+	}
 	#prePromptContextCheckPromise: Promise<void> | undefined = undefined;
 	/** Display-only context snapshot; pre-prompt compaction estimates deliberately remain uncached. */
 	#contextUsageCache: { key: string; value: ContextUsage } | undefined;
@@ -3026,6 +3074,38 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
+		if (
+			event.type === "tool_execution_start" ||
+			event.type === "tool_execution_update" ||
+			event.type === "tool_execution_end"
+		) {
+			this.#markRetryReplayUnsafe();
+		} else if (event.type === "message_end") {
+			if (
+				event.message.role === "toolResult" ||
+				(event.message.role === "assistant" && assistantMessageHasVisibleOrToolContent(event.message))
+			) {
+				this.#markRetryReplayUnsafe();
+			}
+		} else if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			if (
+				update.type === "toolcall_start" ||
+				update.type === "toolcall_delta" ||
+				update.type === "toolcall_end" ||
+				((update.type === "text_delta" ||
+					update.type === "thinking_delta" ||
+					update.type === "reasoning_summary_delta") &&
+					update.delta.length > 0) ||
+				((update.type === "text_end" ||
+					update.type === "thinking_end" ||
+					update.type === "reasoning_summary_end") &&
+					update.content.length > 0)
+			) {
+				this.#markRetryReplayUnsafe();
+			}
+		}
 		// Record a successful final yield before any asynchronous extension work so a
 		// concurrently delivered agent_end cannot start post-turn maintenance first.
 		if (event.type === "tool_execution_end" && event.toolName === "yield" && !event.isError) {
@@ -3697,6 +3777,7 @@ export class AgentSession {
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
 		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		allowDuringCancelAndSubmit?: boolean;
 		onError?: (error: unknown) => void;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
@@ -3731,7 +3812,7 @@ export class AgentSession {
 						skip("generation_changed");
 						return false;
 					}
-					if (this.#cancelAndSubmitInProgress) {
+					if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
 						skip("queue_drained");
 						return false;
 					}
@@ -4659,6 +4740,7 @@ export class AgentSession {
 					message: event.message,
 					contentIndex: event.assistantMessageEvent.contentIndex,
 				};
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_start")) this.#markRetryReplayUnsafe();
 				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
 			} else if (event.assistantMessageEvent.type === "reasoning_summary_delta") {
 				const reasoningEvent: ReasoningSummaryDeltaEvent = {
@@ -4667,6 +4749,7 @@ export class AgentSession {
 					contentIndex: event.assistantMessageEvent.contentIndex,
 					delta: event.assistantMessageEvent.delta,
 				};
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_delta")) this.#markRetryReplayUnsafe();
 				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
 			} else if (event.assistantMessageEvent.type === "reasoning_summary_end") {
 				const reasoningEvent: ReasoningSummaryEndEvent = {
@@ -4675,6 +4758,7 @@ export class AgentSession {
 					contentIndex: event.assistantMessageEvent.contentIndex,
 					content: event.assistantMessageEvent.content,
 				};
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_end")) this.#markRetryReplayUnsafe();
 				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
 			}
 		} else if (event.type === "message_end") {
@@ -4728,6 +4812,7 @@ export class AgentSession {
 				continuationSkipReason: event.continuationSkipReason,
 			});
 		} else if (event.type === "auto_retry_start") {
+			if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
 			await this.#extensionRunner.emit({
 				type: "auto_retry_start",
 				attempt: event.attempt,
@@ -7044,6 +7129,7 @@ export class AgentSession {
 					...options,
 					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 					admissionLease: admission,
+					resetRetryReplaySafety: true,
 				});
 			} finally {
 				// Clean up residual eager-todo directive if the prompt never consumed it
@@ -7176,7 +7262,11 @@ export class AgentSession {
 
 			await this.#syncSkillPromptActiveStateSafely(customMessage, true);
 			try {
-				await this.#promptWithMessage(customMessage, textContent, { ...options, admissionLease: admission });
+				await this.#promptWithMessage(customMessage, textContent, {
+					...options,
+					admissionLease: admission,
+					resetRetryReplaySafety: true,
+				});
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(customMessage, false);
 			}
@@ -7192,6 +7282,7 @@ export class AgentSession {
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
 			onRunAccepted?: () => void;
+			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
 		await this.#agentEndPublicationPromise;
@@ -7204,6 +7295,7 @@ export class AgentSession {
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			if (options?.resetRetryReplaySafety) this.#resetRetryReplaySafety();
 			if (message.role === "user") {
 				await this.#resetDefaultFallbackForNewTurn();
 				await this.#ensureDefaultFallbackResolution();
@@ -7343,6 +7435,8 @@ export class AgentSession {
 
 			// Emit before_agent_start extension event. Race hook completion with prompt
 			// cancellation so a wedged hook cannot retain SDK prompt authority.
+			if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
+
 			if (this.#extensionRunner) {
 				const result = await this.#awaitPromptPreflight(
 					generation,
@@ -7613,6 +7707,8 @@ export class AgentSession {
 		} as unknown as HookCommandContext;
 
 		try {
+			this.#markRetryReplayUnsafe();
+
 			const args = parseCommandArgs(argsString);
 			const result = await loaded.command.execute(args, ctx);
 			// If result is a string, it's a prompt to send to LLM
@@ -8343,6 +8439,7 @@ export class AgentSession {
 				: undefined;
 		this.#abortActiveMidRunBarriers();
 		this.#silentAbortPending = options?.silent === true;
+		this.#markRetryReplayUnsafe();
 		this.abortRetry();
 		this.#promptGeneration++;
 		this.#promptPreflightAbortController.abort();
@@ -8581,6 +8678,7 @@ export class AgentSession {
 					try {
 						await this.#promptWithMessage(message, messageText, {
 							admissionLease: admission,
+							resetRetryReplaySafety: true,
 							onRunAccepted: () => {
 								runAccepted = true;
 								if (selected) {
@@ -12650,23 +12748,33 @@ export class AgentSession {
 	): Promise<boolean | ManagedAttemptDecision> {
 		const controller = this.#defaultFallbackChain();
 		const managedFallback = controller.chain.entries.length > 1;
-		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
-		if (!trigger) {
-			return managedOutcome
-				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
-				: false;
-		}
 		const retrySettings = this.settings.getGroup("retry");
 		const legacyRetryConfigured =
 			this.settings.has("retry.enabled") ||
 			this.settings.has("retry.maxRetries") ||
 			this.settings.has("retry.baseDelayMs") ||
 			this.settings.has("retry.maxDelayMs");
-		// A bare default retry configuration must preserve the historical
-		// fail-closed behavior for generic provider errors. Explicit retry
-		// settings opt into the resilient legacy retry path.
-		if (!managedFallback && (!retrySettings.enabled || !legacyRetryConfigured)) return false;
+		// retry.enabled=false always surfaces immediately, matching the explicit
+		// user opt-out.
+		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		// Bare defaults admit only clean, side-effect-free canonical stream watchdog failures.
+		if (!managedFallback && !legacyRetryConfigured) {
+			if (
+				hasBareDefaultRetryDisqualifyingFacts(message) ||
+				(classification !== "transient" && classification !== "first_event_timeout") ||
+				!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? "") ||
+				!this.#hasCleanRetryReplaySafety
+			) {
+				return false;
+			}
+		}
+		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		if (!trigger) {
+			return managedOutcome
+				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
+				: false;
+		}
 		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
@@ -12839,6 +12947,7 @@ export class AgentSession {
 			this.#scheduleAgentContinue({
 				delayMs: 1,
 				generation,
+				allowDuringCancelAndSubmit: true,
 				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
 				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
 			});
@@ -13021,6 +13130,8 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean },
 	): Promise<BashResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
+		this.#markRetryReplayUnsafe();
+
 		const cwd = this.sessionManager.getCwd();
 
 		if (this.#extensionRunner?.hasHandlers("user_bash")) {
@@ -13152,6 +13263,7 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean },
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
+		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
 
