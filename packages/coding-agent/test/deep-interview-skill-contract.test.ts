@@ -109,7 +109,9 @@ describe("deep-interview self-proofread output rule", () => {
 		expect(skill).toContain(
 			"apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing",
 		);
-		expect(skill).toContain("Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence");
+		expect(skill).toContain(
+			"Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence",
+		);
 	});
 
 	it("adds a Final_Checklist item for the silent self-proofread", () => {
