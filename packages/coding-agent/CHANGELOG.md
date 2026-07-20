@@ -3,8 +3,6 @@
 ## [Unreleased]
 ### Fixed
 - Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
-- Restored the canonical public CLI command-surface contract for the independently documented `gjc memory` filesystem/MAP command after its feature merge omitted the expected command-list update.
-- Filesystem/MAP `memory doctor` now treats intentionally uninitialized scopes as absent instead of making partial-scope opt-in permanently unhealthy; explicit policy denials and real document/MAP safety findings remain reported.
 - Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).
 - Preserved access to legal SQLite table names beginning with `sqlite` but not reserved `sqlite_`.
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
@@ -43,9 +41,6 @@
 ## [0.11.3] - 2026-07-19
 ### Added
 - Bracketed pastes containing complete lists of saved static-image paths can now attach up to 16 images in source order after explicit confirmation. Paste transactions are cancellation-safe, disabled in command modes, enforce source, encoded-output, dimension, and decoded-memory budgets before commit, reject animated, remote, linked, or path-swapped sources, and restore the literal paste on cancellation or failure.
-
-### Added
-- Added the independent, default-off `gjc memory` filesystem/MAP CLI (#2639). It provides explicit initialization, scoped logical-URI retrieval, MAP route resolution, deterministic bounded search/recall, checkpoints/resume, diagnostics, and capability reporting without changing the mutually exclusive `memory.backend` choices or enabling automatic capture, prompt injection, model synthesis, cloud sync, or embeddings.
 
 ### Changed
 - Updated the Kimi Coding Plan Eco, Medium, and Pro presets to Kimi K3 with its supported `low`, `high`, and `max` reasoning efforts.
