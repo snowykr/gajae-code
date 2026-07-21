@@ -65,11 +65,13 @@ import {
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
+	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
 import {
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
+	type ManagedSessionSecurityPolicy,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
 
@@ -1324,9 +1326,12 @@ function computeDefaultSessionDir(
 	sessionsRoot: string = getSessionsDir(),
 ): string {
 	if (!(storage instanceof FileSessionStorage)) throw new SessionManagedStorageError();
-	const resolved = resolveManagedScope({ cwd, agentDir: path.resolve(sessionsRoot, ".."), sessionsRoot });
+	const resolved = resolveManagedScopeForWrite({ cwd, agentDir: path.resolve(sessionsRoot, ".."), sessionsRoot });
 	if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
-	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	const prepared = prepareManagedSessionScopeForWriteSync(
+		resolved.scope,
+		process.platform === "win32" ? "windows-existing-verify-first" : "default",
+	);
 	if (prepared.kind === "error") throw new Error(`Could not prepare managed session scope: ${prepared.message}`);
 	return prepared.scope.directoryPath;
 }
@@ -1408,6 +1413,13 @@ function managedFileSnapshotEquals(left: ManagedFileSnapshot | null, right: Mana
 	);
 }
 const trustedSessionDestinations = new WeakSet<SessionDestination>();
+const managedSecurityPolicies = new WeakMap<ManagedSessionSecurityContext, ManagedSessionSecurityPolicy>();
+
+function managedSecurityPolicyForContext(securityContext: ManagedSessionSecurityContext): ManagedSessionSecurityPolicy {
+	const policy = managedSecurityPolicies.get(securityContext);
+	if (!policy) throw new Error("Managed session security policy unavailable");
+	return policy;
+}
 
 function managedStoreFromContext(
 	securityContext: ManagedSessionSecurityContext,
@@ -1419,6 +1431,7 @@ function managedStoreFromContext(
 		securityContext.retainedAuthority
 			? { authority: securityContext.retainedAuthority, authorityBaseDir: directory }
 			: undefined,
+		managedSecurityPolicyForContext(securityContext),
 	);
 }
 
@@ -1431,6 +1444,10 @@ function freezeManagedDestination(scope: ManagedScope): SessionDestination {
 		rootAuthority,
 		retainedAuthority: managedDirectoryAuthorityForScope(scope),
 	});
+	managedSecurityPolicies.set(
+		securityContext,
+		scope.platform === "win32" ? "windows-existing-verify-first" : "default",
+	);
 	const destination = Object.freeze({ kind: "managed" as const, directory: scope.directoryPath, securityContext });
 	trustedSessionDestinations.add(destination);
 	return destination;
@@ -1445,9 +1462,16 @@ function explicitDestination(directory: string): SessionDestination {
 function managedDestination(cwd: string, storage: SessionStorage, agentDir?: string): SessionDestination {
 	if (!(storage instanceof FileSessionStorage)) throw new SessionManagedStorageError();
 	const sessionsRoot = getSessionsDir(agentDir);
-	const resolved = resolveManagedScope({ cwd, agentDir: agentDir ?? path.resolve(sessionsRoot, ".."), sessionsRoot });
+	const resolved = resolveManagedScopeForWrite({
+		cwd,
+		agentDir: agentDir ?? path.resolve(sessionsRoot, ".."),
+		sessionsRoot,
+	});
 	if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
-	const prepared = prepareManagedSessionScopeForWriteSync(resolved.scope);
+	const prepared = prepareManagedSessionScopeForWriteSync(
+		resolved.scope,
+		process.platform === "win32" ? "windows-existing-verify-first" : "default",
+	);
 	if (prepared.kind === "error") throw new Error(`Could not prepare managed session scope: ${prepared.message}`);
 	return freezeManagedDestination(prepared.scope);
 }
@@ -7089,6 +7113,12 @@ export class SessionManager {
 			authority instanceof ManagedSessionDescendantStore
 				? authority.retainAuthority()
 				: retainManagedDirectoryAuthority(rootAuthority, directory);
+		const policy =
+			authority instanceof ManagedSessionDescendantStore
+				? authority.securityPolicy
+				: process.platform === "win32"
+					? "windows-existing-verify-first"
+					: "default";
 		const securityContext = createManagedSessionSecurityContext({
 			agentDir: rootAuthority.canonicalPath,
 			sessionsRoot: rootAuthority.canonicalPath,
@@ -7096,6 +7126,7 @@ export class SessionManager {
 			rootAuthority,
 			retainedAuthority,
 		});
+		managedSecurityPolicies.set(securityContext, policy);
 		const destination = Object.freeze({ kind: "managed" as const, directory, securityContext });
 		trustedSessionDestinations.add(destination);
 		return destination;

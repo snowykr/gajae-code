@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import { canonicalExistingDirectoryIdentity, verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
+import {
+	canonicalExistingDirectoryIdentity,
+	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
+} from "@gajae-code/natives";
 import { pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
@@ -19,12 +23,14 @@ import {
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
 	ManagedSessionDescendantStore,
+	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
 	retainManagedDirectoryAuthority,
 	validateManagedArtifactTree,
+	validateNativeSecurityResult,
 } from "./managed-session-storage";
 
 export const MANAGED_SESSION_LAYOUT_VERSION = 2 as const;
@@ -155,8 +161,6 @@ type NativeIdentityFailureCode =
 	| "identity_unavailable"
 	| "io_error";
 
-type NativeSecurity = { ok: true } | { ok: false; code: string };
-
 interface Binding {
 	schemaVersion: 1;
 	layoutVersion: 2;
@@ -194,6 +198,22 @@ export const computeManagedScopeDigest = scopeDigest;
 
 function identityFor(cwd: string): NativeIdentity {
 	return canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
+}
+
+function verifyExistingManagedScopeDirectory(pathname: string) {
+	if (process.platform !== "win32") return verifyOwnerOnlyPathSecurity(pathname, "directory");
+	const expected = fs.lstatSync(pathname, { bigint: true });
+	if (!expected.isDirectory() || expected.isSymbolicLink()) throw new Error("Unsafe managed directory");
+	const verified = verifyOwnerOnlyPathSecurityExpected(pathname, "directory", expected.dev, expected.ino);
+	const current = fs.lstatSync(pathname, { bigint: true });
+	if (
+		!current.isDirectory() ||
+		current.isSymbolicLink() ||
+		current.dev !== expected.dev ||
+		current.ino !== expected.ino
+	)
+		throw new Error("Managed session directory changed");
+	return verified;
 }
 
 function canonicalExistingPathForIo(base: string, identity: CanonicalNativeIdentity): string {
@@ -317,11 +337,16 @@ function validateExistingBinding(scope: ManagedScope): ManagedScopeResolution | 
 	return validateBindingRaw(scope, raw);
 }
 
-export function resolveManagedScope(input: {
+interface ManagedScopeInput {
 	cwd: string;
 	agentDir: string;
 	sessionsRoot: string;
-}): ManagedScopeResolution {
+}
+
+function resolveManagedScopeInternal(
+	input: ManagedScopeInput,
+	allowRepairableAclFailure: boolean,
+): ManagedScopeResolution {
 	const identity = identityFor(input.cwd);
 	if (!identity.ok) return nativeFailure(identity.code);
 	try {
@@ -379,19 +404,33 @@ export function resolveManagedScope(input: {
 		if (!directory.isDirectory() || directory.isSymbolicLink()) {
 			return { kind: "error", code: "binding_invalid", message: "The managed scope path is not a safe directory." };
 		}
-		const security = verifyOwnerOnlyPathSecurity(scope.directoryPath, "directory") as NativeSecurity;
-		if (!security.ok)
+		const security = validateNativeSecurityResult(
+			verifyExistingManagedScopeDirectory(scope.directoryPath),
+			"verify",
+			"directory",
+		);
+		if (!security.ok && (!allowRepairableAclFailure || security.code !== "acl_verify_failed")) {
 			return {
 				kind: "error",
 				code: "binding_invalid",
 				message: "The managed scope security could not be verified.",
 			};
+		}
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 			return { kind: "error", code: "binding_invalid", message: "The managed scope path could not be inspected." };
 		}
 	}
 	return validateExistingBinding(scope) ?? { kind: "resolved", scope };
+}
+
+export function resolveManagedScope(input: ManagedScopeInput): ManagedScopeResolution {
+	return resolveManagedScopeInternal(input, false);
+}
+
+/** Resolve a scope for a synchronous write without mutating an existing ACL mismatch. */
+export function resolveManagedScopeForWrite(input: ManagedScopeInput): ManagedScopeResolution {
+	return resolveManagedScopeInternal(input, true);
 }
 
 function legacyDirectoryNames(
@@ -594,15 +633,18 @@ function listDirectoryCandidates(
 		});
 }
 
-export async function ensureManagedScope(scope: ManagedScope): Promise<ManagedScopeResolution> {
+export async function ensureManagedScope(
+	scope: ManagedScope,
+	policy: ManagedSessionSecurityPolicy = "default",
+): Promise<ManagedScopeResolution> {
 	try {
 		const root = scopeRoot(scope);
-		ensureManagedDirectory(scope.sessionsRoot, root);
-		ensureManagedDirectory(scope.directoryPath, root);
+		ensureManagedDirectory(scope.sessionsRoot, root, policy);
+		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const bindingPath = path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE);
 		const binding = `${JSON.stringify(bindingFor(scope))}\n`;
 		try {
-			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root);
+			await publishManagedFileNoReplace(bindingPath, new TextEncoder().encode(binding), undefined, root, policy);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
 		}
@@ -676,11 +718,14 @@ function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 }
 
 /** Synchronously create and validate the v2 binding before a default session writer exists. */
-export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): ManagedScopeResolution {
+export function prepareManagedSessionScopeForWriteSync(
+	scope: ManagedScope,
+	policy: ManagedSessionSecurityPolicy = "default",
+): ManagedScopeResolution {
 	try {
 		const root = scopeRoot(scope);
-		ensureManagedDirectory(scope.sessionsRoot, root);
-		ensureManagedDirectory(scope.directoryPath, root);
+		ensureManagedDirectory(scope.sessionsRoot, root, policy);
+		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
 			throw new Error("Managed session directory changed");
@@ -693,11 +738,13 @@ export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): Man
 				root,
 				scope.directoryPath,
 				retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: scope.directoryPath } : undefined,
+				policy,
 			);
 		let store: ManagedSessionDescendantStore;
 		try {
 			store = buildStore();
 		} catch (error) {
+			if (process.platform === "win32" && policy === "windows-existing-verify-first") throw error;
 			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
 			// A prior writer left group/other-readable descendants under the scope
 			// (e.g. resident-cache blobs written on the explicit session path).
@@ -726,10 +773,10 @@ export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): Man
 		managedDirectoryIdentities.set(scope, { dev: preparedDirectory.dev, ino: preparedDirectory.ino });
 		if (validated) return validated;
 		const internal = managedInternalDirectory(scope);
-		ensureManagedDirectory(internal, root);
-		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root);
-		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root);
-		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root);
+		ensureManagedDirectory(internal, root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		return {
@@ -2103,16 +2150,19 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 }
 
 /** Create the v2 binding and private write protocol directories before managed writes. */
-export async function prepareManagedSessionScopeForWrite(scope: ManagedScope): Promise<ManagedScopeResolution> {
-	const prepared = await ensureManagedScope(scope);
+export async function prepareManagedSessionScopeForWrite(
+	scope: ManagedScope,
+	policy: ManagedSessionSecurityPolicy = "default",
+): Promise<ManagedScopeResolution> {
+	const prepared = await ensureManagedScope(scope, policy);
 	if (prepared.kind === "error") return prepared;
 	try {
 		const internal = managedInternalDirectory(scope);
 		const root = scopeRoot(scope);
-		ensureManagedDirectory(internal, root);
-		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root);
-		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root);
-		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root);
+		ensureManagedDirectory(internal, root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
+		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		await reconcileManagedTombstones(scope);
 		return { kind: "resolved", scope };
 	} catch (error) {

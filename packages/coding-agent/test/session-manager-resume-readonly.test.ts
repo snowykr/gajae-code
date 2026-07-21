@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,11 +18,14 @@ import {
 	type SessionStorageStat,
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
+import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
+import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
 });
 
@@ -197,6 +200,38 @@ function sessionText(id: string, role: "user" | "assistant" = "user"): string {
 }
 
 describe("SessionManager read-only resume", () => {
+	it("keeps strict managed read resolution fail-closed on ACL verification failure", () => {
+		const root = makeTempDir();
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		fs.mkdirSync(cwd);
+		fs.mkdirSync(sessionsRoot, { recursive: true });
+
+		const initial = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (initial.kind === "error") throw new Error(`Expected initial scope resolution: ${initial.message}`);
+		fs.mkdirSync(initial.scope.directoryPath);
+
+		const apply = vi.spyOn(native, "applyOwnerOnlyPathSecurity");
+		const repair = vi.spyOn(native, "repairOwnerOnlyPathSecurityExpected");
+		const verify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity").mockReturnValue({
+			ok: false,
+			code: "acl_verify_failed",
+		});
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		expect(() => SessionManager.getDefaultSessionDirReadOnly(cwd, agentDir)).toThrow(
+			"Could not resolve managed session scope: The managed scope security could not be verified.",
+		);
+
+		expect(resolved).toEqual({
+			kind: "error",
+			code: "binding_invalid",
+			message: "The managed scope security could not be verified.",
+		});
+		expect(verify).toHaveBeenCalledWith(initial.scope.directoryPath, "directory");
+		expect(apply).not.toHaveBeenCalled();
+		expect(repair).not.toHaveBeenCalled();
+	});
 	it("lists and inspects without maintenance writes, then strictly opens the approved identity", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/resume.jsonl";

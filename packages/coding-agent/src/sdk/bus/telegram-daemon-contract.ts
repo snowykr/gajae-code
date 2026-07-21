@@ -22,7 +22,8 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * reclamation in generation 11, force-escalated SIGKILL of an unresponsive
  * older-generation owner during automatic generation-upgrade reload in
  * generation 12, restored macOS daemon signaling (kill(2) with a start-time
- * incarnation recheck, replacing the darwin no-op) in generation 13, and
- * retained legacy stopped-lock reclamation in generation 14.
+ * incarnation recheck, replacing the darwin no-op) in generation 13, retained
+ * legacy stopped-lock reclamation in generation 14, and Windows expected-identity
+ * ACL verification and repair in generation 15.
  */
-export const DAEMON_GENERATION = 14;
+export const DAEMON_GENERATION = 15;
