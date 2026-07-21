@@ -504,7 +504,7 @@
     "crates/pi-natives/src/path_identity.rs": "04e0c4c1e7024752f6cc9d2d74dd8514c9b5fdc18ab7897332750f3f90b3cb54",
     "crates/pi-natives/src/ps.rs": "3c8a28d1daf84e91c3db0d29fa05a6231b871903800428ca1acbb2ddecea5f6b",
     "crates/pi-shell/src/process.rs": "3f74458492c16fff24ecc234c74efd29d2a7f5f5c5a7c879c68b00a2e4f08274",
-    "packages/natives/native/index.d.ts": "86ac7c64960e28daad9b9ff1d1512d3916a7855c0aa5c814745dbfe0135be4fe",
+    "packages/natives/native/index.d.ts": "cc24134147cb670caa5e507a46466d82a328d299b60416339c054a03f6c4f63f",
     "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "72aac66e149e8a5e411728e2e17469a7c444b252e4fd776316461b8672de68c5"
   }
 }
