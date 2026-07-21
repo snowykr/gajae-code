@@ -58,6 +58,7 @@ function createInputControllerContext(options: {
 		historyStorage: { getRecent: () => [] },
 		skillCommands: new Map(),
 		pendingImages: options.pendingImages ?? [],
+		hasActiveBtw: () => false,
 		getSlashCommands: () => [{ name: "changelog", description: "Show changelog" }],
 		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
@@ -206,6 +207,7 @@ describe("CommandPalette", () => {
 			showStatus: () => {},
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map([["skill:demo", { description: "Demo skill" }]]),
+			hasActiveBtw: () => false,
 			getSlashCommands: () => liveCommands,
 			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;
@@ -255,6 +257,7 @@ describe("CommandPalette", () => {
 			showStatus: () => {},
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map(),
+			hasActiveBtw: () => false,
 			getSlashCommands: () => [{ name: "clear", description: "Clear the session" }],
 			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;
@@ -299,6 +302,7 @@ describe("CommandPalette", () => {
 			showStatus: () => {},
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map(),
+			hasActiveBtw: () => false,
 			getSlashCommands: () => [{ name: "changelog", description: "Show changelog" }],
 			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;

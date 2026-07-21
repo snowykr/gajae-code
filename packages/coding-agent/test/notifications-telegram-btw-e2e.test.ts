@@ -71,12 +71,12 @@ function isolatedSettings(agentDir: string): Settings {
 		},
 	}) as Settings;
 }
-test("real notifications extension rebinds /btw without provider replay or main-session injection", async () => {
+test("real notifications extension rebinds /btw with raw-question delegation and no main-session injection", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-extension-e2e-"));
 	const cwd = path.join(agentDir, "repo");
 	const sessionId = "btw-extension-e2e";
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
-	const providerCalls: Array<{ prompt: string; signal?: AbortSignal }> = [];
+	const btwCalls: Array<{ question: string; signal?: AbortSignal }> = [];
 	const providerResponse = Promise.withResolvers<{ replyText: string }>();
 	let mainSessionInjections = 0;
 	const settings = isolatedSettings(agentDir);
@@ -115,8 +115,8 @@ test("real notifications extension rebinds /btw without provider replay or main-
 			} as never,
 			{
 				settings,
-				runEphemeralTurn: async (prompt, signal) => {
-					providerCalls.push({ prompt, signal });
+				runBtwTurn: async (question, signal) => {
+					btwCalls.push({ question, signal });
 					if (signal?.aborted) throw signal.reason;
 					return await providerResponse.promise;
 				},
@@ -147,7 +147,7 @@ test("real notifications extension rebinds /btw without provider replay or main-
 				text: "/btw exact side question",
 			},
 		});
-		await waitFor(() => providerCalls.length === 1, "EphemeralTurnHost provider invocation");
+		await waitFor(() => btwCalls.length === 1, "raw-question BTW invocation");
 		daemon.sessions.get(sessionId)!.ws.close();
 		await waitFor(() => !daemon.sessions.has(sessionId), "extension transient transport loss");
 		await daemon.scanRoots();
@@ -158,16 +158,12 @@ test("real notifications extension rebinds /btw without provider replay or main-
 			"extension replacement capability replay",
 		);
 		await sleep(80);
-		expect(providerCalls).toHaveLength(1);
+		expect(btwCalls).toHaveLength(1);
 		providerResponse.resolve({ replyText: "| Formula | Value |\n| --- | --- |\n| $x^2$ | 4 |" });
 		await waitFor(() => bot.count("sendRichMessage") === richBefore + 1, "correlated rich /btw delivery");
-		expect(providerCalls).toHaveLength(1);
-		expect(
-			providerCalls[0]!.prompt,
-		).toBe(`You are answering inside an ephemeral multi-turn side chat for the interactive session.
-Use only the sanitized visible-text conversation scope and prior side-chat turns provided as messages.
-Answer directly. Do not use tools or request hidden session state.`);
-		expect(providerCalls[0]!.signal).toBeInstanceOf(AbortSignal);
+		expect(btwCalls).toHaveLength(1);
+		expect(btwCalls[0]!.question).toBe("exact side question");
+		expect(btwCalls[0]!.signal).toBeInstanceOf(AbortSignal);
 		expect(mainSessionInjections).toBe(0);
 		expect(bot.count("sendMessage")).toBe(sendMessageBefore);
 		const richCalls = bot.calls.filter(call => call.method === "sendRichMessage");

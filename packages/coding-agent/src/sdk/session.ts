@@ -92,6 +92,7 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
+import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { MCPManager } from "../runtime-mcp";
@@ -1855,9 +1856,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						spawnedByGjc,
 						sdkHostModeSupported: options.sdkHostModeSupported,
 						ensureProviderDaemon: options.ensureNotificationProviderDaemon,
-						runEphemeralTurn: async (promptText, signal) => {
+						runBtwTurn: async (question, signal) => {
 							if (!session) throw new Error("Ephemeral turns are unavailable.");
-							const { replyText } = await session.runEphemeralTurn({ promptText, signal });
+							const { replyText } = await session.runEphemeralTurn({
+								purpose: "btw",
+								turn: { question, scope: session.createBtwConversationScope(btwUserPrompt) },
+								signal,
+							});
 							return { replyText };
 						},
 					});
