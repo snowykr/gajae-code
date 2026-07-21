@@ -4,8 +4,9 @@
  * Lightweight utilities for calling MCP servers directly via HTTP
  * without maintaining persistent connections.
  */
-import { logger } from "@gajae-code/utils";
+// biome-ignore assist/source/organizeImports: Keep independent MCP security imports on separate merge anchors.
 import { cancelMCPStream, MCP_HTTP_TIMEOUT_MS, MCP_MAX_CONTENT_BYTES, readMCPResponseText } from "./content-limits";
+import { logger } from "@gajae-code/utils";
 
 /** Parse SSE response format (lines starting with "data: ") */
 export function parseSSE(text: string): unknown {
@@ -23,6 +24,15 @@ export function parseSSE(text: string): unknown {
 		return JSON.parse(text);
 	} catch {
 		return null;
+	}
+}
+
+async function translateMCPTimeout<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	try {
+		return await operation;
+	} catch (error) {
+		if (signal.aborted && error === signal.reason) throw new Error("MCP request timed out");
+		throw error;
 	}
 }
 
@@ -58,38 +68,31 @@ export async function callMCP<T = unknown>(
 		params: params ?? {},
 	};
 
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), MCP_HTTP_TIMEOUT_MS);
-	let response: Response;
-	try {
-		response = await fetch(url, {
+	const signal = AbortSignal.timeout(MCP_HTTP_TIMEOUT_MS);
+	const response = await translateMCPTimeout(
+		fetch(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
 			body: JSON.stringify(body),
-			signal: controller.signal,
-		});
+			signal,
+		}),
+		signal,
+	);
 
-		if (!response.ok) {
-			const errorMsg = `MCP request failed: ${response.status} ${response.statusText}`;
-			logger.error(errorMsg, { url, method, params });
-			cancelMCPStream(response.body);
-			throw new Error(errorMsg);
-		}
-
-		const result = parseSSE(
-			await readMCPResponseText(response, MCP_MAX_CONTENT_BYTES, false, controller.signal),
-		) as JsonRpcResponse<T> | null;
-
-		if (!result) {
-			logger.error("Failed to parse MCP response", { url, method });
-			throw new Error("Failed to parse MCP response");
-		}
-
-		return result;
-	} catch (error) {
-		if (error instanceof Error && error.name === "AbortError") throw new Error("MCP request timed out");
-		throw error;
-	} finally {
-		clearTimeout(timeout);
+	if (!response.ok) {
+		cancelMCPStream(response.body);
+		const errorMsg = `MCP request failed: ${response.status} ${response.statusText}`;
+		logger.error(errorMsg, { url, method, params });
+		throw new Error(errorMsg);
 	}
+
+	const text = await translateMCPTimeout(readMCPResponseText(response, MCP_MAX_CONTENT_BYTES, false, signal), signal);
+	const result = parseSSE(text) as JsonRpcResponse<T> | null;
+
+	if (!result) {
+		logger.error("Failed to parse MCP response", { url, method, responseText: text.slice(0, 500) });
+		throw new Error("Failed to parse MCP response");
+	}
+
+	return result;
 }

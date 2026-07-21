@@ -197,4 +197,51 @@ describe("MCP remote content limits", () => {
 		);
 		expect(cancelled).toBe(1);
 	});
+
+	test("legacy callMCP keeps one deadline across headers and body reads", async () => {
+		const headerTimeout = new AbortController();
+		const bodyTimeout = new AbortController();
+		const bodyStarted = Promise.withResolvers<void>();
+		vi.spyOn(AbortSignal, "timeout")
+			.mockReturnValueOnce(headerTimeout.signal)
+			.mockReturnValueOnce(bodyTimeout.signal);
+		vi.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(
+				fetchImplementation(async (_url, init) => {
+					const { promise, reject } = Promise.withResolvers<Response>();
+					init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+					return promise;
+				}),
+			)
+			.mockImplementationOnce(
+				fetchImplementation(
+					async (_url, _init) =>
+						new Response(
+							new ReadableStream({
+								start() {
+									bodyStarted.resolve();
+								},
+							}),
+						),
+				),
+			);
+
+		const pendingHeaders = callMCP("https://example.invalid", "tools/list");
+		headerTimeout.abort(new DOMException("The operation timed out", "TimeoutError"));
+		await expect(pendingHeaders).rejects.toThrow("MCP request timed out");
+
+		const pendingBody = callMCP("https://example.invalid", "tools/list");
+		await bodyStarted.promise;
+		bodyTimeout.abort(new DOMException("The operation timed out", "TimeoutError"));
+		await expect(pendingBody).rejects.toThrow("MCP request timed out");
+	});
+
+	test("legacy callMCP preserves errors unrelated to an expired deadline", async () => {
+		const timeout = new AbortController();
+		timeout.abort(new DOMException("The operation timed out", "TimeoutError"));
+		vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+		vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network failed before timeout"));
+
+		await expect(callMCP("https://example.invalid", "tools/list")).rejects.toThrow("network failed before timeout");
+	});
 });
