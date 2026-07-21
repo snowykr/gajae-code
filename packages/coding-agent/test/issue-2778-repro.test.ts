@@ -1,5 +1,5 @@
-import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 
 const mainPath = path.resolve(import.meta.dir, "../src/main.ts");
 
