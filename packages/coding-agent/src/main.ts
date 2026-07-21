@@ -12,6 +12,7 @@ import { createInterface } from "node:readline/promises";
 import type { ImageContent } from "@gajae-code/ai";
 import {
 	$env,
+	$pickenv,
 	getAgentDir,
 	getProjectDir,
 	logger,
@@ -1091,6 +1092,33 @@ export interface RunRootCommandDependencies {
 	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
+export interface ModelRoleOverrides {
+	smol?: string;
+	slow?: string;
+	plan?: string;
+}
+
+/**
+ * Resolve the ephemeral `smol`/`slow`/`plan` model-role overrides.
+ *
+ * Precedence per role is CLI flag > documented `GJC_*_MODEL` > legacy
+ * `PI_*_MODEL`, matching the repo-wide GJC-first/PI-fallback convention.
+ * Resolution reads the process environment via `$pickenv`, which trims values
+ * and treats empty/whitespace as unset; it is deliberately kept separate from
+ * credential env resolution (`$credentialEnv`/`$pickCredentialEnv`). The
+ * function is pure and stateless, so it reads fresh each call and a later
+ * invocation never inherits an earlier one's values.
+ */
+export function resolveModelRoleOverrides(parsed: Pick<Args, "smol" | "slow" | "plan">): ModelRoleOverrides {
+	const overrides: ModelRoleOverrides = {};
+	const smol = parsed.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
+	const slow = parsed.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
+	const plan = parsed.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
+	if (smol) overrides.smol = smol;
+	if (slow) overrides.slow = slow;
+	if (plan) overrides.plan = plan;
+	return overrides;
+}
 export async function runRootCommand(
 	parsed: Args,
 	rawArgs: string[],
@@ -1284,15 +1312,14 @@ export async function runRootCommand(
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
-	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
-	const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
-	const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
-	if (smolModel || slowModel || planModel) {
+	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted).
+	// Precedence per role: CLI flag > documented GJC_*_MODEL > legacy PI_*_MODEL.
+	const roleOverrides = resolveModelRoleOverrides(parsedArgs);
+	if (roleOverrides.smol || roleOverrides.slow || roleOverrides.plan) {
 		settingsInstance.overrideModelRoles({
-			smol: smolModel,
-			slow: slowModel,
-			plan: planModel,
+			...(roleOverrides.smol ? { smol: roleOverrides.smol } : {}),
+			...(roleOverrides.slow ? { slow: roleOverrides.slow } : {}),
+			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
 		});
 	}
 
