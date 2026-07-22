@@ -3059,7 +3059,7 @@ describe("telegram daemon", () => {
 		};
 		fs.mkdirSync(paths.dir, { recursive: true });
 		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
-		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: legacyState.pid, startedAt: legacyState.startedAt }));
 		fs.utimesSync(paths.lock, new Date(0), new Date(0));
 
 		const ownershipInput = {
@@ -3091,6 +3091,41 @@ describe("telegram daemon", () => {
 			ownershipPhase: "ready",
 		});
 	});
+	test("keeps a live v0.10.2 owner blocked when its legacy lock does not match", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				ownerId: "999-v010-owner",
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 200,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 3,
+			}),
+		);
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 999, startedAt: 99 }));
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				pid: 4242,
+				ownerId: "current-owner",
+				now: () => 100_000,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `linux:${pid}`,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+	});
 	test("detailed ensure completes the v0.10.2 attestation and reload in one startup", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -3109,7 +3144,7 @@ describe("telegram daemon", () => {
 		};
 		fs.mkdirSync(paths.dir, { recursive: true });
 		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
-		fs.writeFileSync(paths.lock, "");
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: legacyState.pid, startedAt: legacyState.startedAt }));
 		fs.utimesSync(paths.lock, new Date(0), new Date(0));
 
 		let now = 100_000;

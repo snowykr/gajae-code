@@ -1310,12 +1310,22 @@ export async function acquireDaemonOwnership(input: {
 		// remained, and must receive the same liveness/freshness protection as any
 		// other live reservation.
 		const stoppedLockMatches = ownershipLockMatchesStoppedState(recheckedLock, rechecked);
-		const lockDecision = stoppedLockMatches
-			? undefined
-			: liveOwnershipLockDecision({ lock: recheckedLock, pidAlive, pidIncarnation });
+		// A pre-incarnation parent owns a legacy { pid, startedAt } lock. An exact
+		// state/lock pair is authority only to perform the bounded heartbeat
+		// attestation below; it is never attached or unlinked here.
+		const legacyParentLockMatches =
+			isLegacyParentDaemonState(rechecked) &&
+			recheckedLock.kind === "legacy" &&
+			recheckedLock.metadata.pid === rechecked.pid &&
+			recheckedLock.metadata.startedAt === rechecked.startedAt;
+		const lockDecision =
+			stoppedLockMatches || legacyParentLockMatches
+				? undefined
+				: liveOwnershipLockDecision({ lock: recheckedLock, pidAlive, pidIncarnation });
 		if (lockDecision) return lockDecision;
 		if (
 			!stoppedLockMatches &&
+			!legacyParentLockMatches &&
 			!(await ownershipLockIsReclaimable({
 				fs: fsImpl,
 				path: paths.lock,
