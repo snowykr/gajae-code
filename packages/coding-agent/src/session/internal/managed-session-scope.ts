@@ -1836,11 +1836,19 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 		throw error;
 	}
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
+	const tree = snapshotArtifactTree(originalPath);
+	const root = tree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+	if (!root) throw new Error("unsafe_artifacts");
 	return {
 		originalPath,
 		detachedPath: path.join(path.dirname(originalPath), `.gjc-migrate-${operation}-artifacts`),
-		identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
-		tree: snapshotArtifactTree(originalPath),
+		identity: {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: process.platform === "win32" ? BigInt(root.size) : stat.size,
+			mtimeNs: stat.mtimeNs,
+		},
+		tree,
 	};
 }
 
@@ -1887,7 +1895,10 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): DetachedArt
 	});
 	if (!result.ok || !result.detachedPath || !matchesDetachedArtifactRoot(result.detachedPath, plan))
 		throw new Error("durability_failed");
-	return { ...plan, detachedPath: result.detachedPath };
+	const detachedPath =
+		process.platform === "win32" ? fs.realpathSync.native(result.detachedPath) : result.detachedPath;
+	if (!matchesDetachedArtifactRoot(detachedPath, plan)) throw new Error("durability_failed");
+	return { ...plan, detachedPath };
 }
 
 function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {

@@ -1621,7 +1621,10 @@ export function fsyncManagedArtifactTree(root: string): NativeDirectoryTreeSnaps
 		const stat = fs.lstatSync(pathname);
 		if (stat.isSymbolicLink()) throw new Error("unsafe_artifacts");
 		if (stat.isFile()) {
-			const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			const fd = fs.openSync(
+				pathname,
+				(process.platform === "win32" ? fs.constants.O_WRONLY : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW,
+			);
 			try {
 				fs.fsyncSync(fd);
 			} finally {
