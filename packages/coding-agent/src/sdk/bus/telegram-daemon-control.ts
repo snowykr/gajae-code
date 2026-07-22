@@ -37,6 +37,7 @@ import {
 	isSignalableMatchingOwner,
 	readDaemonRoots,
 	readDaemonState,
+	readOwnershipLock,
 	spawnTelegramDaemonOwner,
 	type TelegramDaemonDeps,
 	type TelegramDaemonFs,
@@ -52,6 +53,13 @@ const nodeFs: TelegramDaemonFs = {
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 const DEFAULT_WAIT_STEP_MS = 25;
+async function readJsonControl<T>(fsImpl: TelegramDaemonFs, file: string): Promise<T | undefined> {
+	try {
+		return JSON.parse(await fsImpl.readFile(file, "utf8")) as T;
+	} catch {
+		return undefined;
+	}
+}
 
 export interface TelegramDaemonControlRequest {
 	version: 1;
@@ -317,29 +325,42 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		signal: NodeJS.Signals,
 	): Promise<"signaled" | "already_gone" | "ownership_changed"> {
 		const current = await readDaemonState(this.settings, this.fsImpl);
-		// The signal is a privileged action: immediately before sending it, prove the
-		// complete state record is still the exact captured owner. A malformed record,
-		// configuration mutation, or successor using a reused PID is never signalable.
-		if (
-			!hasSafeDaemonStateShape(current) ||
-			current.ownerId !== captured.ownerId ||
-			current.acquisitionId !== captured.acquisitionId ||
-			current.pid !== captured.pid ||
-			current.generation !== captured.generation ||
-			current.incarnation !== captured.incarnation ||
-			current.tokenFingerprint !== captured.tokenFingerprint ||
-			current.chatId !== captured.chatId ||
-			current.tokenFingerprint !== tokenFingerprint ||
-			current.chatId !== chatId
-		)
-			return "ownership_changed";
-		// A matching captured owner that exited between the request and recheck has
-		// completed the handoff. A live owner with changed or unavailable provenance
-		// remains ambiguous and must not be treated as stopped.
+		const legacyCurrentMatches =
+			captured.generation === 3 &&
+			captured.acquisitionId === captured.ownerId &&
+			captured.ownershipPhase === "ready" &&
+			current?.generation === 3 &&
+			current.incarnation === undefined &&
+			current.acquisitionId === undefined &&
+			current.ownershipPhase === undefined &&
+			current.ownerId === captured.ownerId &&
+			current.pid === captured.pid &&
+			current.startedAt === captured.startedAt &&
+			current.heartbeatAt === captured.heartbeatAt &&
+			current.version === captured.version &&
+			current.tokenFingerprint === captured.tokenFingerprint &&
+			current.chatId === captured.chatId &&
+			current.tokenFingerprint === tokenFingerprint &&
+			current.chatId === chatId &&
+			JSON.stringify(current.roots) === JSON.stringify(captured.roots);
+		const modernCurrentMatches =
+			hasSafeDaemonStateShape(current) &&
+			current.ownerId === captured.ownerId &&
+			current.acquisitionId === captured.acquisitionId &&
+			current.pid === captured.pid &&
+			current.generation === captured.generation &&
+			current.incarnation === captured.incarnation &&
+			current.tokenFingerprint === captured.tokenFingerprint &&
+			current.chatId === captured.chatId &&
+			current.tokenFingerprint === tokenFingerprint &&
+			current.chatId === chatId;
+		// The signal is privileged: the persisted record must still be the exact
+		// modern owner or the exact attested generation-3 release owner.
+		if (!modernCurrentMatches && !legacyCurrentMatches) return "ownership_changed";
 		if (!this.pidAlive(captured.pid)) return "already_gone";
 		if (
 			!isSignalableMatchingOwner({
-				state: current,
+				state: modernCurrentMatches ? current : captured,
 				tokenFingerprint,
 				chatId,
 				pidAlive: this.pidAlive,
@@ -408,7 +429,36 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const gracefulTimeoutMs = opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS;
 		const killTimeoutMs = opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
 
-		const state = await readDaemonState(this.settings, this.fsImpl);
+		let state = await readDaemonState(this.settings, this.fsImpl);
+		if (state && state.generation === 3 && state.incarnation === undefined) {
+			const evidence = await readJsonControl<{
+				stateDigest: string;
+				lock: { size: number; mtimeMs?: number; dev?: number; ino?: number; ctimeMs?: number };
+				pid: number;
+				incarnation: string;
+				heartbeatAt: number;
+				observedAt: number;
+				tokenFingerprint: string;
+				chatId: string;
+			}>(this.fsImpl, `${daemonPaths(this.settings.getAgentDir()).state}.legacy-migration.json`);
+			const lock = await readOwnershipLock(this.fsImpl, daemonPaths(this.settings.getAgentDir()).lock);
+			if (
+				evidence &&
+				lock.kind === "v010" &&
+				evidence.pid === state.pid &&
+				evidence.incarnation === this.deps.pidIncarnation?.(state.pid) &&
+				evidence.tokenFingerprint === fp &&
+				evidence.chatId === chatId &&
+				JSON.stringify(evidence.lock) === JSON.stringify(lock.metadata)
+			) {
+				state = {
+					...state,
+					incarnation: evidence.incarnation,
+					acquisitionId: state.ownerId,
+					ownershipPhase: "ready",
+				};
+			}
+		}
 		const replaceableLiveOwner =
 			(action === "reload" &&
 				state !== undefined &&
