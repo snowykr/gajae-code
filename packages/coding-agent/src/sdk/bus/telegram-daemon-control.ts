@@ -24,7 +24,7 @@ import type {
 } from "../../daemon/control-types";
 import { OWNERSHIP_MISMATCH_MESSAGE, ownershipMismatchRecovery } from "../../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
-import { isProcessIncarnation } from "../broker/process-incarnation";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "./notification-service";
 import {
@@ -198,7 +198,6 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	private readonly now: () => number;
 	private readonly processReference: (pid: number) => DaemonProcessReference | undefined;
 	private readonly waitStepMs: number;
-
 	constructor(
 		private readonly settings: Settings,
 		private readonly deps: TelegramDaemonControlDeps = {},
@@ -442,11 +441,12 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				chatId: string;
 			}>(this.fsImpl, `${daemonPaths(this.settings.getAgentDir()).state}.legacy-migration.json`);
 			const lock = await readOwnershipLock(this.fsImpl, daemonPaths(this.settings.getAgentDir()).lock);
+			const currentIncarnation = (this.deps.pidIncarnation ?? processIncarnation)(state.pid);
 			if (
 				evidence &&
 				lock.kind === "v010" &&
 				evidence.pid === state.pid &&
-				evidence.incarnation === this.deps.pidIncarnation?.(state.pid) &&
+				evidence.incarnation === currentIncarnation &&
 				evidence.tokenFingerprint === fp &&
 				evidence.chatId === chatId &&
 				JSON.stringify(evidence.lock) === JSON.stringify(lock.metadata)

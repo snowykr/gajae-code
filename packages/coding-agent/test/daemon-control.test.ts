@@ -440,6 +440,60 @@ describe("Telegram daemon PID provenance fencing", () => {
 });
 
 describe("TelegramDaemonController.reload", () => {
+	test("uses processIncarnation fallback for legacy migration evidence when pidIncarnation is omitted", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const paths = daemonPaths(agentDir);
+		const pid = process.pid;
+		const incarnation = processIncarnation(pid);
+		if (!incarnation) {
+			throw new Error(`Unable to determine process incarnation for pid ${pid}`);
+		}
+		const state = {
+			pid,
+			ownerId: "legacy-owner",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1_000,
+			heartbeatAt: Date.now(),
+			roots: [],
+			version: 1,
+			generation: 3,
+		};
+		writeState(agentDir, state);
+		fs.writeFileSync(paths.lock, "");
+		const stat = fs.statSync(paths.lock);
+		fs.writeFileSync(
+			`${paths.state}.legacy-migration.json`,
+			JSON.stringify({
+				stateDigest: "unused",
+				lock: { size: 0, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs },
+				pid,
+				incarnation,
+				heartbeatAt: state.heartbeatAt,
+				observedAt: Date.now(),
+				tokenFingerprint: state.tokenFingerprint,
+				chatId: "42",
+			}),
+		);
+		const signals: Array<[number, string]> = [];
+		let alive = true;
+		const ctrl = new TelegramDaemonController(s, {
+			pidAlive: candidatePid => candidatePid === pid && alive,
+			processReference: referencedPid => ({
+				incarnation: referencedPid === pid ? incarnation : "linux:100",
+				signalRoot: signal => {
+					signals.push([referencedPid, signal]);
+					if (signal === "SIGTERM") alive = false;
+				},
+			}),
+		});
+
+		const result = await ctrl.stop();
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([[pid, "SIGTERM"]]);
+	});
+
 	test("cooperatively stops the old owner and spawns a fresh one", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
