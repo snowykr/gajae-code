@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -1191,6 +1191,17 @@ describe.each([
 });
 
 describe("Darwin default daemon signaling", () => {
+	test("default Darwin authority rechecks incarnation before numeric signaling", () => {
+		const kill = spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			const reference = defaultProcessReference(process.pid, "darwin");
+			expect(reference).toBeDefined();
+			reference?.signalRoot("SIGTERM");
+			expect(kill).toHaveBeenCalledWith(process.pid, "SIGTERM");
+		} finally {
+			kill.mockRestore();
+		}
+	});
 	test("Telegram refuses Darwin TERM/KILL without opening the native numeric-PID signal path", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);

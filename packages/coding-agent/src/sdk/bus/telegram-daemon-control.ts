@@ -379,8 +379,6 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		signal: NodeJS.Signals,
 	): Promise<"signaled" | "already_gone" | "ownership_changed" | "hard_termination"> {
 		if (!this.#currentConfigurationMatches(tokenFingerprint, chatId)) return "ownership_changed";
-		if ((this.deps.platform ?? process.platform) === "darwin" && !this.deps.processReference)
-			return "ownership_changed";
 		const current = await readAttestedLegacyDaemonOwner({
 			settings: this.settings,
 			fs: this.fsImpl,

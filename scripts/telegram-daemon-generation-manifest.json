@@ -461,7 +461,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "2ca819f15e42e1185fd5c7e74bd9d72d903d374f1a9f1e7bfe92760934807238",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:NOTIFICATION_PROTOCOL_VERSION": "b99289f651fedcf020d28dbaf6f07dd37e7e4a5f6dc1f5118b872112325f1e81",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:DaemonProcessReference": "c3d13e3670a6245a1250c4ebfcd80a36dd8fc96c67ab64d9f979182bd117bc4e",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "e806ce840b5927dc45820b816783dd94a8f11a7362a715f0213e9f4c08959d74",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "8ae322035cfe83f10caf26320bd4638b5433be0e812d7cbf6cdb329bcdff92fe",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:clearOwnRequest": "5f02e8a6d69b7400db8aa5f6e33a4efcc29d9b36aa0d71aaeab151b9dbe710c3",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:defaultProcessReference": "35ba4e7f14e4a24eeb36580a2d2ba649681709ed21cb70e05f98d194dc4cb384",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:reload": "22f55a88ce4338529c15495793796f9afd81f8c9da7bbfc8cd10e34cc2442507",
