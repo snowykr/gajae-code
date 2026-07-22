@@ -2138,9 +2138,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while terminal cleanup and attested handoff use generation 21", () => {
+	test("keeps wire protocol 3 while dead Windows v0.10 replacement uses generation 22", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(21);
+		expect(DAEMON_GENERATION).toBe(22);
 	});
 
 	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
@@ -3333,6 +3333,57 @@ describe("telegram daemon", () => {
 		expect(spawns).toBe(0);
 		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBytes);
 		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockBytes);
+	});
+	test("Windows replaces a dead v0.10 parent owner instead of preserving its stale fence", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const state = {
+			pid: 999,
+			ownerId: "dead-v010-owner",
+			tokenFingerprint: tokenFingerprint("123456:secret-token"),
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+			generation: 3,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, `${JSON.stringify(state, null, 2)}\n`);
+		fs.writeFileSync(paths.lock, "");
+
+		let now = 1_000;
+		let spawns = 0;
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4243,
+			now: () => now,
+			onSpawn: () => spawns++,
+		});
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: agentDir, sessionId: "windows-dead-v010" },
+			{
+				platform: "win32",
+				pid: 4242,
+				now: () => now,
+				pidAlive: pid => pid === 4243,
+				pidIncarnation: () => "linux:100",
+				spawn: child.spawn,
+				readinessTimeoutMs: 1,
+				waitStepMs: 1,
+				sleep: async () => {
+					now++;
+					await child.sleep();
+				},
+			},
+		);
+		expect(result).toBe("spawned");
+		expect(spawns).toBe(1);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 4243,
+			ownershipPhase: "ready",
+		});
 	});
 	test("blocks a promoted generation-3 hybrid with a zero-byte lock before controller routing", async () => {
 		const agentDir = tempAgentDir();

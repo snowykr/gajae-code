@@ -2471,13 +2471,13 @@ export async function ensureTelegramDaemonRunningDetailed(
 	if (!isTelegramConfigured(cfg)) return "disabled";
 	const root = notificationRootForCwd(input.cwd);
 	const fp = tokenFingerprint(cfg.botToken);
-	// The v0.10 parent has no stable process authority on Windows. Never turn an
+	// A live v0.10 parent has no stable process authority on Windows. Never turn an
 	// unproven cooperative handoff into destructive cleanup or a replacement spawn.
-	if (
-		(deps.platform ?? process.platform) === "win32" &&
-		isParentDaemonState(await readDaemonState(input.settings, deps.fs))
-	)
-		return "blocked_identity";
+	if ((deps.platform ?? process.platform) === "win32") {
+		const parentState = await readDaemonState(input.settings, deps.fs);
+		if (isParentDaemonState(parentState) && (deps.pidAlive ?? defaultPidAlive)(parentState.pid))
+			return "blocked_identity";
+	}
 	// Windows can retain dead launcher metadata without an ownership lock; reclaim
 	// its dead discovery records before the replacement can publish a new owner.
 	if ((deps.platform ?? process.platform) === "win32" && !deps.fs) {

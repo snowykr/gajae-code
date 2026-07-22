@@ -30,7 +30,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * stop fencing in generation 18, recommended ask metadata rendering in
  * generation 19, authoritative terminal session-close delivery and cleanup
  * fencing, attested generation-bearing pre-incarnation owner handoff in
- * generation 20, and guarded modern generation-absent predecessor signaling in
- * generation 21.
+ * generation 20, guarded modern generation-absent predecessor signaling in
+ * generation 21, and dead Windows v0.10 owner replacement in generation 22.
  */
-export const DAEMON_GENERATION = 21;
+export const DAEMON_GENERATION = 22;
