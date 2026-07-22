@@ -625,10 +625,22 @@ function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState |
 	);
 }
 
-function ownershipLockMatchesStoppedState(lock: OwnershipLockRead, state: unknown): boolean {
+function ownershipLockMatchesStoppedState(
+	lock: OwnershipLockRead,
+	state: unknown,
+	pidAlive: (pid: number) => boolean,
+): boolean {
 	if (isExplicitlyStoppedDaemonState(state)) return ownershipLockMatchesState(lock, state);
-	if (!isLegacyStoppedDaemonState(state) || lock.kind !== "legacy") return false;
-	const legacyState = state as Pick<DaemonState, "pid" | "startedAt"> & { stoppedAt: number };
+	if (!isLegacyStoppedDaemonState(state)) return false;
+	const legacyState = state as Pick<DaemonState, "pid" | "startedAt" | "generation"> & { stoppedAt: number };
+	if (lock.kind === "v010")
+		return (
+			legacyState.generation === 3 &&
+			!pidAlive(legacyState.pid) &&
+			lock.metadata.mtimeMs !== undefined &&
+			lock.metadata.mtimeMs <= legacyState.stoppedAt
+		);
+	if (lock.kind !== "legacy") return false;
 	return (
 		lock.metadata.pid === legacyState.pid &&
 		lock.metadata.startedAt <= legacyState.startedAt &&
@@ -1548,7 +1560,7 @@ export async function acquireDaemonOwnership(input: {
 		// A newer initializer may have replaced the pathname while that tombstone
 		// remained, and must receive the same liveness/freshness protection as any
 		// other live reservation.
-		const stoppedLockMatches = ownershipLockMatchesStoppedState(recheckedLock, rechecked);
+		const stoppedLockMatches = ownershipLockMatchesStoppedState(recheckedLock, rechecked, pidAlive);
 		// A v0.10 parent owns a legacy { pid, startedAt } lock. An exact
 		// state/lock pair is authority only to attest or retry handoff of that
 		// owner; it is never attached or unlinked here.

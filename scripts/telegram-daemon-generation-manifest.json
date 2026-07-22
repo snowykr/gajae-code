@@ -478,7 +478,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:waitForPidDeath": "7c824d810b12d7689f29dc2c8272d65992cdae20f22c6bdf039b75344c2c6615",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:DaemonState": "30d57ddd33e12ca95db3ed5023bb69de4e72e791eeb12a990a5b171449c58591",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramDaemonOwnershipPhase": "e18b8212480f9c8c7d21c3e97b9b4813d445e5afa8f13c16916cc145d0a45339",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:acquireDaemonOwnership": "55673b9b163d2e4ec8b4630c527618d82fe2baa6543a4a8189c386859416692f",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:acquireDaemonOwnership": "b1024068b704d781c171aca2264b43fbdd2be0aeb57efacfaff5a77409115dca",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:acquireTransitionLock": "148715ae25e7c78a3176b80bfd609cfc219052e1690108f17a03b7f10a7656f4",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:bindProvisionalDaemonPid": "3d81721d2252b958e3414fd795db69f58002cf74bc4bed92b064b9eef69c1541",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:classifyForeignLiveOwner": "c907f82f6d51c514f36d0309cca46070bb207993d40fb79deea3b4674a7fa81a",

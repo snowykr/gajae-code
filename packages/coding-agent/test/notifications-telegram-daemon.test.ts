@@ -1004,6 +1004,83 @@ describe("telegram daemon", () => {
 		).resolves.toMatchObject({ acquired: true, ownerId: "replacement" });
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).not.toHaveProperty("stoppedAt");
 	});
+	test("reclaims a generation-3 stopped tombstone with its retained zero-byte lock", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, "");
+		fs.utimesSync(paths.lock, new Date(150), new Date(150));
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "legacy-stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 200,
+				stoppedAt: 300,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 3,
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "replacement",
+				now: () => 30_000,
+				pidAlive: () => false,
+				pidIncarnation: pid => `linux:${pid}`,
+			}),
+		).resolves.toMatchObject({ acquired: true, ownerId: "replacement" });
+		expect(fs.readFileSync(paths.lock, "utf8")).not.toBe("");
+	});
+	test.each([
+		["recorded PID is still live", 150, true],
+		["zero-byte lock is newer than the tombstone", 301, false],
+	] as const)("keeps a generation-3 zero-byte lock when %s", async (_case, lockMtime, ownerAlive) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, "");
+		fs.utimesSync(paths.lock, new Date(lockMtime), new Date(lockMtime));
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "legacy-stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 200,
+				stoppedAt: 300,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 3,
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "replacement",
+				now: () => 30_000,
+				pidAlive: pid => ownerAlive && pid === 111,
+				pidIncarnation: pid => `linux:${pid}`,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+	});
 	test.each([
 		["matching", { pid: 111, startedAt: 0 }, { acquired: true, ownerId: "replacement" }],
 		["newer-start-time", { pid: 111, startedAt: 3 }, { acquired: false, blocked: true }],
