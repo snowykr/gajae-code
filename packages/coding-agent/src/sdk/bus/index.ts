@@ -954,7 +954,6 @@ interface SessionRuntime {
 const SENSITIVE_MODEL_LABEL =
 	/(?:\b(?:https?|wss?):\/\/|\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password|account(?:\s*id)?|email|exception|stack trace)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,}\b)/i;
 const TOOL_SUMMARY_MAX = 280;
-const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
 /** Stable projection of the tool-owned safe-display seam (never the full Tool surface). */
 type SafeSummaryTool = Pick<Tool, "safeSummary" | "safeSummaryFields">;
@@ -3406,7 +3405,7 @@ export function createNotificationsExtension(
 			stateRoot,
 			token,
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
-			connectionCapabilities: connectionId => hostCapCache.get(connectionId) ?? EMPTY_CAPABILITIES,
+			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onFrame: handler => {
@@ -3608,6 +3607,13 @@ export function createNotificationsExtension(
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
+					if (typedFrame.type === "event_replay") {
+						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
+						hostCapCache.set(
+							inbound.connectionId,
+							new Set(capabilities.filter((capability): capability is string => typeof capability === "string")),
+						);
+					}
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch {}
 			});
