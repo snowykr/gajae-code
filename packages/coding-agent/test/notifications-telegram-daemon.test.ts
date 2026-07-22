@@ -3256,6 +3256,7 @@ describe("telegram daemon", () => {
 		const result = await ensureTelegramDaemonRunningDetailed(
 			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
 			{
+				platform: "linux",
 				pid: 4242,
 				now: () => now,
 				pidAlive: pid => alive.has(pid),
