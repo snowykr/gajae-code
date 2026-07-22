@@ -88,6 +88,7 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
+	closeIdempotencyKey: string;
 	unsubscribe: () => void;
 	reconnectUnsubscribe: () => void;
 	/** Per-session frame work queue; callbacks never race prompt ownership. */
@@ -571,8 +572,10 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
+	readonly #closing = new Map<string, Promise<CloseSessionResponse>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
@@ -735,14 +738,24 @@ export class AcpAgent implements Agent {
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
 		if (!cwd) return {};
-		this.#beginTeardown(params.sessionId);
-		try {
-			await this.#teardownSession(params.sessionId, "closed", true);
-			this.#knownSessionCwds.delete(params.sessionId);
-			return {};
-		} finally {
-			this.#finishTeardown(params.sessionId);
-		}
+		const existing = this.#closing.get(params.sessionId);
+		if (existing) return existing;
+		const task = Promise.resolve().then(async () => {
+			this.#beginTeardown(params.sessionId);
+			try {
+				await this.#teardownSession(params.sessionId, "closed", true);
+				this.#knownSessionCwds.delete(params.sessionId);
+				return {};
+			} finally {
+				this.#finishTeardown(params.sessionId);
+			}
+		});
+		this.#closing.set(params.sessionId, task);
+		const cleanup = task.finally(() => {
+			if (this.#closing.get(params.sessionId) === task) this.#closing.delete(params.sessionId);
+		});
+		void cleanup.catch(() => undefined);
+		return task;
 	}
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
@@ -1045,6 +1058,7 @@ export class AcpAgent implements Agent {
 			const record: SessionRecord = {
 				cwd,
 				adapter,
+				closeIdempotencyKey: randomUUID(),
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
 				frameTail: Promise.resolve(),
@@ -1059,6 +1073,7 @@ export class AcpAgent implements Agent {
 			this.#knownSessionCwds.set(id, cwd);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
+			this.#pendingCloseIdempotencyKeys.delete(id);
 		} catch (error) {
 			if (adapter && this.#sessions.get(id)?.adapter === adapter) {
 				try {
@@ -1130,12 +1145,11 @@ export class AcpAgent implements Agent {
 				failures.push(error);
 			}
 			if (closeRemote) {
+				const closeIdempotencyKey =
+					record?.closeIdempotencyKey ?? this.#pendingCloseIdempotencyKeys.get(id) ?? randomUUID();
+				this.#pendingCloseIdempotencyKeys.set(id, closeIdempotencyKey);
 				try {
-					await (await this.#brokerAdapter()).global(
-						"session.close",
-						{ sessionId: id },
-						this.#lifecycleIdempotencyKey(id, "session.close"),
-					);
+					await (await this.#brokerAdapter()).global("session.close", { sessionId: id }, closeIdempotencyKey);
 				} catch (error) {
 					if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
 				}
@@ -1146,6 +1160,7 @@ export class AcpAgent implements Agent {
 					.join("; ");
 				throw aggregateAcpFailure("terminal_uncertain", `ACP session cleanup is uncertain: ${detail}`, failures);
 			}
+			if (closeRemote) this.#pendingCloseIdempotencyKeys.delete(id);
 		} finally {
 			this.#finishTeardown(id);
 		}
@@ -1494,6 +1509,8 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#pendingCloseIdempotencyKeys.clear();
+		if (this.#closing.size === 0) this.#closing.clear();
 		this.#tearingDown.clear();
 		if (this.#broker) {
 			const broker = this.#broker;

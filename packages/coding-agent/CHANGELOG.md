@@ -9,6 +9,7 @@
 
 ### Fixed
 - Repeated byte-identical stale SDK broker locks no longer cause startup to loop when a prior tombstone exists.
+- ACP session close now rotates idempotency keys for resumed attachment generations while retaining the same key across terminally uncertain close retries.
 
 - Ordinary `ask` calls now normalize a provider-emitted `deepInterview: null` placeholder instead of misclassifying it as malformed Round-0 intent recovery data and rejecting it before coercion.
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
