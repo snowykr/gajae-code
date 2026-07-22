@@ -10,6 +10,7 @@
 ### Fixed
 - Repeated byte-identical stale SDK broker locks no longer cause startup to loop when a prior tombstone exists.
 - ConversationStore now tolerates only unsupported Windows parent-directory durability errors after preserving temporary-file fsync and atomic rename.
+- Ralplan no longer re-asks for execution approval when the user already explicitly named `ultragoal` or `team` in the current turn; that naming is the consent.
 
 - Ordinary `ask` calls now normalize a provider-emitted `deepInterview: null` placeholder instead of misclassifying it as malformed Round-0 intent recovery data and rejecting it before coercion.
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
@@ -19,6 +20,7 @@
 - Resumed managed sessions now complete the verified legacy `local://` artifact migration before synchronous path resolution, preserving legacy scratch files instead of failing startup with a migration-order error.
 - Corrected Telegram's uncertain lifecycle guidance so create, close, and resume commands describe their own possible outcome; close and resume no longer display the create-only duplicate-start warning.
 - Telegram ask notifications now preserve the authoritative recommended choice from native asks and workflow gates, marking that option as `(Recommended)` in the message body without changing button indices or submitted answers.
+- Telegram `/session_close` now fails closed when tmux disappearance cannot be confirmed, and publishes the managed owner verdict before locked terminal-state preservation so normal close finalization is not delayed behind that state path.
 
 ## [0.11.6] - 2026-07-21
 ## [0.11.5] - 2026-07-20
@@ -88,6 +90,10 @@
 
 ### Changed
 - The `read` tool is now receipt-by-default: bare and unparseable reads return a bounded receipt (≤50 lines / 10 KiB) with a re-read-with-selector footer only when truncated, `:raw` stays pure verbatim up to a max(2 MiB, spill threshold) ceiling, structural summaries cap unit-granularly at 20 KiB while preserving elision and source-recovery footers, and directories are byte/line capped and never spill. Only an explicit full-content selector (`:raw` or an explicit range) with real content is spill-eligible. Subagent previews now enforce a real byte/code-point cap via per-shape render budgets plus a shape-aware artifact-eligibility tag enforced centrally in output-meta.
+
+
+### Fixed
+- Ultragoal objective ownership no longer treats arbitrary strings that merely mention `goals.json`/`ledger.jsonl` as Ultragoal-owned; only the exact default aggregate objective qualifies for the known-objective path.
 
 ### Fixed
 - Workflow-state handoff no longer self-locks the active-state cache, so a same-turn skill handoff (e.g. ultragoal → ralplan) completes instead of stalling behind a lock the handoff itself still holds (#2638).
