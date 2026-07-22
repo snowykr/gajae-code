@@ -14326,6 +14326,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const bot = new FakeBotApi();
 		const createStarted = Promise.withResolvers<void>();
 		const releaseCreate = Promise.withResolvers<unknown>();
+		const deleteStarted = Promise.withResolvers<void>();
 		const originalCall = bot.call.bind(bot);
 		let heldCreate = true;
 		bot.call = async (method, body, options) => {
@@ -14334,6 +14335,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 				createStarted.resolve();
 				return releaseCreate.promise;
 			}
+			if (method === "deleteForumTopic") deleteStarted.resolve();
 			return originalCall(method, body, options);
 		};
 		const daemon = recoveryDaemon(agentDir, bot);
@@ -14351,7 +14353,9 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		successor.ws.dispatchEvent(new Event("open"));
 		releaseCreate.resolve({ ok: true, result: { message_thread_id: 77 } });
 		await predecessorReplay;
-		await new Promise(resolve => setTimeout(resolve, 0));
+		await deleteStarted.promise;
+		for (let i = 0; i < 20 && (daemon as any).topics.get("CANONICAL") !== undefined; i++)
+			await new Promise(resolve => setTimeout(resolve, 1));
 
 		expect(
 			bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
