@@ -11937,6 +11937,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			id: "ask",
 			question: "Q",
 			options: ["Y", "N"],
+			recommendedIndex: 1,
 		});
 		const rich = bot.calls.filter(c => c.method === "sendRichMessage");
 		expect(rich).toHaveLength(1);
@@ -11946,11 +11947,16 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		});
 		expect(countMethod(bot, "sendMessage")).toBe(0);
 		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
+		expect(rich[0]!.body.rich_message.markdown).toContain("2. N (Recommended)");
+		expect(rich[0]!.body.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text)).toEqual([
+			"1",
+			"2",
+		]);
 		expect(rich[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
 		expect(rich[0]!.body.message_thread_id).toBe(555);
 		expect(daemon.messageRoutes.get("4242")).toEqual({ sessionId: "S", actionId: "ask" });
 
-		const alias = rich[0]!.body.reply_markup.inline_keyboard[0][0].callback_data;
+		const alias = rich[0]!.body.reply_markup.inline_keyboard[0][1].callback_data;
 		await daemon.handleTelegramUpdate({
 			update_id: 1,
 			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
@@ -11958,7 +11964,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(JSON.parse(FakeWs.instances[0]!.sent.at(-1)!)).toEqual({
 			type: "reply",
 			id: "ask",
-			answer: 0,
+			answer: 1,
 			token: "ts",
 		});
 
