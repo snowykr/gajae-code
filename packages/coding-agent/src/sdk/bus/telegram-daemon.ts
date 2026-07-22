@@ -963,7 +963,7 @@ type LegacyParentDaemonState = Omit<DaemonState, "incarnation" | "acquisitionId"
 	incarnation?: undefined;
 	acquisitionId?: undefined;
 	ownershipPhase?: undefined;
-	generation?: undefined;
+	generation?: number;
 };
 
 interface LegacyMigrationAttestation {
@@ -991,7 +991,10 @@ function isLegacyParentDaemonState(state: unknown): state is LegacyParentDaemonS
 			candidate.incarnation === undefined &&
 			candidate.acquisitionId === undefined &&
 			candidate.ownershipPhase === undefined &&
-			candidate.generation === undefined &&
+			(candidate.generation === undefined ||
+				(Number.isSafeInteger(candidate.generation) &&
+					(candidate.generation as number) > 0 &&
+					(candidate.generation as number) < 5)) &&
 			candidate.stoppedAt === undefined,
 	);
 }

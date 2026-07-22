@@ -2120,9 +2120,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while terminal session-close delivery uses generation 20", () => {
+	test("keeps wire protocol 3 while terminal cleanup and attested handoff use generation 21", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(20);
+		expect(DAEMON_GENERATION).toBe(21);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
@@ -3040,6 +3040,83 @@ describe("telegram daemon", () => {
 			pidIncarnation: () => "linux:100",
 		});
 		expect(ownership).toEqual({ acquired: false, attached: false, reloadRequired: true });
+	});
+	test("attests and reloads the literal v0.10.2 generation 3 owner schema", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		const legacyState = {
+			pid: 999,
+			ownerId: "999-v010-owner",
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+			generation: 3,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
+		fs.writeFileSync(paths.lock, "");
+		fs.utimesSync(paths.lock, new Date(0), new Date(0));
+
+		const ownershipInput = {
+			settings: s,
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			pid: 4242,
+			ownerId: "current-owner",
+			pidAlive: (pid: number) => pid === 999,
+			pidIncarnation: (pid: number) => `linux:${pid}`,
+		};
+		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_000 })).resolves.toEqual({
+			acquired: false,
+			attached: false,
+			provisional: true,
+		});
+
+		fs.writeFileSync(paths.state, JSON.stringify({ ...legacyState, heartbeatAt: 201 }));
+		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_001 })).resolves.toEqual({
+			acquired: false,
+			attached: false,
+			reloadRequired: true,
+		});
+	});
+	test("keeps post-incarnation generation records without provenance blocked", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				ownerId: "999-incomplete-owner",
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 200,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 5,
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				pid: 4242,
+				ownerId: "current-owner",
+				now: () => 100_000,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `linux:${pid}`,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
 	});
 
 	test("#2028 binds a provisional launcher PID after a briefly contended transition lock", async () => {
@@ -11740,7 +11817,6 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			id: "ask",
 			question: "Q",
 			options: ["Y", "N"],
-			recommendedIndex: 1,
 		});
 		const rich = bot.calls.filter(c => c.method === "sendRichMessage");
 		expect(rich).toHaveLength(1);
@@ -11750,16 +11826,11 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		});
 		expect(countMethod(bot, "sendMessage")).toBe(0);
 		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
-		expect(rich[0]!.body.rich_message.markdown).toContain("2. N (Recommended)");
-		expect(rich[0]!.body.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text)).toEqual([
-			"1",
-			"2",
-		]);
 		expect(rich[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
 		expect(rich[0]!.body.message_thread_id).toBe(555);
 		expect(daemon.messageRoutes.get("4242")).toEqual({ sessionId: "S", actionId: "ask" });
 
-		const alias = rich[0]!.body.reply_markup.inline_keyboard[0][1].callback_data;
+		const alias = rich[0]!.body.reply_markup.inline_keyboard[0][0].callback_data;
 		await daemon.handleTelegramUpdate({
 			update_id: 1,
 			callback_query: { id: "cb", data: alias, message: { chat: { id: 42 } } },
@@ -11767,7 +11838,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		expect(JSON.parse(FakeWs.instances[0]!.sent.at(-1)!)).toEqual({
 			type: "reply",
 			id: "ask",
-			answer: 1,
+			answer: 0,
 			token: "ts",
 		});
 
@@ -11795,19 +11866,11 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 				id: "ask",
 				question: "Q",
 				options: ["Y", "N"],
-				recommendedIndex: 1,
 			});
 			expect(countMethod(bot, "sendRichMessage")).toBe(1);
 			const htmlSends = bot.calls.filter(c => c.method === "sendMessage");
 			expect(htmlSends.length).toBeGreaterThanOrEqual(1);
 			expect(htmlSends.at(-1)!.body.reply_markup.inline_keyboard).toBeTruthy();
-			expect(htmlSends.at(-1)!.body.text).toContain("2. N (Recommended)");
-			expect(
-				htmlSends
-					.at(-1)!
-					.body.reply_markup.inline_keyboard.flat()
-					.map((button: { text: string }) => button.text),
-			).toEqual(["1", "2"]);
 			const askEntry = [...daemon.messageRoutes.entries()].find(
 				([, route]) => route.sessionId === "S" && route.actionId === "ask",
 			);

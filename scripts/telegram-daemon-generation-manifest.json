@@ -482,7 +482,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:hasSafeDaemonStateShape": "9cbc3723dec8704b55e2350c9679f7de9219affc99b2820de0a03fb72ee4172b",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isCurrentCompatibleOwner": "a1952b6356fd090a4f2031b3ffdfc090448bf3f2ced243a473c81f33f222da50",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isFreshLiveOwner": "e6ae047ab6c06d2fbfd1f534f13db6d81ab390ff91feb02f75296be28e94163a",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isLegacyParentDaemonState": "e81db4eed29e82681f91f9ff299edcbad7300e7f5cb37cee8890ab5fc3b89f88",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isLegacyParentDaemonState": "8d974a22c1df406d40abb80299479cf5c212da609ab4cfd0e9db1ad111331129",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isPhysicalMatchingOwner": "1665414e433a24b8c826015ae2693d9e0fa4f29c4fb53431dd22855957f0cfd3",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isRecognizedLegacyGeneration": "0b9f9b795f4e92bd5a2bc2e39ab41f38af2fea8799e82557dd628d5faa1ebc38",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isSignalableMatchingOwner": "366b1f2dc8e2e5b393fc7e3e9fe207cb580f8ea842b99d8d8b238003d212a901",
