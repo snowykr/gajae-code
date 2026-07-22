@@ -160,20 +160,14 @@ def parse_frame(text: str) -> Frame:
     return GenericFrame(raw)
 
 
-def _wire_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            "sessionId" if key == "session_id" else
-            "workflowGateId" if key == "workflow_gate_id" else
-            "idempotencyKey" if key == "idempotency_key" else
-            "resolvedBy" if key == "resolved_by" else
-            "continuationCursor" if key == "continuation_cursor" else key: _wire_value(item)
-            for key, item in value.items()
-            if item is not None
-        }
-    if isinstance(value, list):
-        return [_wire_value(item) for item in value]
-    return value
+def _wire_key(key: str) -> str:
+    return {
+        "session_id": "sessionId",
+        "workflow_gate_id": "workflowGateId",
+        "idempotency_key": "idempotencyKey",
+        "resolved_by": "resolvedBy",
+        "continuation_cursor": "continuationCursor",
+    }.get(key, key)
 
 
 def serialize_frame(frame: Frame) -> str:
@@ -181,8 +175,11 @@ def serialize_frame(frame: Frame) -> str:
         value: dict[str, JSONValue] = frame.raw
     else:
         value = asdict(frame)
+        if isinstance(frame, QueryResponse) and frame.page is not None:
+            page = cast(dict[str, JSONValue], value["page"])
+            value["page"] = {_wire_key(key): item for key, item in page.items() if item is not None}
         value["type"] = {ActionNeeded: "action_needed", ActionResolved: "action_resolved", ReplyRejected: "reply_rejected", Reply: "reply", ControlRequest: "control_request", ControlResponse: "control_response", QueryRequest: "query_request", QueryResponse: "query_response"}[type(frame)]
-        value = _wire_value(value)
+        value = {_wire_key(key): item for key, item in value.items() if item is not None}
     return json.dumps(value, separators=(",", ":"))
 
 

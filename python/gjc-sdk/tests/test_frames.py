@@ -1,11 +1,18 @@
 import json
 
-from gjc_sdk.frames import ActionNeeded, ActionResolved, GenericFrame, QueryPage, QueryResponse, Reply, parse_frame, reply_frame, serialize_frame
+from gjc_sdk.frames import ActionNeeded, ActionResolved, ControlRequest, GenericFrame, QueryPage, QueryResponse, Reply, parse_frame, reply_frame, serialize_frame
 
 
 def test_reply_serialization_includes_token() -> None:
     raw = json.loads(serialize_frame(reply_frame("action-1", {"choice": "yes"}, "secret")))
     assert raw == {"type": "reply", "id": "action-1", "answer": {"choice": "yes"}, "token": "secret"}
+
+
+def test_serialization_preserves_nested_user_payload() -> None:
+    raw = json.loads(
+        serialize_frame(ControlRequest("request-1", "status", {"filter": {"session_id": "s", "include": None}}))
+    )
+    assert raw["input"] == {"filter": {"session_id": "s", "include": None}}
 
 
 def test_unknown_frame_is_preserved() -> None:
