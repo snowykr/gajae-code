@@ -3090,6 +3090,13 @@ describe("telegram daemon", () => {
 			acquisitionId: "999-v010-owner",
 			ownershipPhase: "ready",
 		});
+		// A failed reload leaves the promoted state beside the original legacy
+		// lock. The next startup must remain able to retry the exact owner.
+		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_002 })).resolves.toEqual({
+			acquired: false,
+			attached: false,
+			reloadRequired: true,
+		});
 	});
 	test("keeps a live v0.10.2 owner blocked when its legacy lock does not match", async () => {
 		const agentDir = tempAgentDir();
@@ -3125,6 +3132,44 @@ describe("telegram daemon", () => {
 				pidIncarnation: pid => `linux:${pid}`,
 			}),
 		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+	});
+	test("retries a promoted v0.10.2 owner that still holds its legacy lock", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				ownerId: "999-v010-owner",
+				acquisitionId: "999-v010-owner",
+				incarnation: "linux:999",
+				ownershipPhase: "ready",
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 201,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 3,
+			}),
+		);
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 999, startedAt: 100 }));
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				pid: 4242,
+				ownerId: "current-owner",
+				now: () => 100_002,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `linux:${pid}`,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
 	test("detailed ensure completes the v0.10.2 attestation and reload in one startup", async () => {
 		const agentDir = tempAgentDir();

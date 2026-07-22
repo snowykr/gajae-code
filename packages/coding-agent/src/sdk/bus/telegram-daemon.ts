@@ -998,9 +998,20 @@ function isLegacyParentDaemonState(state: unknown): state is LegacyParentDaemonS
 			candidate.stoppedAt === undefined,
 	);
 }
-function legacyOwnershipLockMatchesState(lock: OwnershipLockRead, state: unknown): boolean {
-	if (!isLegacyParentDaemonState(state) || lock.kind !== "legacy") return false;
-	return lock.metadata.pid === state.pid && lock.metadata.startedAt === state.startedAt;
+function legacyOwnershipLockMatchesHandoffState(lock: OwnershipLockRead, state: unknown): boolean {
+	if (lock.kind !== "legacy") return false;
+	if (isLegacyParentDaemonState(state))
+		return lock.metadata.pid === state.pid && lock.metadata.startedAt === state.startedAt;
+	if (!hasSafeDaemonStateShape(state)) return false;
+	return (
+		state.stoppedAt === undefined &&
+		state.ownershipPhase === "ready" &&
+		state.acquisitionId === state.ownerId &&
+		(state.generation === undefined ||
+			(Number.isSafeInteger(state.generation) && state.generation > 0 && state.generation < 5)) &&
+		lock.metadata.pid === state.pid &&
+		lock.metadata.startedAt === state.startedAt
+	);
 }
 
 function legacyMigrationAttestationPath(statePath: string): string {
@@ -1314,18 +1325,18 @@ export async function acquireDaemonOwnership(input: {
 		// remained, and must receive the same liveness/freshness protection as any
 		// other live reservation.
 		const stoppedLockMatches = ownershipLockMatchesStoppedState(recheckedLock, rechecked);
-		// A pre-incarnation parent owns a legacy { pid, startedAt } lock. An exact
-		// state/lock pair is authority only to perform the bounded heartbeat
-		// attestation below; it is never attached or unlinked here.
-		const legacyParentLockMatches = legacyOwnershipLockMatchesState(recheckedLock, rechecked);
+		// A v0.10 parent owns a legacy { pid, startedAt } lock. An exact
+		// state/lock pair is authority only to attest or retry handoff of that
+		// owner; it is never attached or unlinked here.
+		const legacyHandoffLockMatches = legacyOwnershipLockMatchesHandoffState(recheckedLock, rechecked);
 		const lockDecision =
-			stoppedLockMatches || legacyParentLockMatches
+			stoppedLockMatches || legacyHandoffLockMatches
 				? undefined
 				: liveOwnershipLockDecision({ lock: recheckedLock, pidAlive, pidIncarnation });
 		if (lockDecision) return lockDecision;
 		if (
 			!stoppedLockMatches &&
-			!legacyParentLockMatches &&
+			!legacyHandoffLockMatches &&
 			!(await ownershipLockIsReclaimable({
 				fs: fsImpl,
 				path: paths.lock,
