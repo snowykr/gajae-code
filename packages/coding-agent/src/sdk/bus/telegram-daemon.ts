@@ -1040,9 +1040,18 @@ async function legacyParentHandoffDecision(input: {
 		heartbeatAt: state.heartbeatAt,
 		observedAt: input.now,
 	} satisfies LegacyMigrationAttestation);
-	return attested
-		? { acquired: false, attached: false, reloadRequired: true }
-		: { acquired: false, attached: false, provisional: true };
+	if (!attested) return { acquired: false, attached: false, provisional: true };
+	// The advancing heartbeat and stable kernel incarnation prove that this exact
+	// pre-incarnation process still owns the legacy state. Promote only the
+	// provenance fields needed by the existing generation-reload controller so it
+	// can signal that process without weakening isSignalableMatchingOwner.
+	await writeJsonAtomic(input.fs, input.statePath, {
+		...state,
+		incarnation,
+		acquisitionId: state.ownerId,
+		ownershipPhase: "ready",
+	} satisfies DaemonState);
+	return { acquired: false, attached: false, reloadRequired: true };
 }
 
 function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
@@ -2262,7 +2271,11 @@ export async function ensureTelegramDaemonRunningDetailed(
 			waitStepMs: deps.waitStepMs,
 			timeoutMs: deps.readinessTimeoutMs,
 		});
-		if (ready) {
+		// A legacy parent cannot satisfy the current ready-state shape, but the
+		// bounded wait gives its heartbeat a second observation window. Retry the
+		// acquisition once so legacyParentHandoffDecision can consume that
+		// attestation before startup treats the owner as blocked.
+		if (ready || isLegacyParentDaemonState(provisional)) {
 			spawned = await withTelegramSetupLease(
 				cfg.botToken,
 				async () =>

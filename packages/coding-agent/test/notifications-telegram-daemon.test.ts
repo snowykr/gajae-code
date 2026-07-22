@@ -3083,6 +3083,79 @@ describe("telegram daemon", () => {
 			attached: false,
 			reloadRequired: true,
 		});
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 999,
+			generation: 3,
+			incarnation: "linux:999",
+			acquisitionId: "999-v010-owner",
+			ownershipPhase: "ready",
+		});
+	});
+	test("detailed ensure completes the v0.10.2 attestation and reload in one startup", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		const legacyState = {
+			pid: 999,
+			ownerId: "999-v010-owner",
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+			generation: 3,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
+		fs.writeFileSync(paths.lock, "");
+		fs.utimesSync(paths.lock, new Date(0), new Date(0));
+
+		let now = 100_000;
+		let legacyHeartbeatAdvanced = false;
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4244,
+			now: () => now,
+			onSpawn: pid => alive.add(pid),
+		});
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
+			{
+				pid: 4242,
+				now: () => now,
+				pidAlive: pid => alive.has(pid),
+				pidIncarnation: () => "linux:100",
+				processReference: pid =>
+					pid === 999
+						? {
+								incarnation: "linux:100",
+								signalRoot: signal => {
+									signals.push([pid, signal]);
+									if (signal === "SIGTERM") alive.delete(pid);
+								},
+							}
+						: undefined,
+				sleep: async ms => {
+					now += ms;
+					if (!legacyHeartbeatAdvanced) {
+						legacyHeartbeatAdvanced = true;
+						fs.writeFileSync(paths.state, JSON.stringify({ ...legacyState, heartbeatAt: 201 }));
+						return;
+					}
+					await child.sleep();
+				},
+				spawn: child.spawn,
+				readinessTimeoutMs: 2,
+				waitStepMs: 1,
+			},
+		);
+
+		expect(result).toBe("reloaded");
+		expect(signals).toContainEqual([999, "SIGTERM"]);
 	});
 	test("keeps post-incarnation generation records without provenance blocked", async () => {
 		const agentDir = tempAgentDir();
