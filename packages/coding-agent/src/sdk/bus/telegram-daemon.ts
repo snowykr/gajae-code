@@ -1035,10 +1035,11 @@ type GenerationAbsentParentDaemonState = Omit<ParentDaemonStateBase, "generation
 type Generation3ReleaseDaemonState = Omit<ParentDaemonStateBase, "generation"> & {
 	generation: 3;
 };
-type LegacyParentDaemonState = GenerationAbsentParentDaemonState | Generation3ReleaseDaemonState;
+export type LegacyParentDaemonState = GenerationAbsentParentDaemonState | Generation3ReleaseDaemonState;
 
 interface LegacyMigrationAttestation {
 	stateDigest: string;
+	confirmed?: true;
 	lock?: V010OwnershipLockMetadata;
 	pid: number;
 	incarnation: string;
@@ -1061,6 +1062,14 @@ function historicalStateSerializer(state: LegacyParentDaemonState): string {
 		...(state.generation === undefined ? {} : { generation: 3 }),
 	};
 	return `${JSON.stringify(historicalState, null, 2)}\n`;
+}
+
+function legacyParentStateDigest(state: LegacyParentDaemonState): string {
+	const { heartbeatAt: _heartbeatAt, ...immutableState } = state;
+	return crypto
+		.createHash("sha256")
+		.update(historicalStateSerializer({ ...immutableState, heartbeatAt: 0 }))
+		.digest("hex");
 }
 
 function hasExactParentStateKeys(state: object, keys: readonly string[]): boolean {
@@ -1183,7 +1192,15 @@ async function legacyParentHandoffDecision(input: {
 	tokenFingerprint: string;
 	chatId: string;
 }): Promise<
-	{ acquired: false; attached: false; provisional?: boolean; reloadRequired?: boolean; blocked?: boolean } | undefined
+	| {
+			acquired: false;
+			attached: false;
+			provisional?: boolean;
+			reloadRequired?: boolean;
+			legacyReloadRequired?: boolean;
+			blocked?: boolean;
+	  }
+	| undefined
 > {
 	const { state } = input;
 	if (!input.pidAlive(state.pid)) return undefined;
@@ -1210,11 +1227,7 @@ async function legacyParentHandoffDecision(input: {
 		input.fs,
 		legacyMigrationAttestationPath(input.statePath),
 	);
-	const { heartbeatAt: _heartbeatAt, ...immutableState } = state;
-	const stateDigest = crypto
-		.createHash("sha256")
-		.update(historicalStateSerializer({ ...immutableState, heartbeatAt: 0 }))
-		.digest("hex");
+	const stateDigest = legacyParentStateDigest(state);
 	const attested = Boolean(
 		previous &&
 			previous.stateDigest === stateDigest &&
@@ -1228,6 +1241,7 @@ async function legacyParentHandoffDecision(input: {
 	);
 	await writeJsonAtomic(input.fs, legacyMigrationAttestationPath(input.statePath), {
 		stateDigest,
+		...(attested ? { confirmed: true as const } : {}),
 		...(attestationLock === undefined ? {} : { lock: attestationLock }),
 		pid: state.pid,
 		incarnation,
@@ -1237,7 +1251,54 @@ async function legacyParentHandoffDecision(input: {
 		chatId: input.chatId,
 	} satisfies LegacyMigrationAttestation);
 	if (!attested) return { acquired: false, attached: false, provisional: true };
-	return { acquired: false, attached: false, provisional: true };
+	return { acquired: false, attached: false, reloadRequired: true, legacyReloadRequired: true };
+}
+
+export interface AttestedLegacyDaemonOwner {
+	state: LegacyParentDaemonState;
+	incarnation: string;
+}
+
+/** Revalidate the exact two-observation legacy proof immediately before signaling. */
+export async function readAttestedLegacyDaemonOwner(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	pidIncarnation?: (pid: number) => string | undefined;
+	tokenFingerprint: string;
+	chatId: string;
+}): Promise<AttestedLegacyDaemonOwner | undefined> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readJson<unknown>(fsImpl, paths.state);
+	if (!isGeneration3ReleaseDaemonState(state)) return undefined;
+	let stateBytes: string;
+	try {
+		stateBytes = await fsImpl.readFile(paths.state, "utf8");
+	} catch {
+		return undefined;
+	}
+	if (stateBytes !== historicalStateSerializer(state)) return undefined;
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	if (lock.kind !== "v010") return undefined;
+	const attestation = await readJson<LegacyMigrationAttestation>(fsImpl, legacyMigrationAttestationPath(paths.state));
+	const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(state.pid);
+	const now = (input.now ?? Date.now)();
+	if (
+		attestation?.confirmed !== true ||
+		!isProcessIncarnation(incarnation) ||
+		attestation.stateDigest !== legacyParentStateDigest(state) ||
+		JSON.stringify(attestation.lock) !== JSON.stringify(lock.metadata) ||
+		attestation.pid !== state.pid ||
+		attestation.incarnation !== incarnation ||
+		attestation.tokenFingerprint !== input.tokenFingerprint ||
+		attestation.chatId !== input.chatId ||
+		attestation.heartbeatAt > state.heartbeatAt ||
+		now < attestation.observedAt ||
+		now - attestation.observedAt > HEARTBEAT_TTL_MS
+	)
+		return undefined;
+	return { state, incarnation };
 }
 
 function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
@@ -1407,6 +1468,7 @@ export async function acquireDaemonOwnership(input: {
 	provisional?: boolean;
 	reason?: "identity_mismatch";
 	reloadRequired?: boolean;
+	legacyReloadRequired?: boolean;
 }> {
 	const fsImpl = input.fs ?? nodeFs;
 	const now = input.now ?? Date.now;
@@ -2217,7 +2279,13 @@ export interface TelegramSpawnAcquisition {
 
 export type TelegramSpawnOwnerResult =
 	| { result: "owner_spawned"; acquisition: TelegramSpawnAcquisition; runtime: DaemonRuntimeInfo; warnings: string[] }
-	| { result: "attached"; runtime: DaemonRuntimeInfo; warnings: string[]; reloadRequired?: boolean }
+	| {
+			result: "attached";
+			runtime: DaemonRuntimeInfo;
+			warnings: string[];
+			reloadRequired?: boolean;
+			legacyReloadRequired?: boolean;
+	  }
 	| { result: "blocked"; runtime: DaemonRuntimeInfo; warnings: string[]; reloadRequired?: boolean };
 
 /**
@@ -2300,6 +2368,7 @@ export async function spawnTelegramDaemonOwner(
 			runtime: buildTelegramDaemonSpawnArgs({ execPath, ownerId: "", agentDir }).runtime,
 			warnings: [],
 			reloadRequired: ownership.reloadRequired,
+			legacyReloadRequired: ownership.legacyReloadRequired,
 		};
 	}
 	const launcherPid = deps.pid ?? process.pid;
@@ -2584,7 +2653,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 		const previous = await readNotificationRootRegistration({ ...input, fs: deps.fs });
 		await registerNotificationRoot({ ...input, fs: deps.fs });
 		const controller = new TelegramDaemonController(input.settings, telegramControllerDeps(deps));
-		const upgrade = await controller.reloadForGenerationUpgrade();
+		const upgrade = await controller.reloadForGenerationUpgrade({}, spawned.legacyReloadRequired === true);
 		if (upgrade.outcome !== "ready") {
 			await restoreNotificationRootRegistration({
 				settings: input.settings,

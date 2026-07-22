@@ -36,6 +36,7 @@ import {
 	ensureTelegramDaemonRunningDetailed,
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
+	readAttestedLegacyDaemonOwner,
 	readDaemonState,
 	registerNotificationRoot,
 	releaseDaemonOwnership,
@@ -54,6 +55,7 @@ import {
 } from "../src/sdk/bus/telegram-daemon";
 import { ownerPidFromOwnerId, runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
 import { NOTIFICATION_PROTOCOL_VERSION } from "../src/sdk/bus/telegram-daemon-contract";
+import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
 import type { InboundAttachment } from "../src/sdk/bus/threaded-inbound";
 
 const THREADED_FALLBACK_NOTICE =
@@ -3141,7 +3143,7 @@ describe("telegram daemon", () => {
 		});
 		expect(ownership).toEqual({ acquired: false, attached: false, blocked: true });
 	});
-	test("attests the literal v0.10.2 generation 3 owner without rewriting its live state", async () => {
+	test("attests the literal v0.10.2 generation 3 owner before requiring reload", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -3176,16 +3178,101 @@ describe("telegram daemon", () => {
 			attached: false,
 			provisional: true,
 		});
+		await expect(
+			readAttestedLegacyDaemonOwner({
+				settings: s,
+				now: () => 100_000,
+				pidIncarnation: ownershipInput.pidIncarnation,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+			}),
+		).resolves.toBeUndefined();
 
 		const advancedState = `${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`;
 		fs.writeFileSync(paths.state, advancedState);
 		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_001 })).resolves.toEqual({
 			acquired: false,
 			attached: false,
-			provisional: true,
+			legacyReloadRequired: true,
+			reloadRequired: true,
 		});
+		await expect(
+			readAttestedLegacyDaemonOwner({
+				settings: s,
+				now: () => 100_001,
+				pidIncarnation: ownershipInput.pidIncarnation,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+			}),
+		).resolves.toMatchObject({ state: { pid: 999, heartbeatAt: 201 }, incarnation: "linux:999" });
+		fs.utimesSync(paths.lock, new Date(1), new Date(1));
+		await expect(
+			readAttestedLegacyDaemonOwner({
+				settings: s,
+				now: () => 100_001,
+				pidIncarnation: ownershipInput.pidIncarnation,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+			}),
+		).resolves.toBeUndefined();
 		expect(fs.readFileSync(paths.state, "utf8")).toBe(advancedState);
 		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+	});
+	test("attested legacy reload aborts when configuration changes while opening process authority", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		const legacyState = {
+			pid: 999,
+			ownerId: "999-v010-owner",
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+			generation: 3,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, `${JSON.stringify(legacyState, null, 2)}\n`);
+		fs.writeFileSync(paths.lock, "");
+		fs.utimesSync(paths.lock, new Date(0), new Date(0));
+		const ownershipInput = {
+			settings: s,
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			pid: 4242,
+			ownerId: "current-owner",
+			pidAlive: (pid: number) => pid === 999,
+			pidIncarnation: (pid: number) => `linux:${pid}`,
+		};
+		await acquireDaemonOwnership({ ...ownershipInput, now: () => 100_000 });
+		fs.writeFileSync(paths.state, `${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`);
+		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_001 })).resolves.toMatchObject({
+			reloadRequired: true,
+			legacyReloadRequired: true,
+		});
+
+		const signals: NodeJS.Signals[] = [];
+		const result = await new TelegramDaemonController(s, {
+			platform: "linux",
+			now: () => 100_001,
+			pidAlive: pid => pid === 999,
+			pidIncarnation: pid => `linux:${pid}`,
+			processReference: () => {
+				s.set("notifications.telegram.chatId", "43");
+				return {
+					incarnation: "linux:999",
+					termination: "cooperative",
+					signalRoot: signal => signals.push(signal),
+				};
+			},
+		}).reloadForGenerationUpgrade({}, true);
+
+		expect(result.outcome).toBe("failed");
+		expect(result.operation.message).toContain("ownership changed");
+		expect(signals).toEqual([]);
 	});
 	test("accepts only canonical historical parent bytes for legacy attestation", async () => {
 		const fingerprint = tokenFingerprint("123456:secret-token");
@@ -3299,7 +3386,7 @@ describe("telegram daemon", () => {
 			}),
 		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
 	});
-	test("detailed ensure preserves a live v0.10.2 fence after attestation", async () => {
+	test("detailed ensure reloads a live v0.10.2 owner after attestation", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -3364,12 +3451,8 @@ describe("telegram daemon", () => {
 			},
 		);
 
-		expect(result).toBe("blocked_identity");
-		expect(signals).toEqual([]);
-		expect(fs.readFileSync(paths.state, "utf8")).toBe(
-			`${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`,
-		);
-		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+		expect(result).toBe("reloaded");
+		expect(signals).toContainEqual([999, "SIGTERM"]);
 	});
 	test("Windows legacy cooperative handoff remains closed without spawning", async () => {
 		const agentDir = tempAgentDir();
