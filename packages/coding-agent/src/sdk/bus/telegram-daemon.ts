@@ -7801,6 +7801,7 @@ export class TelegramNotificationDaemon {
 		// Runtime callers can bypass TypeScript's option type. Without a valid bot
 		// token, there is no authenticated daemon identity or lifecycle authority.
 		if (!validBotToken(this.opts.botToken)) return;
+		let ownershipProved = false;
 		try {
 			const renewed = await renewDaemonHeartbeat({
 				settings: this.opts.settings,
@@ -7813,7 +7814,9 @@ export class TelegramNotificationDaemon {
 				pid: this.opts.pid ?? process.pid,
 				pidIncarnation: this.opts.pidIncarnation,
 			});
-			this.running = !this.stopRequested && renewed;
+			if (!renewed) return;
+			ownershipProved = true;
+			this.running = !this.stopRequested;
 			if (!this.running) return;
 			// Owner-only: start lifecycle control immediately after ownership proof,
 			// before timers or pre-poll startup work can invalidate this run.
@@ -7885,61 +7888,64 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
-			let toolShutdownError: unknown;
-			try {
-				await this.beginToolActivityShutdown();
-			} catch (error) {
-				toolShutdownError = error;
-			}
-			this.effects.beginShutdown();
-			this.#deliveryAbort.abort();
-			let persisted = false;
-			const shutdown = this.effects.allowTerminal(async () => {
-				if (toolShutdownError) throw toolShutdownError;
-				await this.#drainBtwTurns();
-				await this.toolTerminalizationChain;
-				this.runtime.stop();
-				this.stopOwnershipHeartbeatTimer();
-				this.stopFlushTimer();
-				this.stopScanTimer();
-				this.stopTypingTimer();
-				this.stopLifecycleControl();
-				await this.cleanupAllAttachmentDirs();
-				await this.persistAliases();
-				await this.persistTopics();
-				await this.persistSeenUpdateIds();
-				await this.opts.control?.clear?.(this.opts.ownerId);
-				persisted = true;
-			});
-			const deadline = Promise.withResolvers<boolean>();
-			const deadlineTimer = setTimeout(() => deadline.resolve(false), BTW_SHUTDOWN_JOIN_MS);
-			const completed = await Promise.race([
-				shutdown.then(
-					() => true,
-					error => {
-						logger.warn(`notifications: shutdown persistence failed: ${sanitizeDiagnostic(String(error))}`);
-						return false;
-					},
-				),
-				deadline.promise,
-			]);
-			clearTimeout(deadlineTimer);
-			const quiesced = completed && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
-			if (!quiesced || !persisted) {
-				logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
-			} else {
-				await releaseDaemonOwnership({
-					settings: this.opts.settings,
-					ownerId: this.opts.ownerId,
-					acquisitionId: this.opts.ownerId,
-					tokenFingerprint: tokenFingerprint(this.opts.botToken),
-					chatId: this.opts.chatId,
-					pid: this.opts.pid ?? process.pid,
-					generation: DAEMON_GENERATION,
-					pidIncarnation: this.opts.pidIncarnation,
-					fs: this.fsImpl,
-					now: this.opts.now,
+			// A contender must not mutate durable owner state while unwinding startup.
+			if (ownershipProved) {
+				let toolShutdownError: unknown;
+				try {
+					await this.beginToolActivityShutdown();
+				} catch (error) {
+					toolShutdownError = error;
+				}
+				this.effects.beginShutdown();
+				this.#deliveryAbort.abort();
+				let persisted = false;
+				const shutdown = this.effects.allowTerminal(async () => {
+					if (toolShutdownError) throw toolShutdownError;
+					await this.#drainBtwTurns();
+					await this.toolTerminalizationChain;
+					this.runtime.stop();
+					this.stopOwnershipHeartbeatTimer();
+					this.stopFlushTimer();
+					this.stopScanTimer();
+					this.stopTypingTimer();
+					this.stopLifecycleControl();
+					await this.cleanupAllAttachmentDirs();
+					await this.persistAliases();
+					await this.persistTopics();
+					await this.persistSeenUpdateIds();
+					await this.opts.control?.clear?.(this.opts.ownerId);
+					persisted = true;
 				});
+				const deadline = Promise.withResolvers<boolean>();
+				const deadlineTimer = setTimeout(() => deadline.resolve(false), BTW_SHUTDOWN_JOIN_MS);
+				const completed = await Promise.race([
+					shutdown.then(
+						() => true,
+						error => {
+							logger.warn(`notifications: shutdown persistence failed: ${sanitizeDiagnostic(String(error))}`);
+							return false;
+						},
+					),
+					deadline.promise,
+				]);
+				clearTimeout(deadlineTimer);
+				const quiesced = completed && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
+				if (!quiesced || !persisted) {
+					logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
+				} else {
+					await releaseDaemonOwnership({
+						settings: this.opts.settings,
+						ownerId: this.opts.ownerId,
+						acquisitionId: this.opts.ownerId,
+						tokenFingerprint: tokenFingerprint(this.opts.botToken),
+						chatId: this.opts.chatId,
+						pid: this.opts.pid ?? process.pid,
+						generation: DAEMON_GENERATION,
+						pidIncarnation: this.opts.pidIncarnation,
+						fs: this.fsImpl,
+						now: this.opts.now,
+					});
+				}
 			}
 		}
 	}

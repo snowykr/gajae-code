@@ -455,6 +455,60 @@ it("does not restore running state after stop during deferred initial heartbeat 
 	expect([lifecycleFactories, intervalsStarted, apiCalls]).toEqual([0, 0, 0]);
 });
 
+it("does not clean up foreign durable state when initial heartbeat renewal rejects ownership", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-foreign-renewal-"));
+	const settings = daemonSettings(agentDir);
+	await startAsOwner(settings, "foreign-owner", "123456:secret-token");
+	const paths = daemonPaths(agentDir);
+	const durableFiles = [paths.aliases, path.join(paths.dir, "telegram-topics.json"), paths.seenUpdates];
+	const contents = ['{"version":1,"aliases":{}}\n', '{"version":1,"topics":{}}\n', '{"version":1,"updateIds":[42]}\n'];
+	for (let index = 0; index < durableFiles.length; index++)
+		fs.writeFileSync(durableFiles[index]!, contents[index]!, { mode: 0o600 });
+
+	let stateReads = 0;
+	const daemonFs: TelegramDaemonFs = {
+		mkdir: async (directory, opts) => {
+			await fs.promises.mkdir(directory, opts);
+		},
+		readFile: async (file, encoding) => {
+			if (file === paths.state) stateReads++;
+			return await fs.promises.readFile(file, encoding);
+		},
+		writeFile: fs.promises.writeFile.bind(fs.promises),
+		rename: fs.promises.rename.bind(fs.promises),
+		unlink: fs.promises.unlink.bind(fs.promises),
+		open: fs.promises.open.bind(fs.promises),
+		readdir: async file => await fs.promises.readdir(file),
+		chmod: fs.promises.chmod.bind(fs.promises),
+		readEndpointFile: readNotificationEndpointFile,
+		exactUnlink: async (file, identity) =>
+			await exactUnlinkNotificationFile(file, identity, ".gjc-test-daemon-transition.json"),
+	};
+
+	let controlsCleared = 0;
+	const daemon = new TelegramNotificationDaemon({
+		settings,
+		ownerId: "contending-owner",
+		botToken: "123456:secret-token",
+		chatId: PAIRED,
+		fs: daemonFs,
+		botApi: { call: async () => ({ ok: true, result: [] }) } as never,
+		control: {
+			shouldStop: async () => false,
+			clear: async () => {
+				controlsCleared++;
+			},
+		},
+	});
+
+	await daemon.run();
+
+	expect(durableFiles.map(file => fs.readFileSync(file, "utf8"))).toEqual(contents);
+	expect(controlsCleared).toBe(0);
+	expect(stateReads).toBe(1);
+	expect(fs.existsSync(paths.lock)).toBe(true);
+});
+
 describe("lifecycle control runtime", () => {
 	it("buildCreateArgv emits only launcher-supported flags (no --session-id)", () => {
 		expect(buildCreateArgv(createFrame(), { intendedSessionId: "x" })).toEqual({
