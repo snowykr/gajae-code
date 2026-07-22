@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Cron guidance now routes silent recurring polling and event-driven PR/CI watchers to `monitor`, because every cron firing starts a normal assistant turn and prompt wording cannot reliably suppress its response.
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
 - Restored `/models` preset landing navigation after the Image Generation row and made compaction/pruning regression fixtures use an explicit 200K context boundary instead of a mutable provider descriptor default.
 - Fixed Windows legacy session artifact migration by using native directory identity size, a traversable detached-path alias, and writable file handles for final durability sync.
