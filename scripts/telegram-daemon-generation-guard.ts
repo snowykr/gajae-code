@@ -8,9 +8,11 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 20;
+export const GUARD_CONTRACT_VERSION = 23;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
+const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
@@ -42,7 +44,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "ce4a074f34c7f455be235a3c01b10a3ff45e1ba0936c6c5e16ffa6d1db1c8cd8";
+const PROTECTED_INVENTORY_SHA256 = "a49bcbb42416097468002151a3e75636fe28b6e2ac4ab8fbc5692bf14f1d1541";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -64,11 +66,23 @@ export const TELEGRAM_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"ownershipLockMatchesState",
 	"ownershipLockMatchesMetadata",
 	"ownershipLockIsReclaimable",
+	"isParentDaemonState",
+	"isGenerationAbsentParentDaemonState",
+	"isGeneration3ReleaseDaemonState",
 	"isLegacyParentDaemonState",
+	"legacyOwnershipLockMatchesHandoffState",
+	"historicalStateSerializer",
 	"legacyParentHandoffDecision",
+	"unlinkOwnershipLockExactly",
 	"rebindOwnershipLock",
 	"rollbackOwnershipLockRebind",
+	"retireProvisionalDaemonOwnership",
+	"confirmTelegramDaemonSpawn",
 ] as const;
+
+/** Telegram process authority must distinguish cooperative and hard termination. */
+export const TELEGRAM_PROCESS_AUTHORITY_PROTECTED_DECLARATIONS = ["DaemonProcessReference", "defaultProcessReference", "signalCapturedOwner"] as const;
+
 
 /** Telegram authentication and lifecycle control must remain generation-fenced. */
 export const TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS = ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const;
@@ -146,6 +160,13 @@ function validateTransitionTokenInventory(inventory: Inventory): void {
 		throw new Error("telegram-daemon-generation-guard: transition-token primitives must be protected by the Telegram generation contract");
 }
 
+function validateTelegramProcessAuthorityInventory(inventory: Inventory): void {
+	const symbols = inventory.telegram[telegramControl];
+	if (!symbols || TELEGRAM_PROCESS_AUTHORITY_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
+		throw new Error("telegram-daemon-generation-guard: Telegram process termination authority must be protected by the Telegram generation contract");
+}
+
+
 
 
 function inventoryHash(inventory: Inventory): string {
@@ -153,7 +174,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 20) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 23) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -163,6 +184,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateTransitionTokenInventory(inventory);
 	validateTelegramOwnerLockInventory(inventory);
 	validateTelegramLifecycleInventory(inventory);
+	validateTelegramProcessAuthorityInventory(inventory);
 	validateChatOwnerLockInventory(inventory);
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
@@ -540,25 +562,51 @@ function authorityDigest(source: string | undefined): string | undefined {
 	return source === undefined ? undefined : crypto.createHash("sha256").update(source).digest("hex");
 }
 
+function inventoryFromManifestSource(source: string | undefined): Inventory | undefined {
+	if (source === undefined) return undefined;
+	try {
+		const inventory = (JSON.parse(source) as { inventory?: unknown }).inventory;
+		if (!inventory || typeof inventory !== "object" || Array.isArray(inventory)) return undefined;
+		if (Object.keys(inventory).sort().join(",") !== "discord,slack,telegram") return undefined;
+		for (const files of Object.values(inventory as Record<string, unknown>)) {
+			if (!files || typeof files !== "object" || Array.isArray(files)) return undefined;
+			for (const symbols of Object.values(files as Record<string, unknown>))
+				if (!Array.isArray(symbols) || symbols.some(symbol => typeof symbol !== "string")) return undefined;
+		}
+		return inventory as Inventory;
+	} catch {
+		return undefined;
+	}
+}
+
+function inventorySymbols(inventory: Inventory, family: Family, file: string): readonly string[] {
+	return inventory[family]?.[file] ?? [];
+}
+
 export function evaluate(
 	base: ReadonlyMap<string, string | undefined>,
 	head: ReadonlyMap<string, string | undefined>,
 	inventory: Inventory = protectedInventory,
+	baseInventory: Inventory = inventory,
 ): Evaluation {
 	const protectedChanges: string[] = [];
 	const malformedDeclarations: string[] = [];
 	const bootstrapping = isLegacyBootstrapBase(base);
-	for (const [family, files] of Object.entries(inventory) as [Family, Inventory[Family]][]) {
-		for (const [file, symbols] of Object.entries(files)) {
-			const beforeDeclarations = extractDeclarations(base.get(file) ?? "", symbols);
-			const afterDeclarations = extractDeclarations(head.get(file) ?? "", symbols);
+	for (const family of ["telegram", "discord", "slack"] as const) {
+		const files = new Set([...Object.keys(baseInventory[family]), ...Object.keys(inventory[family])]);
+		for (const file of files) {
+			const symbols = new Set([...inventorySymbols(baseInventory, family, file), ...inventorySymbols(inventory, family, file)]);
+			const beforeDeclarations = extractDeclarations(base.get(file) ?? "", [...symbols]);
+			const afterDeclarations = extractDeclarations(head.get(file) ?? "", [...symbols]);
 			for (const symbol of symbols) {
+				const beforeProtected = inventorySymbols(baseInventory, family, file).includes(symbol);
+				const afterProtected = inventorySymbols(inventory, family, file).includes(symbol);
 				const before = beforeDeclarations.get(symbol);
 				const after = afterDeclarations.get(symbol);
 				const label = `${family}:${file}:${symbol}`;
-				if (!after?.valid || !after || (!bootstrapping && (!before?.valid || !before)))
+				if ((afterProtected && (!after?.valid || !after)) || (!bootstrapping && beforeProtected && (!before?.valid || !before)))
 					malformedDeclarations.push(label);
-				if (before?.canonical !== after?.canonical) protectedChanges.push(label);
+				if ((beforeProtected || afterProtected) && before?.canonical !== after?.canonical) protectedChanges.push(label);
 			}
 		}
 	}
@@ -576,7 +624,6 @@ export function evaluate(
 	const guardContractBumped =
 		headGuardContractVersion !== undefined &&
 		(headGuardContractVersion > (baseGuardContractVersion ?? Number.POSITIVE_INFINITY));
-
 	const oldTelegramGeneration = generation(base.get(telegramContract));
 	const newTelegramGeneration = generation(head.get(telegramContract));
 	const telegramGenerationBumped =
@@ -585,10 +632,7 @@ export function evaluate(
 		(["discord", "slack"] as const).map(kind => {
 			const before = generation(base.get(chatControl), kind);
 			const after = generation(head.get(chatControl), kind);
-			return [
-				kind,
-				after !== undefined && after > (before ?? (bootstrapping ? 0 : Number.POSITIVE_INFINITY)),
-			];
+			return [kind, after !== undefined && after > (before ?? (bootstrapping ? 0 : Number.POSITIVE_INFINITY))];
 		}),
 	) as Evaluation["chatGenerationBumped"];
 	return { protectedChanges, nativeAuthorityChanges, telegramGenerationBumped, chatGenerationBumped, malformedDeclarations, guardPolicyChanged, guardContractBumped };
@@ -637,11 +681,23 @@ export async function run(baseInput: string | undefined, headInput: string | und
 	// no-op policy change.
 	await validateCurrentTreeManifest();
 	if (process.env.GJC_DAEMON_GUARD_DEBUG === "1") console.error("daemon-generation-guard: objects verified");
-	const files = [guardScript, manifestScript, ...new Set([...Object.values(protectedInventory).flatMap(inventory => Object.keys(inventory)), ...nativeAuthoritySources])];
+	// The base manifest can name declarations removed or moved in head, so fetch it
+	// before loading sources and compare the complete base/head protected-path union.
+	const baseManifestSource = await blob(base, manifestScript);
+	const baseInventory = inventoryFromManifestSource(baseManifestSource) ?? protectedInventory;
+	const files = [
+		guardScript,
+		manifestScript,
+		...new Set([
+			...Object.values(baseInventory).flatMap(inventory => Object.keys(inventory)),
+			...Object.values(protectedInventory).flatMap(inventory => Object.keys(inventory)),
+			...nativeAuthoritySources,
+		]),
+	];
 	const baseFiles: Array<readonly [string, string | undefined]> = [];
 	const headFiles: Array<readonly [string, string | undefined]> = [];
 	for (const file of files) {
-		baseFiles.push([file, await blob(base, file)]);
+		baseFiles.push([file, file === manifestScript ? baseManifestSource : await blob(base, file)]);
 		headFiles.push([file, await blob(head, file)]);
 	}
 	if (process.env.GJC_DAEMON_GUARD_DEBUG === "1") {
@@ -650,7 +706,7 @@ export async function run(baseInput: string | undefined, headInput: string | und
 	}
 	if (process.env.GJC_DAEMON_GUARD_DEBUG === "1") console.error("daemon-generation-guard: blobs loaded");
 	const baseMap = new Map(baseFiles);
-	const decision = evaluate(baseMap, new Map(headFiles));
+	const decision = evaluate(baseMap, new Map(headFiles), protectedInventory, baseInventory);
 	if (process.env.GJC_DAEMON_GUARD_DEBUG === "1") console.error("daemon-generation-guard: declarations evaluated");
 	if (baseMap.get(guardScript) !== undefined && decision.guardPolicyChanged && !decision.guardContractBumped)
 		throw new Error(`telegram-daemon-generation-guard: guard policy change requires a strictly higher GUARD_CONTRACT_VERSION`);

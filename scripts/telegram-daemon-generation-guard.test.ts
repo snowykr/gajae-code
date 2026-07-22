@@ -11,6 +11,8 @@ const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.e
 
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
+const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
@@ -47,10 +49,18 @@ const telegramHandoffHelpers = [
 	"ownershipLockMatchesState",
 	"ownershipLockMatchesMetadata",
 	"ownershipLockIsReclaimable",
+	"isParentDaemonState",
+	"isGenerationAbsentParentDaemonState",
+	"isGeneration3ReleaseDaemonState",
 	"isLegacyParentDaemonState",
+	"legacyOwnershipLockMatchesHandoffState",
+	"historicalStateSerializer",
 	"legacyParentHandoffDecision",
+	"unlinkOwnershipLockExactly",
 	"rebindOwnershipLock",
 	"rollbackOwnershipLockRebind",
+	"retireProvisionalDaemonOwnership",
+	"confirmTelegramDaemonSpawn",
 ] as const;
 const chatTakeoverHelpers = [
 	"identityFor",
@@ -314,6 +324,66 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		head.set("scripts/telegram-daemon-generation-guard.ts", "export const GUARD_CONTRACT_VERSION = 3;\nexport const policy = false;");
 		expect(decide(base, head).guardContractBumped).toBe(true);
 	});
+	test("evaluates a contract-bumped head-only protected authority against the base inventory", () => {
+		const baseInventory = {
+			telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
+			discord: {},
+			slack: {},
+		} as const;
+		const headInventory = {
+			telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership", "renewDaemonHeartbeat"] },
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 20;"],
+			[telegramDaemon, "export function acquireDaemonOwnership() { return true; }"],
+			[guardScript, "export const GUARD_CONTRACT_VERSION = 22;"],
+			[manifestScript, JSON.stringify({ contractVersion: 22, inventory: baseInventory, digests: {} })],
+		]);
+		const head = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 21;"],
+			[telegramDaemon, "export function acquireDaemonOwnership() { return true; }\nexport function renewDaemonHeartbeat() { return false; }"],
+			[guardScript, "export const GUARD_CONTRACT_VERSION = 23;"],
+			[manifestScript, JSON.stringify({ contractVersion: 23, inventory: headInventory, digests: {} })],
+		]);
+		const result = evaluate(base, head, headInventory, baseInventory);
+		expect(result.protectedChanges).toContain(`telegram:${telegramDaemon}:renewDaemonHeartbeat`);
+		expect(result.malformedDeclarations).toEqual([]);
+		expect(result.guardContractBumped).toBe(true);
+		expect(result.telegramGenerationBumped).toBe(true);
+	});
+	test("treats a base-only protected declaration removal as a generation-fenced change", () => {
+		const removedFile = "packages/coding-agent/src/sdk/bus/removed-daemon-authority.ts";
+		const baseInventory = {
+			telegram: { [telegramContract]: ["DAEMON_GENERATION"], [removedFile]: ["removeDaemonAuthority"] },
+			discord: {},
+			slack: {},
+		} as const;
+		const headInventory = {
+			telegram: { [telegramContract]: ["DAEMON_GENERATION"] },
+			discord: {},
+			slack: {},
+		} as const;
+		const base = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 20;"],
+			[removedFile, "export function removeDaemonAuthority() { return true; }"],
+			[guardScript, "export const GUARD_CONTRACT_VERSION = 22;"],
+			[manifestScript, JSON.stringify({ contractVersion: 22, inventory: baseInventory, digests: {} })],
+		]);
+		const head = new Map<string, string>([
+			[telegramContract, "export const DAEMON_GENERATION = 20;"],
+			[guardScript, "export const GUARD_CONTRACT_VERSION = 23;"],
+			[manifestScript, JSON.stringify({ contractVersion: 23, inventory: headInventory, digests: {} })],
+		]);
+		const unbumped = evaluate(base, head, headInventory, baseInventory);
+		expect(unbumped.protectedChanges).toContain(`telegram:${removedFile}:removeDaemonAuthority`);
+		expect(unbumped.malformedDeclarations).toEqual([]);
+		expect(unbumped.guardContractBumped).toBe(true);
+		expect(unbumped.telegramGenerationBumped).toBe(false);
+		head.set(telegramContract, "export const DAEMON_GENERATION = 21;");
+		expect(evaluate(base, head, headInventory, baseInventory).telegramGenerationBumped).toBe(true);
+	});
 
 	test("only bootstraps when the guard is absent and rejects duplicate inventory symbols", () => {
 		const base = files({ telegramGeneration: 4, telegramOwnership: "return true;" });
@@ -440,6 +510,11 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		const telegram = mutableInventory();
 		telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== "writeJsonAtomic");
 		expect(() => validateInventory(telegram)).toThrow("Telegram owner-lock handoff primitives");
+		for (const symbol of ["DaemonProcessReference", "defaultProcessReference"] as const) {
+			const processAuthority = mutableInventory();
+			processAuthority.telegram[telegramControl] = processAuthority.telegram[telegramControl]!.filter(name => name !== symbol);
+			expect(() => validateInventory(processAuthority)).toThrow("Telegram process termination authority");
+		}
 		const cli = mutableInventory();
 		cli.discord[chatCli] = cli.discord[chatCli]!.filter(name => name !== "ownerPid");
 		expect(() => validateInventory(cli)).toThrow("chat CLI ownership primitives");
@@ -476,10 +551,18 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 				"ownershipLockIsReclaimable",
 				"isLegacyParentDaemonState",
 				"legacyParentHandoffDecision",
+				"isParentDaemonState",
+				"isGenerationAbsentParentDaemonState",
+				"isGeneration3ReleaseDaemonState",
+				"legacyOwnershipLockMatchesHandoffState",
+				"historicalStateSerializer",
+				"unlinkOwnershipLockExactly",
+				"retireProvisionalDaemonOwnership",
+				"confirmTelegramDaemonSpawn",
 			]),
 		);
-		const control = protectedInventory.telegram["packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts"] ?? [];
-		expect(control).toContain("signalCapturedOwner");
+		const control = protectedInventory.telegram[telegramControl] ?? [];
+		expect(control).toEqual(expect.arrayContaining(["DaemonProcessReference", "defaultProcessReference", "signalCapturedOwner"]));
 		for (const family of ["discord", "slack"] as const) {
 			const chat = protectedInventory[family][chatControl] ?? [];
 			expect(chat).toEqual(

@@ -966,7 +966,7 @@ describe("telegram daemon", () => {
 		).resolves.toMatchObject({ acquired: true });
 	});
 	test.each([
-		["an older generation", { generation: DAEMON_GENERATION - 4 }],
+		["generation 3", { generation: 3 }],
 		["the pre-generation schema", {}],
 	] as const)("reclaims a pre-incarnation stopped tombstone from %s when its PID is still live", async (_schema, legacyFields) => {
 		const agentDir = tempAgentDir();
@@ -1401,7 +1401,7 @@ describe("telegram daemon", () => {
 			...transitionFsCapabilities(),
 			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
 			readFile: async (file, encoding) => {
-				if (file === paths.state && ++stateReads === 3) {
+				if (file === paths.state && ++stateReads === 4) {
 					boundAtStateRead = stateReads;
 					published = true;
 					childProvenanceAvailable = true;
@@ -1445,7 +1445,7 @@ describe("telegram daemon", () => {
 				},
 			),
 		).resolves.toBe("attached");
-		expect(boundAtStateRead).toBe(3);
+		expect(boundAtStateRead).toBe(4);
 		expect(spawned).toBe(1);
 		expect(published).toBe(true);
 		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
@@ -2143,10 +2143,10 @@ describe("telegram daemon", () => {
 		expect(DAEMON_GENERATION).toBe(21);
 	});
 
-	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
+	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir); // no generation field == pre-upgrade daemon
+		writeLiveOwner(agentDir);
 		const result = await acquireDaemonOwnership({
 			settings: s,
 			tokenFingerprint: "e60b05c186ca",
@@ -2848,6 +2848,8 @@ describe("telegram daemon", () => {
 					pid === 999
 						? {
 								incarnation: "linux:100",
+								termination: "cooperative",
+
 								signalRoot: sig => {
 									signals.push([pid, sig]);
 									if (sig === "SIGTERM") alive.delete(pid);
@@ -2875,7 +2877,7 @@ describe("telegram daemon", () => {
 	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { heartbeatAt: Date.now() }); // Missing generation requests #2028 reload.
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, heartbeatAt: Date.now() });
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
 		const child = readyTelegramSpawnFixture({
@@ -2893,6 +2895,8 @@ describe("telegram daemon", () => {
 					pid === 999
 						? {
 								incarnation: "linux:100",
+								termination: "cooperative",
+
 								signalRoot: sig => {
 									signals.push([pid, sig]);
 									if (sig === "SIGTERM") alive.delete(pid);
@@ -3008,13 +3012,14 @@ describe("telegram daemon", () => {
 					pidAlive: () => true,
 					pidIncarnation: () => "linux:100",
 					sendSignal: (pid, signal) => signals.push([pid, signal]),
+					readinessTimeoutMs: 0,
 					spawn: () => {
 						spawns++;
 						return { unref() {} };
 					},
 				},
 			),
-		).rejects.toThrow("Unable to replace stale Telegram daemon");
+		).resolves.toBe("blocked_identity");
 		expect(signals).toEqual([]);
 		expect(spawns).toBe(0);
 	});
@@ -3057,9 +3062,9 @@ describe("telegram daemon", () => {
 			pidAlive: pid => pid === 999,
 			pidIncarnation: () => "linux:100",
 		});
-		expect(ownership).toEqual({ acquired: false, attached: false, reloadRequired: true });
+		expect(ownership).toEqual({ acquired: false, attached: false, blocked: true });
 	});
-	test("attests and reloads the literal v0.10.2 generation 3 owner schema", async () => {
+	test("attests the literal v0.10.2 generation 3 owner without rewriting its live state", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -3076,7 +3081,7 @@ describe("telegram daemon", () => {
 			generation: 3,
 		};
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
+		fs.writeFileSync(paths.state, `${JSON.stringify(legacyState, null, 2)}\n`);
 		fs.writeFileSync(paths.lock, "");
 		fs.utimesSync(paths.lock, new Date(0), new Date(0));
 
@@ -3095,13 +3100,92 @@ describe("telegram daemon", () => {
 			provisional: true,
 		});
 
-		fs.writeFileSync(paths.state, JSON.stringify({ ...legacyState, heartbeatAt: 201 }));
+		const advancedState = `${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`;
+		fs.writeFileSync(paths.state, advancedState);
 		await expect(acquireDaemonOwnership({ ...ownershipInput, now: () => 100_001 })).resolves.toEqual({
 			acquired: false,
 			attached: false,
-			reloadRequired: true,
+			provisional: true,
 		});
-		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toEqual({ ...legacyState, heartbeatAt: 201 });
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(advancedState);
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+	});
+	test("accepts only canonical historical parent bytes for legacy attestation", async () => {
+		const fingerprint = tokenFingerprint("123456:secret-token");
+		const parent = {
+			pid: 999,
+			ownerId: "999-v010-owner",
+			tokenFingerprint: fingerprint,
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+		};
+		const canonical = `${JSON.stringify(parent, null, 2)}\n`;
+		const { ownerId, ...parentWithoutOwner } = parent;
+		const rejected = [
+			["extra key", `${JSON.stringify({ ...parent, unexpected: true }, null, 2)}\n`],
+			["reordered keys", `${JSON.stringify({ ownerId, ...parentWithoutOwner }, null, 2)}\n`],
+			["compact JSON", JSON.stringify(parent)],
+			["modern hybrid", `${JSON.stringify({ ...parent, incarnation: "linux:100" }, null, 2)}\n`],
+		] as const;
+		for (const [name, stateBytes] of rejected) {
+			const agentDir = tempAgentDir();
+			const s = setPrivateAgentDir(settings(agentDir), agentDir);
+			const paths = daemonPaths(agentDir);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			fs.writeFileSync(paths.state, stateBytes);
+			await expect(
+				acquireDaemonOwnership({
+					settings: s,
+					tokenFingerprint: fingerprint,
+					chatId: "42",
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: pid => `linux:${pid}`,
+					now: () => 100_000,
+				}),
+			).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+			expect(fs.readFileSync(paths.state, "utf8"), name).toBe(stateBytes);
+			expect(fs.existsSync(`${paths.state}.legacy-migration.json`), name).toBe(false);
+		}
+		const zeroLockDir = tempAgentDir();
+		const zeroLockSettings = setPrivateAgentDir(settings(zeroLockDir), zeroLockDir);
+		const zeroLockPaths = daemonPaths(zeroLockDir);
+		fs.mkdirSync(zeroLockPaths.dir, { recursive: true });
+		fs.writeFileSync(zeroLockPaths.state, canonical);
+		fs.writeFileSync(zeroLockPaths.lock, "");
+		await expect(
+			acquireDaemonOwnership({
+				settings: zeroLockSettings,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `linux:${pid}`,
+				now: () => 100_000,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.existsSync(`${zeroLockPaths.state}.legacy-migration.json`)).toBe(false);
+
+		const validDir = tempAgentDir();
+		const validSettings = setPrivateAgentDir(settings(validDir), validDir);
+		const validPaths = daemonPaths(validDir);
+		fs.mkdirSync(validPaths.dir, { recursive: true });
+		fs.writeFileSync(validPaths.state, canonical);
+		await expect(
+			acquireDaemonOwnership({
+				settings: validSettings,
+				tokenFingerprint: fingerprint,
+				chatId: "42",
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: pid => `linux:${pid}`,
+				now: () => 100_000,
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+		expect(fs.existsSync(`${validPaths.state}.legacy-migration.json`)).toBe(true);
 	});
 	test("keeps a live v0.10.2 owner blocked when its legacy lock does not match", async () => {
 		const agentDir = tempAgentDir();
@@ -3136,9 +3220,9 @@ describe("telegram daemon", () => {
 				pidAlive: pid => pid === 999,
 				pidIncarnation: pid => `linux:${pid}`,
 			}),
-		).resolves.toEqual({ acquired: false, attached: false, provisional: true });
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
 	});
-	test("detailed ensure completes the v0.10.2 attestation and reload in one startup", async () => {
+	test("detailed ensure preserves a live v0.10.2 fence after attestation", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const paths = daemonPaths(agentDir);
@@ -3155,7 +3239,7 @@ describe("telegram daemon", () => {
 			generation: 3,
 		};
 		fs.mkdirSync(paths.dir, { recursive: true });
-		fs.writeFileSync(paths.state, JSON.stringify(legacyState));
+		fs.writeFileSync(paths.state, `${JSON.stringify(legacyState, null, 2)}\n`);
 		fs.writeFileSync(paths.lock, "");
 		fs.utimesSync(paths.lock, new Date(0), new Date(0));
 
@@ -3180,6 +3264,7 @@ describe("telegram daemon", () => {
 					pid === 999
 						? {
 								incarnation: "linux:100",
+								termination: "cooperative",
 								signalRoot: signal => {
 									signals.push([pid, signal]);
 									if (signal === "SIGTERM") alive.delete(pid);
@@ -3190,7 +3275,7 @@ describe("telegram daemon", () => {
 					now += ms;
 					if (!legacyHeartbeatAdvanced) {
 						legacyHeartbeatAdvanced = true;
-						fs.writeFileSync(paths.state, JSON.stringify({ ...legacyState, heartbeatAt: 201 }));
+						fs.writeFileSync(paths.state, `${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`);
 						return;
 					}
 					await child.sleep();
@@ -3201,8 +3286,121 @@ describe("telegram daemon", () => {
 			},
 		);
 
-		expect(result).toBe("reloaded");
-		expect(signals).toContainEqual([999, "SIGTERM"]);
+		expect(result).toBe("blocked_identity");
+		expect(signals).toEqual([]);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(
+			`${JSON.stringify({ ...legacyState, heartbeatAt: 201 }, null, 2)}\n`,
+		);
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+	});
+	test("Windows legacy cooperative handoff remains closed without spawning", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		const state = {
+			pid: 999,
+			ownerId: "v010-owner",
+			tokenFingerprint: tokenFingerprint("123456:secret-token"),
+			chatId: "42",
+			startedAt: 100,
+			heartbeatAt: 200,
+			roots: [],
+			version: DAEMON_VERSION,
+			generation: 3,
+		};
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.state, `${JSON.stringify(state, null, 2)}\n`);
+		fs.writeFileSync(paths.lock, "");
+		const stateBytes = fs.readFileSync(paths.state, "utf8");
+		const lockBytes = fs.readFileSync(paths.lock, "utf8");
+
+		let spawns = 0;
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "windows-v010" },
+				{
+					platform: "win32",
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: () => "linux:100",
+					spawn: () => {
+						spawns++;
+						return { pid: 4243, unref() {} };
+					},
+				},
+			),
+		).resolves.toBe("blocked_identity");
+		expect(spawns).toBe(0);
+		expect(fs.readFileSync(paths.state, "utf8")).toBe(stateBytes);
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe(lockBytes);
+	});
+	test("blocks a promoted generation-3 hybrid with a zero-byte lock before controller routing", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 999,
+				incarnation: "linux:100",
+				ownerId: "promoted-generation-3",
+				acquisitionId: "promoted-generation-3",
+				ownershipPhase: "ready",
+				tokenFingerprint: tokenFingerprint("123456:secret-token"),
+				chatId: "42",
+				startedAt: 100,
+				heartbeatAt: 200,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: 3,
+			}),
+		);
+		fs.writeFileSync(paths.lock, "");
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: tokenFingerprint("123456:secret-token"),
+				chatId: "42",
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: () => "linux:100",
+			}),
+		).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		expect(fs.readFileSync(paths.lock, "utf8")).toBe("");
+	});
+	test("rejects numeric and hybrid pre-incarnation parent records", async () => {
+		for (const state of [{ generation: 2 }, { generation: 19 }] as const) {
+			const agentDir = tempAgentDir();
+			const s = setPrivateAgentDir(settings(agentDir), agentDir);
+			const paths = daemonPaths(agentDir);
+			fs.mkdirSync(paths.dir, { recursive: true });
+			fs.writeFileSync(
+				paths.state,
+				`${JSON.stringify({
+					pid: 999,
+					ownerId: "invalid-parent",
+					tokenFingerprint: tokenFingerprint("123456:secret-token"),
+					chatId: "42",
+					startedAt: 100,
+					heartbeatAt: 200,
+					roots: [],
+					version: DAEMON_VERSION,
+					...state,
+				})}\n`,
+			);
+			fs.writeFileSync(paths.lock, "");
+			await expect(
+				acquireDaemonOwnership({
+					settings: s,
+					tokenFingerprint: tokenFingerprint("123456:secret-token"),
+					chatId: "42",
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: () => "linux:100",
+				}),
+			).resolves.toEqual({ acquired: false, attached: false, blocked: true });
+		}
 	});
 	test("keeps post-incarnation generation records without provenance blocked", async () => {
 		const agentDir = tempAgentDir();
