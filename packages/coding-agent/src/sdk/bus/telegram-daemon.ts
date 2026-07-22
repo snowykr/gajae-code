@@ -998,6 +998,10 @@ function isLegacyParentDaemonState(state: unknown): state is LegacyParentDaemonS
 			candidate.stoppedAt === undefined,
 	);
 }
+function legacyOwnershipLockMatchesState(lock: OwnershipLockRead, state: unknown): boolean {
+	if (!isLegacyParentDaemonState(state) || lock.kind !== "legacy") return false;
+	return lock.metadata.pid === state.pid && lock.metadata.startedAt === state.startedAt;
+}
 
 function legacyMigrationAttestationPath(statePath: string): string {
 	return `${statePath}.legacy-migration.json`;
@@ -1313,11 +1317,7 @@ export async function acquireDaemonOwnership(input: {
 		// A pre-incarnation parent owns a legacy { pid, startedAt } lock. An exact
 		// state/lock pair is authority only to perform the bounded heartbeat
 		// attestation below; it is never attached or unlinked here.
-		const legacyParentLockMatches =
-			isLegacyParentDaemonState(rechecked) &&
-			recheckedLock.kind === "legacy" &&
-			recheckedLock.metadata.pid === rechecked.pid &&
-			recheckedLock.metadata.startedAt === rechecked.startedAt;
+		const legacyParentLockMatches = legacyOwnershipLockMatchesState(recheckedLock, rechecked);
 		const lockDecision =
 			stoppedLockMatches || legacyParentLockMatches
 				? undefined
