@@ -2474,7 +2474,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 	// A live v0.10 parent has no stable process authority on Windows. Never turn an
 	// unproven cooperative handoff into destructive cleanup or a replacement spawn.
 	if ((deps.platform ?? process.platform) === "win32") {
-		const parentState = await readDaemonState(input.settings, deps.fs);
+		const parentState: unknown = await readDaemonState(input.settings, deps.fs);
 		if (isParentDaemonState(parentState) && (deps.pidAlive ?? defaultPidAlive)(parentState.pid))
 			return "blocked_identity";
 	}
