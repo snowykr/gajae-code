@@ -24,6 +24,11 @@
 - Deep Interview now scopes provider-facing `ask` metadata to the persisted workflow stage, including after durable session resume: Round 0 advertises only the locked `intent_contract` branch, later rounds advertise ordinary and `intent_review` branches, foreign workflow gates cannot seed recorder state, and wire-valid empty positive-round reviews reach canonical Zod diagnostics while malformed authority remains fail-closed.
 - Bounded docs.rs rustdoc downloads, legacy cache reads, and gzip expansion before parsing or caching; transport-level content encoding is disabled and rejected so Bun cannot decompress outside the explicit output guard.
 
+### Added
+
+- Added SDK v3 prompt reconciliation through `turn.prompt_status` with caller-supplied `clientRef` correlation, bounded live-session lifecycle retention, reconnect-safe lookup, and explicit ordered non-replay semantics for `turn.prompt` (#2930).
+- Added `models.profiles.list` discovery of the effective built-in plus `models.yml` profile catalog, exact-ID pre-spawn validation that reloads host configuration for each lifecycle request, and structured `unknown_model_profile` / `model_profile_registry_error` details across lifecycle startup failures (#2931).
+
 ## [0.11.7] - 2026-07-22
 ### Added
 
