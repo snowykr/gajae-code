@@ -64,7 +64,7 @@ const EXPECTED_CJK: Record<string, string[]> = {
 	"cjk-ja-stream-working": ["未保存の変更があります。", "Enter で保存し、", "Esc でキャンセルします。"],
 	"cjk-zh-error-recovery": ["存在未保存的更改。", "按 Enter 保存，", "按 Esc 取消。"],
 	"cjk-mixed-preview-scroll": [
-		"작업 상태: 검토 대기 중입니다.",
+		"작업 상태: 준비 중입니다.",
 		"iTerm2 환경에서",
 		"출력 상태를 확인하세요.",
 		"Enter로 계속하고 Esc로 취소하세요.",
