@@ -253,7 +253,7 @@ describe("TUI raster lease public boundary", () => {
 	it("invalidates on generic render with erase first and callback once", async () => {
 		const { tui, terminal } = await setup();
 		let calls = 0;
-		const lease = await tui.acquireRasterLease(request("pet", rect(), "ERASE", () => calls++));
+		const lease = await tui.acquireRasterLease(request("pet", rect(), "\x1b[1;1H\x1b[2K", () => calls++));
 		expect(lease.status).toBe("acquired");
 		const component: Component = { render: () => ["PAYLOAD"], invalidate() {} };
 		tui.addChild(component);
@@ -261,8 +261,8 @@ describe("TUI raster lease public boundary", () => {
 		tui.start();
 		await terminal.waitForRender();
 		const output = terminal.getWriteLog().join("");
-		expect(output.indexOf("ERASE")).toBeGreaterThanOrEqual(0);
-		expect(output.indexOf("PAYLOAD")).toBeGreaterThan(output.indexOf("ERASE"));
+		expect(output).toContain("\x1b[?2026h\x1b7\x1b[?25l\x1b[1;1H\x1b[2K\x1b8");
+		expect(output.indexOf("PAYLOAD")).toBeGreaterThan(output.indexOf("\x1b[?2026l"));
 		expect(calls).toBe(1);
 		tui.stop();
 	});

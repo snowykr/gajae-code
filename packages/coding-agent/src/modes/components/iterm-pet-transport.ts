@@ -555,7 +555,7 @@ export class ItermPetTransport {
 		if (!clientId) return this.revoke("topology-ineligible");
 		let pane: PetTmuxResult;
 		try {
-			pane = result(await this.#tmux(["display-message", "-p", "-t", clientId, "#{pane_id}"]));
+			pane = result(await this.#tmux(["display-message", "-p", "-c", clientId, "#{pane_id}"]));
 		} catch {
 			if (!isCurrent()) return this.availability;
 			return this.revoke("topology-ineligible");

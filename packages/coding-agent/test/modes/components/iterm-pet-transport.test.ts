@@ -550,7 +550,7 @@ describe("iTerm Pet transport", () => {
 		expect((await probe).available).toBe(true);
 		expect(calls).toEqual([
 			["list-clients", "-t", "s", "-F", "#{client_name}\t#{client_tty}"],
-			["display-message", "-p", "-t", "/dev/ttys010", "#{pane_id}"],
+			["display-message", "-p", "-c", "/dev/ttys010", "#{pane_id}"],
 			["show-options", "-q", "-p", "-v", "-t", "%1", "allow-passthrough"],
 			["set-option", "-p", "-t", "%1", "allow-passthrough", "on"],
 			["show-options", "-A", "-p", "-v", "-t", "%1", "allow-passthrough"],

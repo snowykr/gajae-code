@@ -1482,10 +1482,12 @@ export class TUI extends Container {
 		if (pending.length > 0) return false;
 		if (affected.length === 0 && pending.length === 0) return this.#writeTerminal(buffer);
 		const queueId = ++this.#rasterQueueId;
-		const cleanup = [
-			...pending.map(r => new TextDecoder().decode(r.erase)),
-			...affected.map(lease => new TextDecoder().decode(lease.erase)),
-		].join("");
+		const cleanup = this.#cursorGuardedRasterSequence(
+			[
+				...pending.map(r => new TextDecoder().decode(r.erase)),
+				...affected.map(lease => new TextDecoder().decode(lease.erase)),
+			].join(""),
+		);
 		const ok = this.#guardTerminalOperation(() => this.terminal.write(cleanup + buffer));
 		if (!ok) {
 			this.#terminalUnavailable = true;
