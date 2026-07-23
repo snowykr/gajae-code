@@ -1,5 +1,6 @@
 /** Protocol-correct direct and managed iTerm2 Pet capability transport. */
 import { parseITerm2CapabilityReply, wrapITerm2RecordForTmux } from "@gajae-code/tui";
+import { resolveGjcTmuxCommand } from "../../gjc-runtime/tmux-common";
 export const PET_CAPABILITY_DRAIN_MAX_MS = 100;
 export const PET_CAPABILITY_QUIESCENCE_MS = 25;
 export const PET_CAPABILITY_QUERY_TIMEOUT_MS = 1000;
@@ -144,9 +145,10 @@ export function createNativePetTransport(o: {
 		notifyLifecycle: e =>
 			o.ui.notifyTerminalLifecycle({ ...e, source: "transport", terminalGeneration: o.ui.terminalGeneration }),
 	};
+	const tmuxCommand = managed ? resolveGjcTmuxCommand(env) : undefined;
 	const tmux: PetTmuxRunner | undefined = managed
 		? async argv => {
-				const p = Bun.spawn(["tmux", ...argv], { stdout: "pipe", stderr: "pipe" });
+				const p = Bun.spawn([tmuxCommand!, ...argv], { stdout: "pipe", stderr: "pipe" });
 				return {
 					status: await p.exited,
 					stdout: await new Response(p.stdout).text(),

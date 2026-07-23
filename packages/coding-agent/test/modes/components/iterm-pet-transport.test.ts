@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { PetTmuxResult, PetTmuxRunner } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
 import {
 	capabilityProbe,
@@ -8,8 +8,34 @@ import {
 	ItermPetTransport,
 	isItermCandidate,
 } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
+import type { Subprocess } from "bun";
 
 const ack = "\x1b]1337;Capabilities=F\x07";
+type SpawnCall = readonly string[];
+type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
+	Bun.SpawnOptions.Writable,
+	Bun.SpawnOptions.Readable,
+	Bun.SpawnOptions.Readable
+>;
+
+function createSpawnMock(calls: SpawnCall[]) {
+	function mockSpawn(options: SpawnOptions & { cmd: string[] }): Subprocess;
+	function mockSpawn(cmd: string[], options?: SpawnOptions): Subprocess;
+	function mockSpawn(first: string[] | (SpawnOptions & { cmd: string[] }), _second?: SpawnOptions): Subprocess {
+		calls.push(Array.isArray(first) ? first : first.cmd);
+		return {
+			pid: 1,
+			stdout: new Response("").body!,
+			stderr: new Response("").body!,
+			exited: Promise.resolve(1),
+		} as Subprocess;
+	}
+	return mockSpawn;
+}
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 class Clock {
 	nowMs = 0;
@@ -104,6 +130,25 @@ describe("iTerm Pet transport factory", () => {
 			},
 		});
 		expect(transport?.availability.mode).toBe("managed");
+	});
+	it("uses the shared tmux command override for managed sessions", async () => {
+		const calls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(calls));
+		const transport = createNativePetTransport({
+			ui: factoryUi,
+			env: {
+				TERM_PROGRAM: "iTerm.app",
+				TERM_PROGRAM_VERSION: "3.7",
+				TMUX_PANE: "%13",
+				GJC_TMUX_ACTIVE_SESSION: "session",
+				GJC_MANAGED_OWNER_RUN_ID: "run",
+				GJC_TMUX_COMMAND: "psmux",
+			},
+		});
+
+		await transport?.inspectManagedTopology();
+
+		expect(calls[0]?.[0]).toBe("psmux");
 	});
 
 	it("rejects tmux when a managed marker is missing", () => {
