@@ -116,10 +116,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let promptSocket: { send(message: string): void } | undefined;
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
-	let holdEndpointResponse = false;
-	let releaseEndpointResponse: (() => void) | undefined;
-	let rejectNextSessionClose = true;
-	let rejectNextPermissionModeSet = false;
+	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
+	let obscureNextSessionCloseOutcome = true;
+	let rejectNextSessionClose = false;
+	let holdPermissionModeSet = false;
+	let releasePermissionModeSet: (() => void) | undefined;
 
 	let server!: ReturnType<typeof Bun.serve>;
 	server = Bun.serve({
@@ -191,23 +192,30 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 									},
 								}),
 							);
-						if (holdEndpointResponse) {
-							releaseEndpointResponse = respond;
-							return;
-						}
 						respond();
 						return;
 					}
-					if (frame.operation === "session.close" && rejectNextSessionClose) {
+					if (frame.operation === "session.close") {
+						const idempotencyKey = String(frame.idempotencyKey);
+						const replay = sessionCloseLedger.get(idempotencyKey);
+						if (replay) {
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...replay }));
+							return;
+						}
+						if (obscureNextSessionCloseOutcome) {
+							obscureNextSessionCloseOutcome = false;
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: false }));
+							return;
+						}
+						const response = rejectNextSessionClose
+							? {
+									ok: false,
+									error: { code: "close_refused", message: "session close rejected" },
+								}
+							: { ok: true, result: {} };
 						rejectNextSessionClose = false;
-						socket.send(
-							JSON.stringify({
-								type: "broker_response",
-								id: frame.id,
-								ok: false,
-								error: { code: "close_refused", message: "session close rejected" },
-							}),
-						);
+						sessionCloseLedger.set(idempotencyKey, response);
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
 						return;
 					}
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
@@ -251,16 +259,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					);
 					return;
 				}
-				if (frame.operation === "permission_mode.set" && rejectNextPermissionModeSet) {
-					rejectNextPermissionModeSet = false;
-					socket.send(
-						JSON.stringify({
-							type: "control_response",
-							id: frame.id,
-							ok: false,
-							error: { code: "permission_mode_rejected", message: "permission mode rejected" },
-						}),
-					);
+				if (frame.operation === "permission_mode.set" && holdPermissionModeSet) {
+					releasePermissionModeSet = () => {
+						socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: {} }));
+					};
 					return;
 				}
 				if (frame.type === "control_request") {
@@ -538,57 +540,52 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		.slice(firstGenerationCloseStart);
 	expect(firstGenerationClose).toHaveLength(1);
 	const firstGenerationKey = firstGenerationClose[0].idempotencyKey;
-	rejectNextPermissionModeSet = true;
+
+	holdPermissionModeSet = true;
 	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 2 }];
-	await expect(loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] })).rejects.toMatchObject({
-		code: "permission_mode_rejected",
-	});
-	await bounded(loader.listSessions({ cwd }), "re-establish close scope");
-	const retryCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
-	await bounded(loader.closeSession({ sessionId: created.sessionId }), "first generation close retry");
-	const retryClose = brokerRequests.filter(request => request.operation === "session.close").slice(retryCloseStart);
-	expect(retryClose).toHaveLength(1);
-	expect(retryClose[0].idempotencyKey).toBe(firstGenerationKey);
-	const generationTwoAbort = new AbortController();
-	const generationTwoLoader = new AcpAgent(
-		{
-			sessionUpdate: async () => {},
-			signal: generationTwoAbort.signal,
-			closed: Promise.withResolvers<void>().promise,
-		} as unknown as AgentSideConnection,
-		{ agentDir },
+	const provisionalResume = loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
+	await waitFor(() => releasePermissionModeSet !== undefined, "held permission mode initialization");
+	const provisionalCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	const provisionalClose = loader.closeSession({ sessionId: created.sessionId });
+	expect(brokerRequests.filter(request => request.operation === "session.close")).toHaveLength(provisionalCloseStart);
+	holdPermissionModeSet = false;
+	releasePermissionModeSet!();
+	releasePermissionModeSet = undefined;
+	await expect(bounded(provisionalResume, "provisional attachment cancellation")).rejects.toThrow(
+		"closed while attaching",
 	);
+	await bounded(provisionalClose, "first generation close retry");
+	const provisionalCloseRequests = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(provisionalCloseStart);
+	expect(provisionalCloseRequests).toHaveLength(1);
+	expect(provisionalCloseRequests[0].idempotencyKey).toBe(firstGenerationKey);
+
 	await bounded(
-		generationTwoLoader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
 		"second generation attach",
 	);
+	rejectNextSessionClose = true;
 	const secondGenerationCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
-	await bounded(generationTwoLoader.closeSession({ sessionId: created.sessionId }), "second generation close");
+	await expect(loader.closeSession({ sessionId: created.sessionId })).rejects.toMatchObject({
+		code: "terminal_uncertain",
+	});
 	const secondGenerationClose = brokerRequests
 		.filter(request => request.operation === "session.close")
 		.slice(secondGenerationCloseStart);
 	expect(secondGenerationClose).toHaveLength(1);
-	expect(secondGenerationClose[0].idempotencyKey).not.toBe(firstGenerationKey);
-	generationTwoAbort.abort();
+	const secondGenerationKey = secondGenerationClose[0].idempotencyKey;
+	expect(secondGenerationKey).not.toBe(firstGenerationKey);
+
+	await bounded(loader.listSessions({ cwd }), "re-establish close scope after definitive rejection");
+	const definitiveRetryStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	await bounded(loader.closeSession({ sessionId: created.sessionId }), "definitive close retry");
+	const definitiveRetry = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(definitiveRetryStart);
+	expect(definitiveRetry).toHaveLength(1);
+	expect(definitiveRetry[0].idempotencyKey).not.toBe(secondGenerationKey);
 	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
-	const racingAbort = new AbortController();
-	const racingLoader = new AcpAgent(
-		{ signal: racingAbort.signal, closed: Promise.withResolvers<void>().promise } as unknown as AgentSideConnection,
-		{ agentDir },
-	);
-	await bounded(racingLoader.listSessions({ cwd }), "scope racing loader");
-	holdEndpointResponse = true;
-	const staleAttach = racingLoader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
-	await waitFor(() => releaseEndpointResponse !== undefined, "held endpoint response");
-	await bounded(racingLoader.closeSession({ sessionId: created.sessionId }), "close racing loader");
-	holdEndpointResponse = false;
-	releaseEndpointResponse!();
-	releaseEndpointResponse = undefined;
-	await expect(bounded(staleAttach, "stale attachment rejection")).rejects.toThrow("closed while attaching");
-	await expect(
-		racingLoader.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "stale" }] }),
-	).rejects.toThrow("Unsupported ACP session");
-	racingAbort.abort();
 
 	brokerSessions = [
 		{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 },

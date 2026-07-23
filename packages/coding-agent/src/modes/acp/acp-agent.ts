@@ -42,7 +42,7 @@ import {
 	AcpSdkAdapterError,
 } from "../../sdk/acp";
 import { ensureBroker } from "../../sdk/broker/ensure";
-import { readSdkBrokerDiscovery, SdkClient } from "../../sdk/client";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import { mapAgentWireEventPayloadToAcpSessionUpdates } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
 import type { AcpStartupOptions } from "./startup-options";
@@ -733,29 +733,21 @@ export class AcpAgent implements Agent {
 		return paginateAcpSessions(listed, params.cwd ?? undefined, this.#cursor(params.cursor));
 	}
 
-	async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
-		if (!cwd) return {};
+		if (!cwd) return Promise.resolve({});
 		const existing = this.#closing.get(params.sessionId);
 		if (existing) return existing;
-		const task = Promise.resolve().then(async () => {
-			this.#beginTeardown(params.sessionId);
-			try {
-				await this.#teardownSession(params.sessionId, "closed", true);
-				this.#knownSessionCwds.delete(params.sessionId);
-				return {};
-			} finally {
-				this.#finishTeardown(params.sessionId);
-			}
-		});
-		this.#closing.set(params.sessionId, task);
-		const cleanup = task.finally(() => {
-			if (this.#closing.get(params.sessionId) === task) this.#closing.delete(params.sessionId);
+		const deferred = Promise.withResolvers<CloseSessionResponse>();
+		this.#closing.set(params.sessionId, deferred.promise);
+		void this.#closeOwnedSession(params.sessionId).then(deferred.resolve, deferred.reject);
+		const cleanup = deferred.promise.finally(() => {
+			if (this.#closing.get(params.sessionId) === deferred.promise) this.#closing.delete(params.sessionId);
 		});
 		void cleanup.catch(() => undefined);
-		return task;
+		return deferred.promise;
 	}
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
@@ -945,6 +937,13 @@ export class AcpAgent implements Agent {
 		);
 	}
 
+	#isDefinitiveBrokerResponse(error: unknown): boolean {
+		// Response-derived client errors retain the broker error as details; transport failures do not.
+		if (!(error instanceof SdkClientError)) return false;
+		const details = object(error.details);
+		return details?.code === error.code && details.message === error.message;
+	}
+
 	async #attachExisting(id: string, cwd: string): Promise<void> {
 		const epoch = this.#sessionEpoch(id);
 		const attached = this.#sessions.get(id);
@@ -1118,6 +1117,21 @@ export class AcpAgent implements Agent {
 		this.#knownSessionCwds.delete(id);
 	}
 
+	async #closeOwnedSession(id: string): Promise<CloseSessionResponse> {
+		this.#beginTeardown(id);
+		try {
+			const attaching = this.#attaching.get(id);
+			// The record is published before permission initialization. Let a canceled
+			// provisional attachment retire it before selecting the generation key.
+			if (attaching) await Promise.allSettled([attaching.task]);
+			await this.#teardownSession(id, "closed", true);
+			this.#knownSessionCwds.delete(id);
+			return {};
+		} finally {
+			this.#finishTeardown(id);
+		}
+	}
+
 	/**
 	 * All local session disposal follows one path: remove ownership and reject a
 	 * waiting prompt before any awaited socket or broker work. A failed close is
@@ -1151,6 +1165,7 @@ export class AcpAgent implements Agent {
 				try {
 					await (await this.#brokerAdapter()).global("session.close", { sessionId: id }, closeIdempotencyKey);
 				} catch (error) {
+					if (this.#isDefinitiveBrokerResponse(error)) this.#pendingCloseIdempotencyKeys.delete(id);
 					if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
 				}
 			}
