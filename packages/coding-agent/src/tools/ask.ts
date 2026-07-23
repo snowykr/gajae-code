@@ -461,6 +461,7 @@ function recoverRoundZeroIntentContract(
 	const deepInterview = question.deepInterview;
 	const hasIntentContract = Object.hasOwn(deepInterview, "intent_contract");
 	const hasIntentReview = Object.hasOwn(deepInterview, "intent_review");
+	if (hasIntentContract && hasIntentReview && stage !== "topology") return { outcome: "reject" };
 	if (hasIntentContract !== hasIntentReview && askSchema.safeParse(normalizedArguments).success)
 		return { outcome: "passthrough" };
 

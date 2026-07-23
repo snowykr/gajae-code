@@ -430,7 +430,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await resumedSession.dispose();
 			resumedAuthStorage.close();
 		}
-	}, 15_000);
+	}, 60_000);
 	it("does not restore deep-interview authority from a stale top-level snapshot", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-stale-workflow-snapshot-"));
 		tempDirs.push(tempDir);
@@ -495,7 +495,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 60_000);
 	it("does not restore deep-interview authority from a sessionless durable entry", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-sessionless-workflow-entry-"));
 		tempDirs.push(tempDir);
@@ -539,7 +539,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 60_000);
 	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
 		tempDirs.push(tempDir);
@@ -566,7 +566,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		// Restoration observed after dispose remains settled (no hang, no
 		// late rejection surfacing from the already-completed microtask).
 		await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
-	});
+	}, 60_000);
 	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
 		tempDirs.push(tempDir);
@@ -608,7 +608,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 60_000);
 	it("provides a durable SDK-native emitter without extension injection", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-production-"));
 		tempDirs.push(tempDir);

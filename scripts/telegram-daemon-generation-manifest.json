@@ -1,5 +1,5 @@
 {
-  "contractVersion": 23,
+  "contractVersion": 24,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -527,10 +527,10 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "b6c3bc76bfce864386f91b8c174e0292782c2f5a44788e40226987d9885260f3",
-    "crates/pi-natives/src/ps.rs": "3c8a28d1daf84e91c3db0d29fa05a6231b871903800428ca1acbb2ddecea5f6b",
-    "crates/pi-shell/src/process.rs": "3f74458492c16fff24ecc234c74efd29d2a7f5f5c5a7c879c68b00a2e4f08274",
-    "packages/natives/native/index.d.ts": "1673d43bcb0c8b34ec2e67063a30d1a3b3a5102450104cc397bada65681d188e",
-    "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "72aac66e149e8a5e411728e2e17469a7c444b252e4fd776316461b8672de68c5"
+    "crates/pi-natives/src/path_identity.rs": "0eb1f5111bdcc8782ea7923d53f1e99c7ca95a01675c4be2ff5332c159dee8cd",
+    "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
+    "crates/pi-shell/src/process.rs": "627b5f43bc4e19cfd2d4b0a9907bd511ebeab07f6ea3c776872dd73805865aca",
+    "packages/natives/native/index.d.ts": "c61e02fd4712c822d30fb4b1496f064097a38718c9443bef526711f828165c50",
+    "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "cedd073107475b238757c6167129484ccec27fe49a2fb52b72f71592d78a7814"
   }
 }

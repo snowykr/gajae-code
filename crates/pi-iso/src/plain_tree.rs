@@ -1160,13 +1160,24 @@ mod platform {
 	impl DirectoryEntry {
 		fn matches(&self, information: &HandleInformation) -> bool {
 			let identity = identity_from_information(information);
-			self.file_id == identity.ino
-				&& self.end_of_file == identity.size
+			let kind_mask = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+			if self.file_id != identity.ino
+				|| self.attributes & kind_mask != information.basic.FileAttributes & kind_mask
+			{
+				return false;
+			}
+			let is_plain_directory = information.basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+				&& information.basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+			if is_plain_directory {
+				// NTFS updates a directory's parent-index metadata lazily, so the
+				// size/timestamps seen by enumeration can trail the open handle
+				// while contents were just written. The 64-bit file id plus the
+				// kind bits are the stable identity for plain directories.
+				return true;
+			}
+			self.end_of_file == identity.size
 				&& self.last_write_time == information.basic.LastWriteTime
 				&& self.change_time == information.basic.ChangeTime
-				&& self.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-					== information.basic.FileAttributes
-						& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
 		}
 	}
 
