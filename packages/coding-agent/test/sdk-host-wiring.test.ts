@@ -3091,7 +3091,7 @@ test("workflow gate recommendation projection marks only one exact hint without 
 		| undefined;
 	let terminalController: { completeGateInteractions: (gateId: string) => unknown } | undefined;
 	const workflowGate = {
-		isUnattended: () => true,
+		supportsRemoteGateAnswers: () => true,
 		onGateEmitted: (listener: typeof emitGate) => {
 			emitGate = listener;
 			return () => {};
@@ -3519,7 +3519,7 @@ test("SDK host omits direct workflow controls for a legacy workflow-gate emitter
 	dirs.push(cwd);
 	const sessionId = `legacy-workflow-gate-${Date.now()}`;
 	const legacyEmitter = {
-		isUnattended: () => true,
+		supportsRemoteGateAnswers: () => true,
 		emitGate: async () => undefined,
 		resolveGate: async () => ({
 			gate_id: "legacy-gate",

@@ -28,7 +28,14 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * startup recovery in generation 16, Telegram topic recovery authority fencing
  * in generation 17, fail-closed blank-token validation plus lifecycle-startup
  * stop fencing in generation 18, recommended ask metadata rendering in
- * generation 19, and authoritative terminal session-close delivery and cleanup
- * fencing in generation 20.
+ * generation 19, authoritative terminal session-close delivery and cleanup
+ * fencing, attested generation-bearing pre-incarnation owner handoff in
+ * generation 20, guarded modern generation-absent predecessor signaling in
+ * generation 21, dead Windows v0.10 owner replacement in generation 22, and
+ * retained native cleanup authority revalidation in generation 23, and typed
+ * retained exact-unlink cleanup authority acceptance (concrete detached
+ * quarantine plus proven canonical absence) in generation 24.
+ * Generation 25 adds startup dead-root prune + leak-artifact self-heal
+ * on TelegramNotificationDaemon.run (#2956).
  */
-export const DAEMON_GENERATION = 20;
+export const DAEMON_GENERATION = 25;

@@ -64,7 +64,7 @@ import {
 import type { NotificationSessionStatus } from "../../sdk/bus/session-control";
 import {
 	ensureTelegramDaemonRunningDetailed,
-	readDaemonState,
+	resolveTelegramSetupPreflight,
 	unregisterNotificationRoot,
 } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
@@ -226,6 +226,7 @@ export interface NotificationsEditorOperationDependencies {
 	sanitizeDiagnostic: typeof sanitizeDiagnostic;
 	ensureTelegramDaemonRunningDetailed: typeof ensureTelegramDaemonRunningDetailed;
 	runTelegramSetup: typeof runTelegramSetup;
+	resolveTelegramSetupPreflight: typeof resolveTelegramSetupPreflight;
 	proposedTelegramIdentity: typeof proposedTelegramIdentity;
 	reconcileCommittedTelegramConfiguration: typeof reconcileCommittedTelegramConfiguration;
 	saveTelegramInactive: typeof saveTelegramInactive;
@@ -250,6 +251,7 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	sanitizeDiagnostic,
 	ensureTelegramDaemonRunningDetailed,
 	runTelegramSetup,
+	resolveTelegramSetupPreflight,
 	proposedTelegramIdentity,
 	reconcileCommittedTelegramConfiguration,
 	saveTelegramInactive,
@@ -306,33 +308,8 @@ export function createNotificationsEditorOperations(
 			cwd: ctx.sessionManager.getCwd(),
 			sessionId: ctx.sessionManager.getSessionId(),
 		});
-	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> => {
-		const storedChatId = services.getNotificationConfig(ctx.settings).chatId;
-		try {
-			const state = await readDaemonState(ctx.settings);
-			const validPid = Number.isSafeInteger(state?.pid) && (state?.pid ?? 0) > 0;
-			if (!state || !validPid) return { storedChatId };
-			let live = false;
-			try {
-				process.kill(state.pid, 0);
-				live = true;
-			} catch (error) {
-				live = (error as NodeJS.ErrnoException).code === "EPERM";
-			}
-			return live
-				? {
-						storedChatId,
-						daemon: {
-							live,
-							tokenFingerprint: typeof state.tokenFingerprint === "string" ? state.tokenFingerprint : undefined,
-							chatId: typeof state.chatId === "string" && state.chatId.trim() ? state.chatId.trim() : undefined,
-						},
-					}
-				: { storedChatId };
-		} catch {
-			return { storedChatId };
-		}
-	};
+	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> =>
+		await services.resolveTelegramSetupPreflight(ctx.settings);
 
 	return {
 		loadState: async () => {
@@ -1694,6 +1671,14 @@ export class SelectorController {
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
 		this.showSelector(done => {
 			let modelSelector: ModelSelectorComponent;
+			const refreshRoleAssignments = () => {
+				modelSelector.refreshRoleAssignments({
+					currentModel: this.ctx.session.model,
+					currentThinkingLevel: this.ctx.session.thinkingLevel,
+					activeModelProfile:
+						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+				});
+			};
 			modelSelector = new ModelSelectorComponent(
 				this.ctx.ui,
 				this.ctx.session.model,
@@ -1701,6 +1686,8 @@ export class SelectorController {
 				this.ctx.session.modelRegistry,
 				this.ctx.session.scopedModels,
 				async selection => {
+					const isTrackedSingleAssignment =
+						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;
 					try {
 						if (selection.kind === "createProfile") {
 							done();
@@ -1741,7 +1728,7 @@ export class SelectorController {
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
 							done();
 							this.ctx.ui.requestRender();
-						} else if (selection.roles) {
+						} else if (selection.roles !== undefined) {
 							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
 							const includesDefault = targetRoles.includes("default");
 							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
@@ -1819,25 +1806,23 @@ export class SelectorController {
 								selectedSelector ?? `${model.provider}/${model.id}`,
 								thinkingLevel,
 							);
-							materializeActiveModelProfileAssignment({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								role,
-								selector: value,
-							});
+							if (
+								!materializeActiveModelProfileAssignment({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									role,
+									selector: value,
+								})
+							) {
+								this.ctx.settings.setModelRole(role, value);
+							}
 							if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
 								this.ctx.session.setThinkingLevel(thinkingLevel);
 							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
+							refreshRoleAssignments();
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
-							done();
 							this.ctx.ui.requestRender();
 						} else {
 							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
@@ -1860,22 +1845,21 @@ export class SelectorController {
 									this.ctx.settings.setAgentModelOverride(role, value);
 								}
 							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
+							refreshRoleAssignments();
 							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							await this.ctx.notifyConfigChanged?.();
 							this.ctx.showStatus(`${role} agent model: ${value}`);
-							done();
 							this.ctx.ui.requestRender();
 						}
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						if (isTrackedSingleAssignment) {
+							refreshRoleAssignments();
+							this.ctx.ui.requestRender();
+							throw error;
+						}
 					}
 				},
 				() => {
