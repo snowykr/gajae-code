@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 24;
+export const GUARD_CONTRACT_VERSION = 25;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -35,7 +35,7 @@ const nativeAuthorityDeclarations = {
 		"exact_remove_directory_tree",
 	],
 	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
-	"crates/pi-shell/src/process.rs": ["kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
 	"packages/natives/native/index.d.ts": ["Process"],
 	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
 } as const;
@@ -191,7 +191,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 24) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 25) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -679,7 +679,7 @@ function rustDeclaration(source: string, selector: string): Declaration {
 		? "#\\[napi\\](?:\\s*#\\[[^\\]]+\\])*\\s*impl\\s+Process\\b"
 		: declarationName === "impl Process"
 			? "impl\\s+Process\\b"
-			: `(?:#\\[[^\\]]+\\]\\s*)*pub\\s+(?:async\\s+)?fn\\s+${declarationName}\\b`;
+			: `(?:#\\[[^\\]]+\\]\\s*)*pub(?:\\(super\\))?\\s+(?:async\\s+)?fn\\s+${declarationName}\\b`;
 	const pattern = new RegExp(prefix, "g");
 	const matches = [...lexical.code.matchAll(pattern)];
 	if (matches.length === 0) return undefined;

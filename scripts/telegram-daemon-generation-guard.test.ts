@@ -99,7 +99,7 @@ const nativeAuthoritySources = {
 		"exact_remove_directory_tree",
 	],
 	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
-	"crates/pi-shell/src/process.rs": ["kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
 	"packages/natives/native/index.d.ts": ["Process"],
 	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
 } as const;
@@ -108,10 +108,16 @@ function nativeAuthorityFiles(): Array<[string, string]> {
 	return [
 		[
 			"crates/pi-natives/src/path_identity.rs",
-			nativeAuthoritySources["crates/pi-natives/src/path_identity.rs"].map(name => `pub fn ${name}() {}`).join("\n"),
+			[
+				...nativeAuthoritySources["crates/pi-natives/src/path_identity.rs"].map(name => `pub fn ${name}() {}`),
+				`mod platform {\n${nativeAuthoritySources["crates/pi-natives/src/path_identity.rs"].map(name => `\tpub(super) fn ${name}() {}`).join("\n")}\n}`,
+			].join("\n"),
 		],
 		["crates/pi-natives/src/ps.rs", "#[napi]\nimpl Process {}"],
-		["crates/pi-shell/src/process.rs", "impl Process {}\npub fn kill_process_group() {}\npub fn current_descendant_pids() {}\npub fn add_new_descendants() {}"],
+		[
+			"crates/pi-shell/src/process.rs",
+			"impl Process { pub fn incarnation(&self) {} }\npub fn kill_process_group() {}\npub fn current_descendant_pids() {}\npub fn add_new_descendants() {}",
+		],
 		["packages/natives/native/index.d.ts", "export declare class Process {}"],
 		["packages/coding-agent/src/sdk/broker/process-incarnation.ts", "export function isProcessIncarnation() {}\nexport function processIncarnation() {}"],
 	];
@@ -517,6 +523,36 @@ test("fails closed when a protected native authority declaration is missing or m
 	malformed.set(source, "export function isProcessIncarnation() {}\nexport function processIncarnation( {");
 	expect(decide(base, malformed).malformedDeclarations).toContain(source + ":authority");
 });
+	test("hashes restricted native path implementations behind public wrappers", () => {
+		const source = "crates/pi-natives/src/path_identity.rs";
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		const head = new Map(base);
+		head.set(
+			source,
+			(head.get(source) ?? "").replace(
+				"pub(super) fn apply_owner_only_path_security() {}",
+				"pub(super) fn apply_owner_only_path_security() { let changed = true; }",
+			),
+		);
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([
+			"telegram:" + source + ":authority",
+			"discord:" + source + ":authority",
+			"slack:" + source + ":authority",
+		]);
+	});
+
+	test("hashes core Process methods used by daemon control", () => {
+		const source = "crates/pi-shell/src/process.rs";
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		const head = new Map(base);
+		head.set(source, (head.get(source) ?? "").replace("pub fn incarnation(&self) {}", "pub fn incarnation(&self) { let changed = true; }"));
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([
+			"telegram:" + source + ":authority",
+			"discord:" + source + ":authority",
+			"slack:" + source + ":authority",
+		]);
+	});
+
 	test("hashes every Rust platform implementation and lexes declaration braces", () => {
 		const source = "crates/pi-shell/src/process.rs";
 		const platformSource = [
