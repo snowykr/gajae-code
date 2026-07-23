@@ -25,6 +25,7 @@ function makeStubs(columns = 80, rows = 30) {
 		},
 		invalidate() {},
 	} as unknown as CustomEditor;
+	let renderRequests = 0;
 	let emitter: (() => string | null) | undefined;
 	let available = true;
 	let failWrites = false;
@@ -56,7 +57,7 @@ function makeStubs(columns = 80, rows = 30) {
 		},
 	};
 	const ui = {
-		requestRender: () => {},
+		requestRender: () => renderRequests++,
 		setPostRenderEmitter: (fn?: () => string | null) => {
 			emitter = fn;
 		},
@@ -116,6 +117,7 @@ function makeStubs(columns = 80, rows = 30) {
 		written,
 		getEmitter: () => emitter,
 		getRenderedWidth: () => renderedWidth,
+		getRenderRequestCount: () => renderRequests,
 		setTerminalSize: (nextColumns: number, nextRows: number) => {
 			terminal.columns = nextColumns;
 			terminal.rows = nextRows;
@@ -778,9 +780,11 @@ describe("GajaePetWidget", () => {
 			const previousRecordCount = stubs.getRasterOutputs().length;
 			expect(stubs.getRenderedWidth()).toBe(75);
 
+			const renderRequestsBeforeResize = stubs.getRenderRequestCount();
 			setCellDimensions({ widthPx: 18, heightPx: 18 });
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
+			expect(stubs.getRenderRequestCount()).toBeGreaterThan(renderRequestsBeforeResize);
 			stubs.editorContainer.render(80);
 			const resizedRecords = stubs
 				.getRasterOutputs()

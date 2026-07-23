@@ -446,6 +446,7 @@ export class GajaePetWidget {
 			this.#builtCellW = cell.widthPx;
 			this.#builtCellH = cell.heightPx;
 			this.#framedEditor.setReserve(pixelColumns + PET_SIDE_MARGIN);
+			this.#ui.requestRender(true);
 		}
 		// iTerm uses the same framed-editor invariant as the other pixel protocols.
 		if (!this.#framedEditor.canFit(this.#ui.terminal.columns)) {
