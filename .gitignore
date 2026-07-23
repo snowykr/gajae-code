@@ -86,3 +86,10 @@ packages/coding-agent/binaries/
 
 # Python SDK build output
 python/gjc-sdk/build/
+/artifacts/g003-qa-report.json
+/artifacts/g011-qa-report.json
+/artifacts/g014-qa-report.json
+/artifacts/g015-qa-report.json
+/artifacts/ultragoal-g003-iterm-size-test-report.json
+/artifacts/ultragoal-g003-quality-gate.json
+/artifacts/ultragoal-g003-review-receipts.json
