@@ -117,7 +117,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let abortAcknowledged = true;
 	let promptDeliveredWhileBusy = false;
 	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
-	let obscureNextSessionCloseOutcome = true;
+	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
 	let holdPermissionModeSet = false;
 	let releasePermissionModeSet: (() => void) | undefined;
@@ -199,12 +199,24 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						const idempotencyKey = String(frame.idempotencyKey);
 						const replay = sessionCloseLedger.get(idempotencyKey);
 						if (replay) {
-							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...replay }));
+							const replayError = replay.error as Record<string, unknown> | undefined;
+							const response = replayError?.code === "terminal_uncertain" ? { ok: true, result: {} } : replay;
+							sessionCloseLedger.set(idempotencyKey, response);
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
 							return;
 						}
-						if (obscureNextSessionCloseOutcome) {
-							obscureNextSessionCloseOutcome = false;
-							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: false }));
+						if (makeNextSessionCloseUncertain) {
+							makeNextSessionCloseUncertain = false;
+							const response = {
+								ok: false,
+								error: {
+									code: "terminal_uncertain",
+									message: "session close outcome is uncertain",
+									cleanup: {},
+								},
+							};
+							sessionCloseLedger.set(idempotencyKey, response);
+							socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...response }));
 							return;
 						}
 						const response = rejectNextSessionClose

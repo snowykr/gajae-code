@@ -938,10 +938,12 @@ export class AcpAgent implements Agent {
 	}
 
 	#isDefinitiveBrokerResponse(error: unknown): boolean {
-		// Response-derived client errors retain the broker error as details; transport failures do not.
+		// Response-derived client errors retain the broker error as details. Responses
+		// that represent ongoing or ambiguous lifecycle work must keep their key.
 		if (!(error instanceof SdkClientError)) return false;
 		const details = object(error.details);
-		return details?.code === error.code && details.message === error.message;
+		if (details?.code !== error.code || details.message !== error.message) return false;
+		return !["terminal_uncertain", "cleanup_pending", "broker_restarting", "unavailable"].includes(error.code);
 	}
 
 	async #attachExisting(id: string, cwd: string): Promise<void> {
