@@ -2,11 +2,11 @@
 
 ## Workflow branch and sources
 
-This surface uses the **extract existing system first** branch from
-[`docs/ui-design-visual-qa.md`](../../../../docs/ui-design-visual-qa.md). The
-rules below are extracted from the current settings selector and shared TUI
-components; they are first-party implementation guidance, not a third-party
-reference or a screenshot substitute.
+This surface selects the **Existing design system** branch from
+[`docs/ui-design-visual-qa.md`](../../../../docs/ui-design-visual-qa.md).
+The rules below extend the current settings selector, shared TUI components,
+and Pet/composer integration; they are first-party implementation guidance,
+not a third-party reference or a screenshot substitute.
 
 Source material:
 
@@ -14,6 +14,10 @@ Source material:
 - `components/provider-onboarding-selector.ts` and `components/dynamic-border.ts`
 - the status-line custom editor embedded in `components/settings-selector.ts`
 - `../theme/theme.ts` and `../shared.ts`
+- `components/gajae-pet-widget.ts`, `components/pet-capability.ts`, and
+  `components/tool-execution.ts`
+- `test/gajae-pet-tui-integration.test.ts` and
+  `packages/tui/test/virtual-terminal.ts`
 - `packages/tui/src/components/tab-bar.ts`, `settings-list.ts`, `select-list.ts`,
   and `input.ts`
 
@@ -154,6 +158,136 @@ terminal cells. Captures include the whole terminal surface for each state.
 - **160×48:** retain the same hierarchy and terminal density while exposing the
   full status/help detail and all relevant scroll positions. It is not a
   different desktop layout.
+## Pet renderer visual-QA contract
+
+The Pet follow-up reuses the existing terminal-cell grammar and the live
+`TUI`, `GajaePetWidget`, `CustomEditor`, `ToolExecutionComponent`, durable
+history, and xterm harness. The Pet is an overlay, never a second renderer:
+the shared composer/transcript transaction commits first and the pixel payload
+is emitted afterward as exempt physical output. A failed shared commit MUST
+not emit an overlay; a failed overlay MUST remain retryable without rewriting
+shared history.
+
+- **Semantics:** `off` is an explicit, useful state. Supported `red` and `blue`
+  modes retain the composer meaning, working state, tool identity, and visible
+  status in text; the sprite is supplementary and never the only progress,
+  error, selection, or completion signal. Tool output and durable-history
+  snapshots remain readable when the Pet is unavailable.
+- **Reservation:** active Pet mode reserves only the measured sprite width plus
+  its one-cell side margin beside the composer. The editor renders at the
+  reduced width, and the Pet hides without changing composer semantics when the
+  viewport cannot fit the reservation. At 80×24 the composer and focused input
+  remain visible; at 120×36 and 160×48 the same hierarchy and density apply,
+  with additional rows exposing history/tool detail rather than decorative
+  padding.
+- **Transactions and durable history:** shared primary/page/follow writes are
+  tagged and committed through the real TUI transaction path. Sixel/Kitty
+  placement and cleanup are exempt physical writes, never durable transcript
+  bytes. Tool checkpoints use a stable call identity and revision; replay
+  acknowledges only the delivered revision. Cleanup after disable, resize,
+  terminal unavailability, and dispose is idempotent and retried after
+  recovery.
+- **Accessibility and no motion:** text names the Pet mode, protocol
+  availability, working/tool state, and recovery action. ASCII/no-color output
+  keeps cursor, borders, labels, and state words; it does not depend on hue,
+  image payloads, or animation. Visual-QA captures use `autoFlexGapMs: null`
+  and fixed state transitions. No-motion output is a discrete frame with no
+  spinner or animation-only meaning.
+- **CJK:** measure terminal cells, not JavaScript string length; normalize
+  editable composer text to NFC and keep grapheme clusters intact. Korean,
+  Japanese, Chinese, and mixed CJK/Latin copy may break only at the fixture's
+  declared semantic boundaries. Action labels, status names, tool identifiers,
+  code/config spans, and masked values are protected spans and MUST stay whole.
+  A semantic break through a protected span is a blocking visual-QA defect.
+
+The canonical matrix is exported by
+`test/fixtures/tui/pet-renderer-visual-showcase.ts`. It is ordered by the
+stable state key, profile, capability, viewport key, render mode, and declared
+checkpoint sequence. It covers **80×24**, **120×36**, and **160×48** and
+self-validates entry uniqueness and its expected count before a harness can
+consume it. Captures are live xterm/TUI evidence; they MUST NOT replace the
+real Pet/composer/tool/history render with placeholder strings and MUST NOT
+publish raw PTY bytes.
+## Visual-QA publication and canonical review receipt
+
+The capture artifact is an immutable, sanitized allowlist only. It MUST NOT contain
+`independent-review.json`, a review body, raw PTY bytes, or a wholesale `.gjc`
+tree. After the sanitized artifact upload, publish a separate reviewable descriptor
+Actions artifact archive containing `visual-qa-descriptor.json`. The descriptor records
+`schema_version`, `owner`, `repo`, `pr_number`, `pr_node_id`, exact
+`head_repository`/`base_repository` identities and repository IDs, exact `head_sha` and
+`base_sha`, `manifest_sha256`, `manifest_entry_count`, immutable capture `artifact_id`
+and `artifact_name`, capture `artifact_url`, uploaded artifact `artifact_sha256`,
+`artifact_byte_length`, `retention_days`, `workflow_run_id`, `workflow_run_attempt`,
+and `run_url` (plus archive digest/length and explicit `raw_pty_published: false`
+metadata). The descriptor archive is safe metadata; it is not a review receipt or a
+direct JSON URL.
+
+Descriptor and capture artifact names MUST include both the workflow run ID and
+run attempt, and publication MUST omit replacement configuration.
+The publisher MUST compare the immutable artifact ID, attempt-unique artifact
+name, workflow run ID, workflow head SHA, and head/base repository IDs with the
+Actions artifacts API before emitting the descriptor. This binds the descriptor
+to the exact repository, head, and base rather than to a replaceable artifact
+name.
+
+The canonical descriptor locator emitted by the workflow is the immutable
+Actions artifact ID and its run-scoped Actions URL:
+`https://github.com/{owner}/{repo}/actions/runs/{workflow_run_id}/artifacts/{descriptor_artifact_id}`.
+This URL identifies the descriptor archive, whose extracted member is
+`visual-qa-descriptor.json`; it is not a direct JSON endpoint. Record the URL,
+artifact ID, archive name, and digest. The repository-bound verifier resolver MUST
+reject an off-origin or mismatched repository/run/artifact locator before any
+request, then use authenticated GitHub Actions API metadata, archive download,
+and safe extraction. It MUST reject name-based/latest, local-file, inline-object,
+direct-JSON, or substituted links. Successful verification MUST include the
+descriptor artifact provenance returned from that canonical Actions lookup. The
+descriptor archive route is separate from the canonical authenticated numeric
+review ID; the review ID remains the only review receipt transport.
+
+After independently downloading and checking the descriptor and immutable
+capture, the unaffiliated reviewer submits one authenticated, approved GitHub
+PR review. The immutable numeric review ID is the canonical receipt transport;
+the verifier does not trust a copied URL, review body, login, or self-attested
+receipt fields. It fetches
+`GET /repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}` using a
+read-only authenticated token and rejects a missing, edited, cross-PR, or
+unauthenticated review. A passing review requires the API review's `id`,
+`node_id`, canonical `html_url`, `state: APPROVED`, reviewer `user.id` and
+`user.node_id`, and non-null `commit_id`. That authenticated commit, the
+descriptor `head_sha`, and the final canonical PR `head.sha` must be the same
+full SHA; the base SHA, repository, PR, manifest digest/count, and safe
+capture contents must also match. Review identity MUST be distinct from the
+workflow executor, canonical PR author, and every API-resolved PR commit
+author.
+
+Run the exact verifier invocation after publication and review. Pass only the
+canonical run-scoped Actions artifact URL or a repository-qualified immutable
+descriptor artifact ID; do not pass a local file, inline object, or direct JSON
+URL. The verifier validates the descriptor's head/base repository names and
+immutable IDs against both the canonical PR and workflow-run PR before downloading
+the capture artifact:
+
+```sh
+GITHUB_TOKEN="$READ_ONLY_GITHUB_TOKEN" \
+bun packages/coding-agent/scripts/verify-pet-renderer-visual-publication.ts \
+  --repository <owner/name> \
+  --pr <number> \
+  --descriptor <descriptor-actions-artifact-url-or-repository-qualified-id> \
+  --review-id <immutable-review-id>
+```
+
+The evidence record must preserve the descriptor Actions artifact archive URL,
+immutable descriptor artifact ID/name/digest, sanitized capture Actions artifact
+URL/name and immutable capture artifact ID, workflow run ID/attempt and run URL,
+repository/PR number and node ID, exact head/base, manifest SHA-256/count,
+and the verifier result (`verified: true`, `final_head_sha`, `review_id`, and
+`review_node_id`). The authenticated review evidence fields are `review_id`,
+`review_node_id`, `review_url`, `state`, `reviewer_id`, `reviewer_node_id`, and
+`review_commit_id`; retain the reviewed state/CJK coverage and scope separately
+as human inspection evidence. Missing or stale fields are a fail-closed block;
+a copied review URL, reviewer assertion, login, or commit-author claim is not
+independent evidence.
 
 ## Notifications editor contract (Work item 7 consumer)
 
@@ -253,11 +387,11 @@ root `manifest.json` lists all 108 entries and the SHA-256/byte length of every
 entry file. Metadata records replay source, terminal size, fixed fixture
 capture timestamp, rendering assumptions, wrapping policy, and capture mode.
 
-Regenerate captures, inspect all relevant scroll positions, and obtain an
-independent-review receipt at
-`.gjc/qa/issue-2050-notifications/independent-review.json`. The reviewer must
-not be the implementing executor. That receipt must use the plan's schema and
-record both manifest counts as 108 plus CJK review results.
+Regenerate captures, inspect all relevant scroll positions, and obtain the
+authenticated review receipt through the separate descriptor/review flow above.
+The reviewer must not be the implementing executor. The receipt must use the
+canonical review transport and record both manifest counts as 108 plus CJK
+review results; it is not stored in the immutable capture artifact.
 
 No raw third-party design corpus, screenshot, or reference asset is stored by
 this workflow.

@@ -47,6 +47,11 @@ packages/ai/test/.temp-images/
 !.gjc/skills/
 !.gjc/skills/**
 .gjc/plugins/
+.gjc/qa/
+/artifacts/g009-ghostty-pty-capture.txt
+/artifacts/g009-ghostty-manual-validation.json
+/artifacts/g015-qa-report.json
+/artifacts/g011-qa-report.json
 .gjc/context/
 .gjc/interviews/
 .gjc/plans/

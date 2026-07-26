@@ -1,0 +1,484 @@
+name: Pet renderer visual QA
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number whose canonical head/base must match the supplied SHAs.
+        required: true
+        type: string
+      head_repository:
+        description: Exact owner/repository containing the PR head commit.
+        required: true
+        type: string
+      head_sha:
+        description: Exact 40-hex PR head commit SHA.
+        required: true
+        type: string
+      base_repository:
+        description: Exact owner/repository containing the PR base commit.
+        required: true
+        type: string
+      base_sha:
+        description: Exact 40-hex PR base commit SHA.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: pet-renderer-visual-qa-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event.pull_request.head.sha || inputs.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Capture exact PR visual evidence
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || inputs.head_repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+      BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || inputs.base_repository }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+      GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+      ARTIFACT_NAME: pet-renderer-visual-qa-${{ github.run_id }}-${{ github.run_attempt }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      CAPTURE_ROOT: .gjc/qa/pet-renderer-visual-showcase/${{ github.event.pull_request.head.sha || inputs.head_sha }}
+      UPLOAD_ROOT: ${{ github.workspace }}/.pet-renderer-visual-qa-upload
+      RETENTION_DAYS: "7"
+    steps:
+
+      - name: Checkout exact PR head
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || inputs.head_repository }}
+          ref: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prove checkout and base object
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out="$(git rev-parse HEAD)"
+          [[ "$checked_out" == "$HEAD_SHA" ]] || { echo "Checked-out SHA $checked_out does not equal $HEAD_SHA"; exit 1; }
+          git fetch --no-tags --depth=1 "https://github.com/$BASE_REPOSITORY.git" "$BASE_SHA"
+          git cat-file -e "$BASE_SHA^{commit}"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install locked capture dependencies
+        run: bun install --frozen-lockfile
+      - name: Build native renderer dependency
+        run: bun --cwd=packages/natives run build
+      - name: Restore generated native declaration and prove tracked source is clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          git restore -- packages/natives/native/index.d.ts
+          if ! git diff --quiet HEAD --; then
+            echo "Tracked source diff remains after restoring generated native declaration:"
+            git diff --name-status HEAD --
+            exit 1
+          fi
+
+      - name: Capture sanitized visual showcase
+        shell: bash
+        env:
+          GITHUB_HEAD_SHA: ${{ env.HEAD_SHA }}
+          GITHUB_BASE_SHA: ${{ env.BASE_SHA }}
+        run: |
+          set -euo pipefail
+          rm -rf "$UPLOAD_ROOT"
+          mkdir -p "$UPLOAD_ROOT"
+          mkdir -p .gjc
+          test ! -e artifacts/g009-ghostty-pty-capture.txt
+          test ! -e "$CAPTURE_ROOT"
+          bun packages/coding-agent/scripts/capture-pet-renderer-visual-showcase.ts \
+            --head "$GITHUB_HEAD_SHA" \
+            --base "$GITHUB_BASE_SHA" \
+            --output "$CAPTURE_ROOT"
+          test -f "$CAPTURE_ROOT/manifest.json"
+          test -f "$CAPTURE_ROOT/visual-review-input.json"
+
+      - name: Stage explicit sanitized allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$UPLOAD_ROOT/sanitized"
+          mkdir -p "$stage"
+          symlink="$(find "$CAPTURE_ROOT" -type l -print -quit)"
+          test -z "$symlink" || { echo "Symlink in capture output: $symlink"; exit 1; }
+          while IFS= read -r -d '' file; do
+            relative="${file#"$CAPTURE_ROOT/"}"
+            case "$relative" in
+              manifest.json|visual-review-input.json|*/terminal.txt|*/terminal-ansi.txt|*/terminal.html|*/metadata.json)
+                mkdir -p "$stage/$(dirname "$relative")"
+                cp -- "$file" "$stage/$relative"
+                ;;
+              *)
+                echo "Unexpected capture output is not allowlisted: $relative"
+                exit 1
+                ;;
+            esac
+          done < <(find "$CAPTURE_ROOT" -type f -print0)
+          test -f "$stage/manifest.json"
+          test -f "$stage/visual-review-input.json"
+          test ! -e "$stage/artifacts/g009-ghostty-pty-capture.txt"
+          test ! -e "$stage/.gjc"
+          tar -C "$stage" -czf "$UPLOAD_ROOT/pet-renderer-visual-qa.tar.gz" .
+          archive_sha256="$(sha256sum "$UPLOAD_ROOT/pet-renderer-visual-qa.tar.gz" | cut -d ' ' -f 1)"
+          cat > "$UPLOAD_ROOT/artifact-metadata.json" <<EOF
+          {
+            "schema_version": 1,
+            "artifact_name": "$ARTIFACT_NAME",
+            "workflow_run_id": $GITHUB_RUN_ID,
+            "workflow_run_attempt": $RUN_ATTEMPT,
+            "archive": "pet-renderer-visual-qa.tar.gz",
+            "archive_sha256": "$archive_sha256",
+            "retention_days": $RETENTION_DAYS,
+            "repository": "$GITHUB_REPOSITORY_NAME",
+            "pr_number": $PR_NUMBER,
+            "head_repository": "$HEAD_REPOSITORY",
+            "head_sha": "$HEAD_SHA",
+            "base_repository": "$BASE_REPOSITORY",
+            "base_sha": "$BASE_SHA",
+            "sanitized_allowlist": ["manifest.json", "visual-review-input.json", "*/terminal.txt", "*/terminal-ansi.txt", "*/terminal.html", "*/metadata.json", "pet-renderer-visual-qa.tar.gz"],
+            "raw_pty_published": false,
+            "gjc_published": false
+          }
+          EOF
+          tar_entries="$(tar -tzf "$UPLOAD_ROOT/pet-renderer-visual-qa.tar.gz")"
+          while IFS= read -r entry; do
+            case "$entry" in
+              ./|./*/|./manifest.json|./visual-review-input.json|./*/terminal.txt|./*/terminal-ansi.txt|./*/terminal.html|./*/metadata.json) ;;
+              *) echo "Unexpected archive entry: $entry"; exit 1 ;;
+            esac
+          done <<< "$tar_entries"
+          cp -- "$UPLOAD_ROOT/pet-renderer-visual-qa.tar.gz" "$stage/pet-renderer-visual-qa.tar.gz"
+
+      - name: Upload sanitized visual-QA artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.UPLOAD_ROOT }}/sanitized
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record artifact retention and digest metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat "$UPLOAD_ROOT/artifact-metadata.json"
+          {
+            echo "## Pet renderer visual-QA artifact"
+            echo "- Artifact: \\`${{ steps.upload.outputs.artifact-url }}\\`"
+            echo "- Retention days: $RETENTION_DAYS"
+            echo "- Upload digest: \\`${{ steps.upload.outputs.artifact-digest }}\\`"
+            echo "- Staged archive SHA-256: \\`$(sha256sum "$UPLOAD_ROOT/pet-renderer-visual-qa.tar.gz" | cut -d ' ' -f 1)\\`"
+            echo "- Exact head: \\`$HEAD_SHA\\`"
+            echo "- Exact base: \\`$BASE_SHA\\`"
+            echo "- Raw PTY published: \\`false\\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  publish:
+    name: Validate and publish verified visual-QA descriptor
+    needs: capture
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || inputs.head_repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+      BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name || inputs.base_repository }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+      GITHUB_REPOSITORY_NAME: ${{ github.repository }}
+      WORKFLOW_EVENT_NAME: ${{ github.event_name }}
+      WORKFLOW_REF_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      ARTIFACT_NAME: pet-renderer-visual-qa-${{ github.run_id }}-${{ github.run_attempt }}
+      DESCRIPTOR_ARTIFACT_NAME: pet-renderer-visual-qa-descriptor-${{ github.run_id }}-${{ github.run_attempt }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      DOWNLOAD_ROOT: ${{ github.workspace }}/.pet-renderer-visual-qa
+      UPLOAD_ROOT: ${{ github.workspace }}/.pet-renderer-visual-qa-publication
+      RETENTION_DAYS: "7"
+    steps:
+      - name: Validate canonical PR and exact head/base inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha='^[0-9a-f]{40}$'
+          repo='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "PR number is invalid"; exit 1; }
+          [[ "$HEAD_SHA" =~ $sha ]] || { echo "Head SHA must be an exact lowercase 40-hex commit"; exit 1; }
+          [[ "$BASE_SHA" =~ $sha ]] || { echo "Base SHA must be an exact lowercase 40-hex commit"; exit 1; }
+          [[ "$HEAD_REPOSITORY" =~ $repo ]] || { echo "Head repository is invalid"; exit 1; }
+          [[ "$BASE_REPOSITORY" =~ $repo ]] || { echo "Base repository is invalid"; exit 1; }
+          [[ "$BASE_REPOSITORY" == "$GITHUB_REPOSITORY_NAME" ]] || { echo "PR base repository must be this repository"; exit 1; }
+          case "$WORKFLOW_EVENT_NAME" in
+            pull_request)
+              [[ "$WORKFLOW_REF_SHA" =~ $sha ]] || { echo "Pull request workflow ref SHA must be an exact lowercase 40-hex commit"; exit 1; }
+              [[ "$WORKFLOW_REF_SHA" == "$HEAD_SHA" ]] || { echo "Pull request workflow ref SHA differs from exact PR head"; exit 1; }
+              ;;
+            workflow_dispatch)
+              [[ "$WORKFLOW_REF_SHA" =~ $sha ]] || { echo "Workflow dispatch ref SHA must be an exact lowercase 40-hex commit"; exit 1; }
+              ;;
+            *)
+              echo "Unsupported workflow event: $WORKFLOW_EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
+          api_prefix="repos/$GITHUB_REPOSITORY_NAME/pulls/$PR_NUMBER"
+          api_head="$(gh api "$api_prefix" --jq '.head.sha')"
+          api_base="$(gh api "$api_prefix" --jq '.base.sha')"
+          api_head_repo="$(gh api "$api_prefix" --jq '.head.repo.full_name')"
+          api_base_repo="$(gh api "$api_prefix" --jq '.base.repo.full_name')"
+          api_head_repo_id="$(gh api "$api_prefix" --jq '.head.repo.id')"
+          api_base_repo_id="$(gh api "$api_prefix" --jq '.base.repo.id')"
+          api_pr_node="$(gh api "$api_prefix" --jq '.node_id')"
+          [[ "$api_pr_node" =~ ^[A-Za-z0-9_:-]+$ ]] || { echo "Canonical PR node ID is invalid"; exit 1; }
+          [[ "$api_head_repo_id" =~ ^[1-9][0-9]*$ ]] || { echo "Canonical PR head repository ID is invalid"; exit 1; }
+          [[ "$api_base_repo_id" =~ ^[1-9][0-9]*$ ]] || { echo "Canonical PR base repository ID is invalid"; exit 1; }
+          {
+            printf 'PR_NODE_ID=%s\n' "$api_pr_node"
+            printf 'HEAD_REPOSITORY_ID=%s\n' "$api_head_repo_id"
+            printf 'BASE_REPOSITORY_ID=%s\n' "$api_base_repo_id"
+          } >> "$GITHUB_ENV"
+          [[ "$api_head" == "$HEAD_SHA" ]] || { echo "Canonical PR head $api_head does not equal supplied $HEAD_SHA"; exit 1; }
+          [[ "$api_base" == "$BASE_SHA" ]] || { echo "Canonical PR base $api_base does not equal supplied $BASE_SHA"; exit 1; }
+          [[ "$api_head_repo" == "$HEAD_REPOSITORY" ]] || { echo "Canonical PR head repository differs from supplied repository"; exit 1; }
+          [[ "$api_base_repo" == "$BASE_REPOSITORY" ]] || { echo "Canonical PR base repository differs from supplied repository"; exit 1; }
+          printf 'canonical PR node: %s\n' "$api_pr_node"
+
+          printf 'canonical PR #%s: %s@%s <- %s@%s\n' \
+            "$PR_NUMBER" "$HEAD_REPOSITORY" "$HEAD_SHA" "$BASE_REPOSITORY" "$BASE_SHA"
+
+      - name: Download sanitized capture artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.DOWNLOAD_ROOT }}
+
+      - name: Publish reviewable visual-QA descriptor from verified artifact
+        id: descriptor
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ needs.capture.outputs.artifact_url }}
+          ARTIFACT_DIGEST: ${{ needs.capture.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.capture.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stage="$DOWNLOAD_ROOT"
+          rm -rf "$UPLOAD_ROOT"
+          mkdir -p "$UPLOAD_ROOT"
+          test -d "$stage"
+          symlink="$(find "$stage" -type l -print -quit)"
+          test -z "$symlink" || { echo "Symlink in downloaded capture artifact: $symlink"; exit 1; }
+          while IFS= read -r -d '' file; do
+            relative="${file#"$stage/"}"
+            case "$relative" in
+              manifest.json|visual-review-input.json|*/terminal.txt|*/terminal-ansi.txt|*/terminal.html|*/metadata.json) ;;
+              pet-renderer-visual-qa.tar.gz) ;;
+              *)
+                echo "Unexpected downloaded artifact output is not allowlisted: $relative"
+                exit 1
+                ;;
+            esac
+          done < <(find "$stage" -type f -print0)
+          test -f "$stage/manifest.json"
+          test -f "$stage/visual-review-input.json"
+          test ! -e "$stage/artifacts/g009-ghostty-pty-capture.txt"
+          test ! -e "$stage/.gjc"
+
+          archive="$stage/pet-renderer-visual-qa.tar.gz"
+          test -f "$archive"
+          archive_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          archive_byte_length="$(wc -c < "$archive" | tr -d '[:space:]')"
+
+          manifest="$stage/manifest.json"
+          manifest_sha256="$(sha256sum "$manifest" | cut -d ' ' -f 1)"
+          manifest_entry_count="$(jq -er '.entry_count | numbers | select(. >= 1)' "$manifest")"
+          artifact_sha256="${ARTIFACT_DIGEST#sha256:}"
+          [[ "$artifact_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "Upload artifact digest is invalid"; exit 1; }
+          [[ "$ARTIFACT_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*/artifacts/[1-9][0-9]*$ ]] || { echo "Upload artifact URL is not a reviewer-safe HTTPS artifact route"; exit 1; }
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "Upload artifact ID is invalid"; exit 1; }
+          expected_artifact_url="https://github.com/$GITHUB_REPOSITORY_NAME/actions/runs/$GITHUB_RUN_ID/artifacts/$ARTIFACT_ID"
+          [[ "$ARTIFACT_URL" == "$expected_artifact_url" ]] || { echo "Upload artifact URL is not bound to this run and artifact ID"; exit 1; }
+          artifact_metadata="$(gh api "repos/$GITHUB_REPOSITORY_NAME/actions/artifacts/$ARTIFACT_ID")"
+          api_artifact_id="$(jq -er '.id | numbers | select(. >= 1)' <<<"$artifact_metadata")"
+          api_artifact_name="$(jq -er '.name | strings | select(length >= 1)' <<<"$artifact_metadata")"
+          api_artifact_digest="$(jq -er '.digest | strings' <<<"$artifact_metadata")"
+          api_workflow_run_id="$(jq -er '.workflow_run.id | numbers | select(. >= 1)' <<<"$artifact_metadata")"
+          api_workflow_head_sha="$(jq -er '.workflow_run.head_sha | strings | select(length == 40)' <<<"$artifact_metadata")"
+          api_workflow_repository_id="$(jq -er '.workflow_run.repository_id | numbers | select(. >= 1)' <<<"$artifact_metadata")"
+          api_workflow_head_repository_id="$(jq -er '.workflow_run.head_repository_id | numbers | select(. >= 1)' <<<"$artifact_metadata")"
+          [[ "$api_artifact_id" == "$ARTIFACT_ID" ]] || { echo "Actions API artifact ID differs from upload output"; exit 1; }
+          [[ "$api_artifact_name" == "$ARTIFACT_NAME" ]] || { echo "Actions API artifact name differs from attempt-unique name"; exit 1; }
+          [[ "$api_artifact_digest" == "sha256:$artifact_sha256" ]] || { echo "Actions API artifact digest differs from upload output"; exit 1; }
+          [[ "$api_workflow_run_id" == "$GITHUB_RUN_ID" ]] || { echo "Actions API artifact workflow run differs from this run"; exit 1; }
+          case "$WORKFLOW_EVENT_NAME" in
+            pull_request)
+              [[ "$api_workflow_head_sha" == "$HEAD_SHA" ]] || { echo "Actions API artifact workflow head differs from exact PR head"; exit 1; }
+              ;;
+            workflow_dispatch)
+              [[ "$api_workflow_head_sha" == "$WORKFLOW_REF_SHA" ]] || { echo "Actions API artifact workflow head differs from workflow dispatch ref"; exit 1; }
+              ;;
+          esac
+          [[ "$api_workflow_repository_id" == "$BASE_REPOSITORY_ID" ]] || { echo "Actions API artifact repository differs from exact PR base repository"; exit 1; }
+          case "$WORKFLOW_EVENT_NAME" in
+            pull_request)
+              [[ "$api_workflow_head_repository_id" == "$HEAD_REPOSITORY_ID" ]] || { echo "Actions API artifact head repository differs from exact PR head repository"; exit 1; }
+              ;;
+            workflow_dispatch)
+              [[ "$api_workflow_head_repository_id" == "$BASE_REPOSITORY_ID" ]] || { echo "Actions API artifact head repository differs from base dispatch repository"; exit 1; }
+              ;;
+          esac
+          artifact_byte_length="$(jq -er '.size_in_bytes | numbers | select(. >= 1)' <<<"$artifact_metadata")"
+          [[ "$artifact_byte_length" =~ ^[1-9][0-9]*$ ]] || { echo "Uploaded artifact length is invalid"; exit 1; }
+          run_url="https://github.com/$GITHUB_REPOSITORY_NAME/actions/runs/$GITHUB_RUN_ID"
+          jq -n \
+            --arg artifact_url "$ARTIFACT_URL" \
+            --arg artifact_sha256 "$artifact_sha256" \
+            --argjson artifact_byte_length "$artifact_byte_length" \
+            --argjson artifact_id "$ARTIFACT_ID" \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --argjson workflow_run_id "$GITHUB_RUN_ID" \
+            --argjson workflow_run_attempt "$RUN_ATTEMPT" \
+            --arg run_url "$run_url" \
+            --arg owner "${GITHUB_REPOSITORY_NAME%%/*}" \
+            --arg repo "${GITHUB_REPOSITORY_NAME#*/}" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg pr_node_id "$PR_NODE_ID" \
+            --arg workflow_event "$WORKFLOW_EVENT_NAME" \
+            --arg workflow_ref_sha "$WORKFLOW_REF_SHA" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg base_sha "$BASE_SHA" \
+            --arg head_repository "$HEAD_REPOSITORY" \
+            --argjson head_repository_id "$HEAD_REPOSITORY_ID" \
+            --arg base_repository "$BASE_REPOSITORY" \
+            --argjson base_repository_id "$BASE_REPOSITORY_ID" \
+            --arg manifest_sha256 "$manifest_sha256" \
+            --argjson manifest_entry_count "$manifest_entry_count" \
+            --argjson retention_days "$RETENTION_DAYS" \
+            --arg archive_sha256 "$archive_sha256" \
+            --argjson archive_byte_length "$archive_byte_length" \
+            '{
+              schema_version: 1,
+              owner: $owner,
+              repo: $repo,
+              pr_number: $pr_number,
+              pr_node_id: $pr_node_id,
+              head_repository: $head_repository,
+              head_repository_id: $head_repository_id,
+              base_repository: $base_repository,
+              base_repository_id: $base_repository_id,
+              workflow_event: $workflow_event,
+              workflow_ref_sha: $workflow_ref_sha,
+              head_sha: $head_sha,
+              base_sha: $base_sha,
+              manifest_sha256: $manifest_sha256,
+              manifest_entry_count: $manifest_entry_count,
+              workflow_run_id: $workflow_run_id,
+              workflow_run_attempt: $workflow_run_attempt,
+              artifact_id: $artifact_id,
+              artifact_name: $artifact_name,
+              artifact_sha256: $artifact_sha256,
+              artifact_byte_length: $artifact_byte_length,
+              artifact_url: $artifact_url,
+              run_url: $run_url,
+              retention_days: $retention_days,
+              archive_sha256: $archive_sha256,
+              archive_byte_length: $archive_byte_length,
+              raw_pty_published: false,
+              gjc_published: false
+            }' > "$UPLOAD_ROOT/visual-qa-descriptor.json"
+          test -s "$UPLOAD_ROOT/visual-qa-descriptor.json"
+
+      - name: Upload reviewable visual-QA descriptor
+        id: upload_descriptor
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ${{ env.DESCRIPTOR_ARTIFACT_NAME }}
+          path: ${{ env.UPLOAD_ROOT }}/visual-qa-descriptor.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record canonical descriptor Actions artifact metadata
+        shell: bash
+        env:
+          DESCRIPTOR_ARTIFACT_URL: ${{ steps.upload_descriptor.outputs.artifact-url }}
+          DESCRIPTOR_ARTIFACT_ID: ${{ steps.upload_descriptor.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$DESCRIPTOR_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "Descriptor Actions artifact ID is invalid"; exit 1; }
+          [[ "$DESCRIPTOR_ARTIFACT_URL" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*/artifacts/[1-9][0-9]*$ ]] || { echo "Descriptor Actions artifact URL is not a reviewer-safe archive route"; exit 1; }
+          expected_descriptor_url="https://github.com/$GITHUB_REPOSITORY_NAME/actions/runs/$GITHUB_RUN_ID/artifacts/$DESCRIPTOR_ARTIFACT_ID"
+          [[ "$DESCRIPTOR_ARTIFACT_URL" == "$expected_descriptor_url" ]] || { echo "Descriptor artifact URL is not bound to this run and artifact ID"; exit 1; }
+          descriptor_metadata="$(gh api "repos/$GITHUB_REPOSITORY_NAME/actions/artifacts/$DESCRIPTOR_ARTIFACT_ID")"
+          api_descriptor_id="$(jq -er '.id | numbers | select(. >= 1)' <<<"$descriptor_metadata")"
+          api_descriptor_name="$(jq -er '.name | strings | select(length >= 1)' <<<"$descriptor_metadata")"
+          api_descriptor_run_id="$(jq -er '.workflow_run.id | numbers | select(. >= 1)' <<<"$descriptor_metadata")"
+          api_descriptor_head_sha="$(jq -er '.workflow_run.head_sha | strings | select(length == 40)' <<<"$descriptor_metadata")"
+          api_descriptor_repository_id="$(jq -er '.workflow_run.repository_id | numbers | select(. >= 1)' <<<"$descriptor_metadata")"
+          api_descriptor_head_repository_id="$(jq -er '.workflow_run.head_repository_id | numbers | select(. >= 1)' <<<"$descriptor_metadata")"
+          [[ "$api_descriptor_id" == "$DESCRIPTOR_ARTIFACT_ID" ]] || { echo "Actions API descriptor artifact ID differs from upload output"; exit 1; }
+          [[ "$api_descriptor_name" == "$DESCRIPTOR_ARTIFACT_NAME" ]] || { echo "Actions API descriptor artifact name differs from attempt-unique name"; exit 1; }
+          [[ "$api_descriptor_run_id" == "$GITHUB_RUN_ID" ]] || { echo "Actions API descriptor run differs from this run"; exit 1; }
+          case "$WORKFLOW_EVENT_NAME" in
+            pull_request)
+              [[ "$api_descriptor_head_sha" == "$HEAD_SHA" ]] || { echo "Actions API descriptor head differs from exact PR head"; exit 1; }
+              ;;
+            workflow_dispatch)
+              [[ "$api_descriptor_head_sha" == "$WORKFLOW_REF_SHA" ]] || { echo "Actions API descriptor head differs from workflow dispatch ref"; exit 1; }
+              ;;
+          esac
+          [[ "$api_descriptor_repository_id" == "$BASE_REPOSITORY_ID" ]] || { echo "Actions API descriptor repository differs from exact PR base repository"; exit 1; }
+          case "$WORKFLOW_EVENT_NAME" in
+            pull_request)
+              [[ "$api_descriptor_head_repository_id" == "$HEAD_REPOSITORY_ID" ]] || { echo "Actions API descriptor head repository differs from exact PR head repository"; exit 1; }
+              ;;
+            workflow_dispatch)
+              [[ "$api_descriptor_head_repository_id" == "$BASE_REPOSITORY_ID" ]] || { echo "Actions API descriptor head repository differs from base dispatch repository"; exit 1; }
+              ;;
+          esac
+          cat "$UPLOAD_ROOT/visual-qa-descriptor.json"
+          {
+            echo "## Pet renderer visual-QA publication"
+            echo "- Sanitized artifact: \\`$ARTIFACT_URL\\`"
+            echo "- Sanitized artifact digest: \\`$ARTIFACT_DIGEST\\`"
+            echo "- Sanitized artifact length: \\`$(jq -r '.artifact_byte_length' "$UPLOAD_ROOT/visual-qa-descriptor.json") bytes\\`"
+            echo "- Sanitized artifact retention: \\`$RETENTION_DAYS days\\`"
+            echo "- Canonical descriptor Actions artifact archive URL (not a direct JSON URL): \\`$DESCRIPTOR_ARTIFACT_URL\\`"
+            echo "- Canonical descriptor Actions artifact ID: \\`$DESCRIPTOR_ARTIFACT_ID\\`"
+            echo "- Descriptor archive digest: \\`${{ steps.upload_descriptor.outputs.artifact-digest }}\\`"
+            echo "- Descriptor archive contents: \\`visual-qa-descriptor.json\\`"
+            echo "- Exact repository/PR: \\`$GITHUB_REPOSITORY_NAME#$PR_NUMBER\\`"
+            echo "- Workflow run ID / attempt: \\`${GITHUB_RUN_ID} / ${RUN_ATTEMPT}\\`"
+            echo "- Exact head: \\`$HEAD_SHA\\`"
+            echo "- Repository-bound resolver route: use Actions API metadata then authenticated archive download/extraction; do not resolve by name or fetch the URL as JSON"
+            echo "- Exact base: \\`$BASE_SHA\\`"
+            echo "- Manifest digest/count: \\`$(jq -r '.manifest_sha256 + " / " + (.manifest_entry_count|tostring)' "$UPLOAD_ROOT/visual-qa-descriptor.json")\\`"
+            echo "- Raw PTY published: \\`false\\`"
+            echo "- Receipt transport: authenticated GitHub review ID (not the capture artifact)"
+          } >> "$GITHUB_STEP_SUMMARY"
