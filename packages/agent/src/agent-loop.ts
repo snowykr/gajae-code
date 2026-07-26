@@ -1538,6 +1538,7 @@ async function runLoopBody(
 					recoveryState.pending && recoveryState.syntheticMessage
 						? { syntheticMessage: recoveryState.syntheticMessage }
 						: undefined,
+					true,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -1615,6 +1616,21 @@ async function runLoopBody(
 					continue;
 				}
 			}
+			const deferredAssistantMessageEnd =
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				message.content.some(content => content.type === "toolCall");
+			const bufferedAssistantEvents: AgentEvent[] = [];
+			const assistantEventStream = {
+				push: (event: AgentEvent) => bufferedAssistantEvents.push(event),
+			} as unknown as EventStream<AgentEvent, AgentMessage[]>;
+			let assistantMessageEndEmitted = false;
+			const emitAssistantMessageEnd = (): void => {
+				if (assistantMessageEndEmitted || !deferredAssistantMessageEnd) return;
+				assistantMessageEndEmitted = true;
+				attemptStream.push({ type: "message_end", message });
+				for (const event of bufferedAssistantEvents) attemptStream.push(event);
+			};
 			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
 			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
 			// a deterministic content fault: re-sending the same history re-triggers it,
@@ -1653,6 +1669,7 @@ async function runLoopBody(
 
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
+				emitAssistantMessageEnd();
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -1674,6 +1691,7 @@ async function runLoopBody(
 			}
 
 			if (config.fallbackManaged && message.stopReason === "error" && managedRetryableFailure(message)) {
+				emitAssistantMessageEnd();
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -1683,6 +1701,7 @@ async function runLoopBody(
 			}
 
 			if (config.fallbackManaged && message.stopReason === "aborted") {
+				emitAssistantMessageEnd();
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -1754,7 +1773,7 @@ async function runLoopBody(
 					for (const toolCall of toolCalls) {
 						const result = createAbortedToolResult(
 							toolCall,
-							stream,
+							assistantEventStream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
 						);
@@ -1772,7 +1791,7 @@ async function runLoopBody(
 						currentContext,
 						message,
 						loopSignal,
-						stream,
+						assistantEventStream,
 						config,
 						telemetry,
 						invokeAgentSpan,
@@ -1802,6 +1821,9 @@ async function runLoopBody(
 						newMessages.push(result);
 					}
 				}
+			} else {
+				consecutiveMalformedTurns = 0;
+				previousMalformedToolSignatures = new Set();
 			}
 
 			if (wasRecoveryAttempt) {
@@ -1811,12 +1833,36 @@ async function runLoopBody(
 			}
 
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
-
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				pendingMessages = steeringMessagesFromExecution;
-				continue;
+			} else {
+				pendingMessages = (await config.getSteeringMessages?.()) || [];
 			}
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			const pauseRequested = pendingMessages.length === 0 && (config.shouldPause?.() ?? false);
+			let breakerTriggered = false;
+			if (pendingMessages.length === 0 && !pauseRequested) {
+				if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
+					recoveryState.pending = true;
+					recoveryState.inserted = false;
+					recoveryState.syntheticMessage = undefined;
+					malformedToolRecoveryAttempted = true;
+				} else if (consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS) {
+					// Deterministic terminal circuit breaker. The one-shot recovery turn
+					// above already had its chance; if the model is still emitting only
+					// malformed tool calls after it, the run cannot make progress and must
+					// stop rather than burn the provider budget. Terminates on consecutive
+					// count, not argument signatures, so rotating invalid shapes are bounded
+					// too.
+					message.stopReason = "error";
+					const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+					message.errorMessage = message.errorMessage
+						? `${message.errorMessage} | ${breakerMessage}`
+						: breakerMessage;
+					breakerTriggered = true;
+				}
+			}
+			emitAssistantMessageEnd();
+			stream.push({ type: "turn_end", message, toolResults });
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
 				publishAgentEnd(
@@ -1921,6 +1967,7 @@ async function streamAssistantResponse(
 	streamFn?: StreamFn,
 	harmonyRetryAttempt = 0,
 	recoveryMode?: { syntheticMessage: UserMessage },
+	deferToolCallMessageEnd = false,
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -2285,7 +2332,14 @@ async function streamAssistantResponse(
 							if (!addedPartial) {
 								stream.push({ type: "message_start", message: { ...finalMessage }, scope });
 							}
-							stream.push({ type: "message_end", message: finalMessage, scope });
+							if (
+								!deferToolCallMessageEnd ||
+								finalMessage.stopReason === "error" ||
+								finalMessage.stopReason === "aborted" ||
+								!finalMessage.content.some(content => content.type === "toolCall")
+							) {
+								stream.push({ type: "message_end", message: finalMessage, scope });
+							}
 							await finishChat(finalMessage);
 							return finalMessage;
 						}

@@ -146,8 +146,11 @@ describe("malformed tool-call circuit breaker", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
-		for await (const _event of stream) {
-			// drain
+		const messageEnds: AgentMessage[] = [];
+		for await (const event of stream) {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				messageEnds.push(structuredClone(event.message));
+			}
 		}
 		const produced = (await stream.result()) as AgentMessage[];
 
@@ -157,6 +160,11 @@ describe("malformed tool-call circuit breaker", () => {
 		if (last?.role !== "assistant") throw new Error("expected an assistant message");
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("consecutive turns of malformed tool calls");
+		const persisted = messageEnds.at(-1);
+		expect(persisted?.role).toBe("assistant");
+		if (persisted?.role !== "assistant") throw new Error("expected persisted assistant message");
+		expect(persisted.stopReason).toBe("error");
+		expect(persisted.errorMessage).toContain("consecutive turns of malformed tool calls");
 	}, 30_000);
 
 	it("does not fire when the model recovers into a real answer", async () => {
@@ -190,7 +198,116 @@ describe("malformed tool-call circuit breaker", () => {
 		);
 		expect(mock.calls.length).toBe(3);
 	});
+	it("resets after a tool-free answer even when steering and follow-up messages keep the loop alive", async () => {
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [throwingTool()],
+		};
+		let calls = 0;
+		let recoveryAnswerSeen = false;
+		let steeringDelivered = false;
+		let followUpDelivered = false;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				if (calls === 3) {
+					recoveryAnswerSeen = true;
+					return { content: ["recovered with a real answer"] };
+				}
+				if (calls === 4) return { content: ["answered to steering"] };
+				return { content: [{ type: "toolCall" as const, id: `tool-${calls}`, name: "echo", arguments: {} }] };
+			},
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				interruptMode: "wait",
+				getSteeringMessages: async () => {
+					if (recoveryAnswerSeen && !steeringDelivered) {
+						steeringDelivered = true;
+						return [createUserMessage("steering")];
+					}
+					return [];
+				},
+				getFollowUpMessages: async () => {
+					if (steeringDelivered && !followUpDelivered) {
+						followUpDelivered = true;
+						return [createUserMessage("follow-up")];
+					}
+					return [];
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+		await stream.result();
 
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(calls).toBe(9);
+		const terminalAssistant = assistantEnds.at(-1);
+		expect(terminalAssistant?.message.role).toBe("assistant");
+		if (terminalAssistant?.message.role !== "assistant") throw new Error("expected terminal assistant message");
+		expect(terminalAssistant.message.stopReason).toBe("error");
+		expect(terminalAssistant.message.errorMessage).toContain("5 consecutive turns");
+	});
+
+	it("emits one assistant tool-call message_end before its tool result", async () => {
+		const okTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }], details: { value: "ok" } };
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [okTool],
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "ok" } }] },
+				{ content: ["all good"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		await stream.result();
+
+		const messageEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> => event.type === "message_end",
+		);
+		const assistantToolCallEnds = messageEnds.filter(
+			event =>
+				event.message.role === "assistant" && event.message.content.some(content => content.type === "toolCall"),
+		);
+		expect(assistantToolCallEnds).toHaveLength(1);
+
+		const assistantToolCallIndex = messageEnds.findIndex(
+			event =>
+				event.message.role === "assistant" && event.message.content.some(content => content.type === "toolCall"),
+		);
+		const toolResultEnds = messageEnds.filter(event => event.message.role === "toolResult");
+		expect(toolResultEnds).toHaveLength(1);
+		expect(assistantToolCallIndex).toBeGreaterThanOrEqual(0);
+		expect(messageEnds[assistantToolCallIndex + 1]?.message.role).toBe("toolResult");
+		const toolResultEnd = messageEnds[assistantToolCallIndex + 1];
+		if (toolResultEnd?.message.role !== "toolResult") throw new Error("expected tool result message_end");
+		expect(toolResultEnd.message.toolCallId).toBe("tool-1");
+	});
 	it("does not count healthy tool turns toward the bound", async () => {
 		let executions = 0;
 		const okTool: AgentTool<typeof toolSchema, { value: string }> = {
