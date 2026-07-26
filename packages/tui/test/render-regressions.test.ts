@@ -15,6 +15,7 @@ import {
 } from "@gajae-code/tui";
 import type { Terminal, TerminalAppearance } from "@gajae-code/tui/terminal";
 import { visibleWidth } from "@gajae-code/tui/utils";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class MutableLinesComponent implements Component {
@@ -167,7 +168,182 @@ class StreamingImageTranscript implements Component {
 		return [`status-${this.#revision}`, ...this.#image.render(width), ...rows("tail-", this.#tailCount)];
 	}
 }
+class WidthSensitiveComponent implements Component {
+	#appendedRows: string[] = [];
 
+	append(): void {
+		this.appendRows("ordinary-new-row");
+	}
+
+	appendRows(...rowsToAppend: string[]): void {
+		this.#appendedRows.push(...rowsToAppend);
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const historic = rows("historic-", 8);
+		if (width >= 24) return this.#appendedRows.length > 0 ? [...historic, ...this.#appendedRows] : historic;
+
+		const expanded = Array.from({ length: 8 }, (_value, index) => [`historic-${index}`, `wrapped-${index}`]).flat();
+		return this.#appendedRows.length > 0 ? [...expanded, ...this.#appendedRows] : expanded;
+	}
+}
+class StableGapAppendComponent implements Component {
+	#appended = false;
+
+	append(): void {
+		this.#appended = true;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		if (width >= 24) {
+			return this.#appended
+				? ["old-row-0123456789", "old-row-abcdefghij", "new-row-0123456789"]
+				: ["old-row-0123456789", "old-row-abcdefghij"];
+		}
+		const reflowed = ["old-row-012", "3456789", "old-row-abc", "defghij"];
+		return this.#appended ? [...reflowed, "new-row-012", "append-cont"] : reflowed;
+	}
+}
+
+class MutationAppendReflowComponent implements Component {
+	#mutated = false;
+
+	mutateAndAppend(): void {
+		this.#mutated = true;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		if (width >= 24 || !this.#mutated) return ["alpha", "omega"];
+		return ["xalpha", "changed", "omega", "new out", "put"];
+	}
+}
+
+class TabReflowAppendComponent implements Component {
+	#appended = false;
+
+	append(): void {
+		this.#appended = true;
+	}
+
+	invalidate(): void {}
+
+	render(_width: number): string[] {
+		const reflowed = getDefaultTabWidth() >= 8 ? ["tab-prefix\told-", "content"] : ["tab-prefix\told-content"];
+		return this.#appended ? [...reflowed, "new-tab-row"] : reflowed;
+	}
+}
+
+class ReflowableHeaderComponent implements Component {
+	#status = 0;
+
+	setStatus(status: number): void {
+		this.#status = status;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const history = rows("history-", 8);
+		if (width >= 24) return [`status-${this.#status}`, ...history];
+		return [
+			`status-${this.#status}`,
+			...Array.from({ length: 8 }, (_value, index) => [`history-${index}`, `wrapped-${index}`]).flat(),
+		];
+	}
+}
+
+class CoalescedMutationAppendComponent implements Component {
+	#status = "old-status";
+	#appendedRows: string[] = [];
+
+	setStatus(status: string): void {
+		this.#status = status;
+	}
+
+	appendRows(...rowsToAppend: string[]): void {
+		this.#appendedRows.push(...rowsToAppend);
+	}
+
+	invalidate(): void {}
+
+	render(_width: number): string[] {
+		return ["history-0", "history-1", this.#status, ...this.#appendedRows];
+	}
+}
+
+class FinalWrappingStatusComponent implements Component {
+	#status = "old";
+
+	setStatus(status: string): void {
+		this.#status = status;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		if (width >= 24) return ["history-0", "history-1", `status-${this.#status}`];
+		return ["history-0", "history-1", `status-${this.#status}-part`, "status-continuation"];
+	}
+}
+
+class DurableSnapshotComponent implements Component {
+	#lines: string[];
+	#pending:
+		| {
+				readonly identity: string;
+				readonly revision: number;
+				readonly final: boolean;
+				readonly snapshot: readonly string[];
+		  }
+		| undefined;
+	readonly acknowledgements: Array<{ identity: string; revision: number }> = [];
+
+	constructor(
+		readonly identity: string,
+		initialLines: string[],
+	) {
+		this.#lines = [...initialLines];
+	}
+
+	queueFinal(snapshot: string, append: boolean): void {
+		this.#pending = {
+			identity: this.identity,
+			revision: (this.#pending?.revision ?? 0) + 1,
+			final: true,
+			snapshot: [snapshot],
+		};
+		if (append) this.#lines.push(snapshot);
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		return this.#lines.map(line => line.slice(0, width));
+	}
+
+	getDurableHistoryEvent(_width: number):
+		| {
+				identity: string;
+				revision: number;
+				final: boolean;
+				snapshot: readonly string[];
+		  }
+		| undefined {
+		return this.#pending;
+	}
+
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void {
+		if (this.#pending?.identity !== identity || this.#pending.revision !== revision) return;
+		this.acknowledgements.push({ identity, revision });
+		this.#pending = undefined;
+	}
+}
 function rows(prefix: string, count: number): string[] {
 	return Array.from({ length: count }, (_v, i) => `${prefix}${i}`);
 }
@@ -204,8 +380,6 @@ describe("TUI terminal-state regressions", () => {
 		"ZELLIJ",
 		"GJC_TMUX_LAUNCHED",
 		"TERMUX_VERSION",
-		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
-		"PI_CLEAR_ON_SHRINK",
 		"PI_TUI_VIRTUAL_VIEWPORT",
 	] as const;
 	let previousHostEnv = new Map<string, string | undefined>();
@@ -283,7 +457,6 @@ describe("TUI terminal-state regressions", () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(["A", "B", "C", "D", "E"]);
-			tui.setClearOnShrink(true);
 			tui.addChild(component);
 
 			try {
@@ -1001,7 +1174,6 @@ describe("TUI terminal-state regressions", () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("row-", 10));
-			tui.setClearOnShrink(false);
 			tui.addChild(component);
 
 			try {
@@ -1019,11 +1191,10 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("clears row 0 when content shrinks to empty without clearOnShrink", async () => {
+		it("clears row 0 when content shrinks to empty", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(["A"]);
-			tui.setClearOnShrink(false);
 			tui.addChild(component);
 
 			try {
@@ -1056,13 +1227,75 @@ describe("TUI terminal-state regressions", () => {
 					await settle(term);
 					term.clearWriteLog();
 					component.setLines(rows("line-", 8));
-					tui.setClearOnShrink(true);
 					tui.requestRender();
 					await settle(term);
 					expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7"]);
 					expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
 				} finally {
 					tui.stop();
+				}
+			});
+		});
+		describe("forced render lifecycle", () => {
+			it("does not replay an overflow transcript after a viewport-safe force and ordinary no-op", async () => {
+				Bun.env.PI_TUI_VIRTUAL_VIEWPORT = "1";
+				const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(rows("line-", 12));
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					term.clearWriteLog();
+					tui.requestRender(true, "test.overflow.force");
+					await settle(term);
+
+					term.clearWriteLog();
+					tui.requestRender(false, "test.overflow.noop");
+					await settle(term);
+
+					const writes = term.getWriteLog().join("");
+					expect(writes).not.toContain("line-0");
+					expect(writes).not.toContain("\x1b[2J\x1b[H");
+
+					const scrollback = term.getScrollBuffer();
+					for (let i = 0; i < 12; i++) {
+						expect(countMatches(scrollback, new RegExp(`\\bline-${i}\\b`))).toBe(1);
+					}
+				} finally {
+					tui.stop();
+				}
+			});
+
+			it("keeps the final stream row intact when the shell writes after a transient viewport paint", async () => {
+				const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(rows("stream-", 8));
+				tui.addChild(component);
+				let stopped = false;
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines([...rows("stream-", 9), "FINAL_STREAM_ROW"]);
+					tui.requestRender(true, "test.transient.final-stream");
+					await settle(term);
+
+					tui.stop();
+					stopped = true;
+					term.write("SHELL_MARKER");
+					await term.flush();
+
+					const scrollback = term.getScrollBuffer().map(line => line.trim());
+					const finalRow = scrollback.lastIndexOf("FINAL_STREAM_ROW");
+					const shellMarker = scrollback.lastIndexOf("SHELL_MARKER");
+					expect(finalRow).toBeGreaterThanOrEqual(0);
+					expect(shellMarker).toBeGreaterThan(finalRow);
+				} finally {
+					if (!stopped) tui.stop();
 				}
 			});
 		});
@@ -1094,10 +1327,11 @@ describe("TUI terminal-state regressions", () => {
 	});
 
 	describe("resize + viewport behavior", () => {
-		it("clears preexisting shell rows on startup and resize redraw", async () => {
+		it("preserves preexisting shell rows without startup clear", async () => {
 			const term = new VirtualTerminal(50, 5);
 			term.write("shell-0\r\nshell-1\r\nshell-2\r\nshell-3\r\nshell-4\r\n");
 			await settle(term);
+			term.clearWriteLog();
 
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("ui-", 8));
@@ -1111,7 +1345,10 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 
 				const buffer = term.getScrollBuffer().join("\n");
-				expect(buffer.includes("shell-")).toBeFalsy();
+				expect(buffer).toContain("shell-");
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\x1b[2J");
+				expect(writes).not.toContain("\x1b[3J");
 			} finally {
 				tui.stop();
 			}
@@ -1240,6 +1477,474 @@ describe("TUI terminal-state regressions", () => {
 					await settle(term);
 					expect(visible(term)).toEqual(expectedViewport(width, 18));
 				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints width reflow without appending existing rows to scrollback", async () => {
+			const term = new VirtualTerminal(24, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("existing-", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 5);
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("\x1b[?2026h\x1b[H");
+				expect(writes).not.toContain("\r\n");
+				expect(visible(term)).toEqual(["existing-3", "existing-4", "existing-5", "existing-6", "existing-7"]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints width reflow that increases row count without re-emitting historic rows", async () => {
+			const term = new VirtualTerminal(24, 5);
+			const tui = new TUI(term);
+			tui.addChild(new WidthSensitiveComponent());
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 5);
+				await settle(term);
+
+				expect(visible(term)).toEqual(["wrapped-5", "historic-6", "wrapped-6", "historic-7", "wrapped-7"]);
+				expect(term.getWriteLog().join("")).not.toContain("\r\n");
+
+				const scrollback = term.getScrollBuffer();
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(scrollback, new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints an offscreen same-length mutation after width reflow growth without replaying history", async () => {
+			const term = new VirtualTerminal(24, 5);
+			const tui = new TUI(term);
+			const component = new ReflowableHeaderComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				term.resize(16, 5);
+				await settle(term);
+				term.clearWriteLog();
+
+				component.setStatus(1);
+				tui.requestRender(false, "test.offscreen-reflow-header");
+				await settle(term);
+
+				expect(visible(term)).toEqual(["wrapped-5", "history-6", "wrapped-6", "history-7", "wrapped-7"]);
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\r\n");
+				expect(writes).not.toContain("status-1");
+				expect(writes).not.toContain("history-0");
+				expect(writes).not.toContain("wrapped-0");
+
+				const scrollback = term.getScrollBuffer();
+				expect(countMatches(scrollback, /status-0/)).toBe(1);
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(scrollback, new RegExp(`\\bhistory-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("appends only the new row after a width reflow grows the rendered frame", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				term.resize(16, 10);
+				await settle(term);
+				term.clearWriteLog();
+
+				component.append();
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("ordinary-new-row");
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+				expect(writes).not.toContain("historic-");
+				expect(writes).not.toContain("wrapped-");
+				expect(countMatches(term.getScrollBuffer(), /ordinary-new-row/g)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints newly exposed rows after transient width reflow before a height-only resize", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				term.resize(16, 10);
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 14);
+				await settle(term);
+
+				const expected = Array.from({ length: 8 }, (_value, index) => [`historic-${index}`, `wrapped-${index}`])
+					.flat()
+					.slice(2);
+				expect(visible(term)).toEqual(expected);
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("historic-1");
+				expect(writes).toContain("wrapped-1");
+				expect(writes).not.toContain("\r\n");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("commits a row appended before the coalesced resize render without replaying reflow", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 10);
+				component.append();
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("ordinary-new-row");
+				expect(countMatches(term.getScrollBuffer(), /ordinary-new-row/g)).toBe(1);
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+				expect(visible(term).at(-1)?.trim()).toBe("ordinary-new-row");
+				const beforeNoop = visible(term);
+
+				term.clearWriteLog();
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term)).toEqual(beforeNoop);
+				expect(term.getWriteLog().join("")).not.toContain("\r\n");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not treat repeated old status text in a coalesced append as reflow evidence", async () => {
+			const term = new VirtualTerminal(24, 3);
+			const tui = new TUI(term);
+			const component = new CoalescedMutationAppendComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 3);
+				component.setStatus("new-status");
+				component.appendRows("old-status", "old-status", "tool-row");
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("old-status");
+				expect(writes).toContain("tool-row");
+				expect(countMatches(term.getScrollBuffer(), /old-status/g)).toBe(2);
+				expect(countMatches(term.getScrollBuffer(), /tool-row/g)).toBe(1);
+				for (const row of ["history-0", "history-1"]) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+				const beforeNoop = visible(term);
+
+				term.clearWriteLog();
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term)).toEqual(beforeNoop);
+				expect(term.getWriteLog().join("")).not.toContain("\r\n");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints an ambiguous final-row mutation instead of committing its reflow continuation", async () => {
+			const term = new VirtualTerminal(24, 4);
+			const tui = new TUI(term);
+			const component = new FinalWrappingStatusComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 4);
+				component.setStatus("new");
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term)).toEqual(["history-0", "history-1", "status-new-part", "status-continuat"]);
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\r\n");
+				expect(writes).toContain("status-continuat");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("repaints a prefix-extending final-row mutation instead of committing its reflow continuation", async () => {
+			const term = new VirtualTerminal(24, 4);
+			const tui = new TUI(term);
+			const component = new FinalWrappingStatusComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 4);
+				component.setStatus("old-extended");
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\r\n");
+				expect(writes).toContain("status-continuat");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("preserves the durable appended suffix when mutation precedes the resize event", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				component.append();
+				tui.requestRender();
+				term.resize(16, 10);
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("ordinary-new-row");
+				expect(countMatches(term.getScrollBuffer(), /ordinary-new-row/g)).toBe(1);
+				expect(term.getScrollBuffer().at(-1)?.trim()).toBe("ordinary-new-row");
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+				expect(visible(term).at(-1)?.trim()).toBe("ordinary-new-row");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not consume a singleton reflow gap before an appended row", async () => {
+			const term = new VirtualTerminal(24, 2);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(["ab", "cd"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 2);
+				component.setLines(["ab", "xx", "cd", "new"]);
+				tui.requestRender();
+				await settle(term);
+
+				term.clearWriteLog();
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				expect(countMatches(scrollback, /\bnew\b/g)).toBe(1);
+				for (const row of ["ab", "cd"]) {
+					expect(countMatches(scrollback, new RegExp(`\\b${row}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not extrapolate a final-row reflow from earlier in-place insertions", async () => {
+			const term = new VirtualTerminal(24, 3);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(["a", "b", "c"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 3);
+				component.setLines(["a", "detail-a", "b", "detail-b", "c", "new output"]);
+				tui.requestRender();
+				await settle(term);
+
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				expect(countMatches(scrollback, /\bnew output\b/g)).toBe(1);
+				for (const row of ["a", "detail-a", "b", "detail-b", "c"]) {
+					expect(countMatches(scrollback, new RegExp(`\\b${row}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("retains the first wrapped appended row after a stable reflow gap", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new StableGapAppendComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 10);
+				component.append();
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				for (const row of ["new-row-012", "append-cont"]) {
+					expect(writes).toContain(row);
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+				for (const row of ["old-row-012", "old-row-abc", "3456789"]) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("preserves a mutation plus wrapped append across the following stable render", async () => {
+			const term = new VirtualTerminal(24, 2);
+			const tui = new TUI(term);
+			const component = new MutationAppendReflowComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(8, 2);
+				component.mutateAndAppend();
+				tui.requestRender();
+				await settle(term);
+
+				term.clearWriteLog();
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				expect(countMatches(scrollback, /new out/g)).toBe(1);
+				expect(countMatches(scrollback, /put/g)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not commit tab reflow continuations as a coalesced append suffix", async () => {
+			const originalTabWidth = getDefaultTabWidth();
+			const term = new VirtualTerminal(24, 6);
+			const tui = new TUI(term);
+			const component = new TabReflowAppendComponent();
+
+			try {
+				setDefaultTabWidth(2);
+				tui.addChild(component);
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				setDefaultTabWidth(8);
+				component.append();
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("new-tab-row");
+				expect(countMatches(term.getScrollBuffer(), /new-tab-row/g)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /tab-prefix/g)).toBeLessThanOrEqual(1);
+				expect(countMatches(term.getScrollBuffer(), /content/g)).toBeLessThanOrEqual(1);
+			} finally {
+				tui.stop();
+				setDefaultTabWidth(originalTabWidth);
+			}
+		});
+		it("commits every row appended before the coalesced resize render without replaying reflow", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 10);
+				component.appendRows("new-row-a", "new-row-b");
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				for (const row of ["new-row-a", "new-row-b"]) {
+					expect(writes).toContain(row);
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+				expect(writes).not.toContain("historic-");
+				expect(
+					visible(term)
+						.slice(-2)
+						.map(line => line.trim()),
+				).toEqual(["new-row-a", "new-row-b"]);
+				const beforeNoop = visible(term);
+
+				term.clearWriteLog();
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term)).toEqual(beforeNoop);
+				expect(term.getWriteLog().join("")).not.toContain("\r\n");
 			} finally {
 				tui.stop();
 			}
@@ -1600,7 +2305,6 @@ describe("TUI terminal-state regressions", () => {
 	describe("scrollback integrity", () => {
 		it("repaints only the visible viewport for offscreen changes in tmux", async () => {
 			Bun.env.TMUX = "1";
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
 			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
@@ -1631,39 +2335,8 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("keeps a legacy full-render kill switch for multiplexer viewport repaint", async () => {
-			Bun.env.TMUX = "1";
-			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
-
-			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
-			const tui = new TUI(term);
-			const lines = rows("line-", 80);
-			const component = new MutableLinesComponent(lines);
-			tui.addChild(component);
-
-			try {
-				tui.start();
-				await settle(term);
-
-				term.clearWriteLog();
-				const nextLines = [...lines];
-				nextLines[0] = "updated-offscreen-header";
-				component.setLines(nextLines);
-				tui.requestRender();
-				await settle(term);
-
-				const writes = term.getWriteLog().join("");
-				expect(writes).toContain("\x1b[2J\x1b[H");
-				expect(writes).not.toContain("\x1b[3J");
-				expect(writes).toContain("updated-offscreen-header");
-			} finally {
-				tui.stop();
-			}
-		});
-
 		it("refreshes newly visible rows after a tmux height increase", async () => {
 			Bun.env.TMUX = "1";
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
 			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
@@ -1789,6 +2462,210 @@ describe("TUI terminal-state regressions", () => {
 					const next = Number.parseInt(viewport[i]!.slice(5), 10);
 					expect(next - prev).toBe(1);
 				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("keeps numbered streaming rows durable when offscreen history mutates during viewport repaint", async () => {
+			const term = new VirtualTerminal(36, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const history = new MutableLinesComponent(rows("history-", 8));
+			const streamRows = ["stream-0"];
+			const stream = new MutableLinesComponent(streamRows);
+			const footer = new MutableLinesComponent(["FOOTER_MARKER"]);
+			tui.addChild(history);
+			tui.addChild(stream);
+			tui.addChild(footer);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				for (let i = 1; i <= 32; i++) {
+					history.setLines([`history-mutated-${i}`, ...rows("history-", 7)]);
+					streamRows.push(`stream-${i}`);
+					stream.setLines(streamRows);
+					term.clearWriteLog();
+					tui.requestRender(false, "test.offscreen-history-stream");
+					await settle(term);
+
+					const writes = term.getWriteLog().join("");
+					expect(writes).toContain("FOOTER_MARKER");
+					expect(writes).not.toContain(`history-mutated-${i}`);
+
+					const viewport = visible(term);
+					expect(viewport.filter(line => line.trim() === "FOOTER_MARKER")).toHaveLength(1);
+
+					const scrollback = term.getScrollBuffer();
+					expect(scrollback.filter(line => line.trim() === "FOOTER_MARKER")).toHaveLength(1);
+					for (const label of streamRows) {
+						expect(
+							scrollback.filter(line => line.trim() === label),
+							`${label} should appear exactly once`,
+						).toHaveLength(1);
+					}
+				}
+
+				const scrollback = term.getScrollBuffer();
+				let previousPosition = -1;
+				for (const label of streamRows) {
+					const position = scrollback.findIndex(line => line.trim() === label);
+					expect(position).toBeGreaterThan(previousPosition);
+					previousPosition = position;
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("does not append rows that regrow below the durable boundary after contraction", async () => {
+			const term = new VirtualTerminal(32, 10);
+			const tui = new TUI(term);
+			const lines = rows("durable-", 8);
+			const component = new MutableLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(lines.slice(0, 5));
+				tui.requestRender(false, "test.contract");
+				await settle(term);
+				term.clearWriteLog();
+
+				component.setLines(lines.slice(0, 7));
+				tui.requestRender(false, "test.sub-durable-regrowth");
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\r\n");
+				expect(visible(term).slice(0, 7)).toEqual([
+					"durable-0",
+					"durable-1",
+					"durable-2",
+					"durable-3",
+					"durable-4",
+					"durable-5",
+					"durable-6",
+				]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("durably appends distinct rows that replace the contracted suffix below the old high-water mark", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const originalRows = rows("durable-", 8);
+			const component = new MutableLinesComponent(originalRows);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(originalRows.slice(0, 5));
+				tui.requestRender(false, "test.contract-distinct");
+				await settle(term);
+				term.clearWriteLog();
+
+				component.setLines([...originalRows.slice(0, 5), "post-contract-0", "post-contract-1"]);
+				tui.requestRender(false, "test.distinct-regrowth");
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("durable-");
+				expect(writes).toContain("post-contract-0");
+				expect(writes).toContain("post-contract-1");
+				expect(countMatches(term.getScrollBuffer(), /post-contract-0/g)).toBe(1);
+				expect(countMatches(term.getScrollBuffer(), /post-contract-1/g)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("rejects ambiguous durable coverage across identical source snapshots", async () => {
+			const term = new VirtualTerminal(32, 4);
+			const tui = new TUI(term);
+			const offscreenSource = new DurableSnapshotComponent("offscreen-source", rows("offscreen-", 8));
+			const emittedSource = new DurableSnapshotComponent("emitted-source", ["emitted-base"]);
+			tui.addChild(offscreenSource);
+			tui.addChild(emittedSource);
+			const observations: Array<{
+				durable: boolean;
+				outcome: string;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				offscreenSource.queueFinal("identical-final", false);
+				emittedSource.queueFinal("identical-final", true);
+				tui.requestRender(false, "test.ambiguous-durable-source");
+				await settle(term);
+
+				const appended = observations.at(-1);
+				expect(appended?.durable).toBe(true);
+				expect(appended?.outcome).toBe("accepted");
+				expect(appended?.durableSourceCoverage).toEqual([]);
+				expect(emittedSource.acknowledgements).toHaveLength(0);
+				expect(offscreenSource.acknowledgements).toHaveLength(0);
+				expect(offscreenSource.getDurableHistoryEvent(32)?.identity).toBe("offscreen-source");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("restarts durable history ownership when replacing the transcript identity", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("old-", 24));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				tui.resetViewportAnchorIntent();
+				const successorRows = ["new-0", "new-1"];
+				component.setLines(successorRows);
+				tui.requestRender(false, "test.replace-identity");
+				await settle(term);
+
+				for (let i = 0; i < 8; i++) {
+					component.setLines([...successorRows, ...rows("successor-", i + 1)]);
+					tui.requestRender(false, "test.replace-identity.append");
+					await settle(term);
+				}
+
+				const scrollback = term.getScrollBuffer().map(line => line.trim());
+				expect(scrollback).toContain("successor-0");
+				expect(scrollback).toContain("successor-1");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("strips component erase controls while retaining text for later renders", async () => {
+			const term = new VirtualTerminal(40, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(["before\x1b[Kafter"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				expect(visible(term)[0]?.trim()).toBe("beforeafter");
+				expect(term.getWriteLog().join("")).not.toContain("\x1b[K");
+
+				component.setLines(["next-safe-frame"]);
+				term.clearWriteLog();
+				tui.requestRender(false, "test.erase-followup");
+				await settle(term);
+
+				expect(visible(term)[0]?.trim()).toBe("next-safe-frame");
+				expect(term.getWriteLog().join("")).toContain("next-safe-frame");
 			} finally {
 				tui.stop();
 			}
@@ -1968,7 +2845,6 @@ describe("TUI terminal-state regressions", () => {
 		it("all cursor sequences fall inside BSU/ESU brackets on deleted-lines render", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
-			tui.setClearOnShrink(true);
 
 			const component = new MutableLinesComponent(["A", "B", "C", "D"]);
 			tui.addChild(component);

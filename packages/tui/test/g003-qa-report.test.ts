@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Component, renderMetrics, TUI } from "@gajae-code/tui";
+import { Text } from "../src/components/text";
 import { VirtualTerminal } from "./virtual-terminal";
 
 const FLAG = "PI_TUI_VIRTUAL_VIEWPORT";
@@ -50,6 +51,20 @@ class MutableLines implements Component {
 	invalidate(): void {}
 	render(_width: number): string[] {
 		return this.#lines;
+	}
+}
+class ReflowingAppendLines implements Component {
+	#text =
+		"Stable paragraph content that is deliberately long enough to rewrap into a different set of physical rows after resize.";
+
+	appendMany(lines: string[]): void {
+		this.#text += `\n${lines.join("\n")}`;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		return new Text(this.#text, 0, 0).render(width);
 	}
 }
 
@@ -208,6 +223,30 @@ describe("G003 virtual viewport adversarial parity QA", () => {
 			},
 			ctx => ctx.tui.scrollViewportPages(1),
 		]);
+	});
+	it("REWRAPPED-MULTI-APPEND", async () => {
+		Bun.env[FLAG] = "1";
+		delete Bun.env.TMUX;
+		delete Bun.env.STY;
+		delete Bun.env.ZELLIJ;
+		const term = new VirtualTerminal(40, ROWS);
+		const tui = new TUI(term);
+		const component = new ReflowingAppendLines();
+		tui.addChild(component);
+		try {
+			tui.start();
+			await settle(term);
+			term.clearWriteLog();
+			component.appendMany(["APPEND-A", "APPEND-B", "APPEND-C"]);
+			term.resize(22, ROWS);
+			tui.requestRender();
+			await settle(term);
+
+			const committed = term.getScrollBuffer().join("\n");
+			expect(committed.match(/APPEND-[A-C]/g)).toEqual(["APPEND-A", "APPEND-B", "APPEND-C"]);
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("RESIZE-STORM", async () => {

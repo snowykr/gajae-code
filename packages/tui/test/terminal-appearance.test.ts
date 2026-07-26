@@ -276,6 +276,19 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		terminal.stop();
 	});
 
+	it("restarts a queued OSC 11 query when its DA1 sentinel expires", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
+
+		expect(queryCount()).toBe(1);
+		process.stdin.emit("data", "\x1b[?997;1n");
+		vi.advanceTimersByTime(100);
+		vi.advanceTimersByTime(1000);
+
+		expect(queryCount()).toBe(2);
+		terminal.stop();
+	});
+
 	it("reassembles a DA1 response split across stdin reads without leaking to input (#1238)", () => {
 		vi.useFakeTimers();
 		const { terminal, received } = setupTerminal();
