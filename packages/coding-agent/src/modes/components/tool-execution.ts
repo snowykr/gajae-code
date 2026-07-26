@@ -162,6 +162,24 @@ export interface ToolExecutionOptions {
 	/** Internal observer for visible asynchronous renderer mutations. */
 	onVisibleTranscriptMutation?: () => void;
 }
+export type DurableHistoryEvent = Readonly<{
+	identity: string;
+	revision: number;
+	final: boolean;
+	snapshot: readonly string[];
+}>;
+
+export interface DurableHistoryEventSource {
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined;
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void;
+	getDurableHistoryEvents?(width: number): readonly DurableHistoryEvent[];
+}
+type ImageConversionSource = {
+	image: { data?: string; mimeType?: string };
+	data: string;
+	mimeType: string;
+	version: number;
+};
 
 export interface ToolExecutionHandle {
 	updateArgs(args: any, toolCallId?: string): void;
@@ -190,6 +208,9 @@ export interface ToolExecutionHandle {
 	 * detection. Optional so existing structural handles remain source compatible.
 	 */
 	consumeVisibleTranscriptChange?(): boolean;
+	getDurableHistoryEvent?(width: number): DurableHistoryEvent | undefined;
+	getDurableHistoryEvents?(width: number): readonly DurableHistoryEvent[];
+	acknowledgeDurableHistoryEvent?(identity: string, revision: number): void;
 }
 
 /**
@@ -235,16 +256,23 @@ export class ToolExecutionComponent extends Container {
 	#argsIdentityVersion = 0;
 	#lastArgsReference: any;
 	#shareArgsWithRenderer = false;
-	// Cached converted images for Kitty protocol (which requires PNG), keyed by index and source.
-	#convertedImages: Map<number, { data: string; mimeType: string; source: string }> = new Map();
-	#imageConversionGenerations = new Map<number, number>();
-	#imageConversionsInFlight = new Map<number, string>();
-
+	// Cached converted images for Kitty protocol (which requires PNG), keyed by source slot and version
+	#convertedImages: Map<number, { source: ImageConversionSource; data: string; mimeType: string }> = new Map();
 	// Spinner animation for partial task results
 	#spinnerFrame?: number;
 	#spinnerAnimation?: AnimationRegistration;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
+	#toolCallId: string | undefined;
+	#durableRevision = 0;
+	#durableAcknowledgedRevision = 0;
+	#pendingPreviewWork = 0;
+	#pendingImageWork = 0;
+	#imageSourceVersions = new Map<
+		number,
+		{ image: ImageConversionSource["image"]; data: string; mimeType: string; version: number }
+	>();
+	#imageConversionsInFlight = new Map<number, ImageConversionSource>();
 	#renderState: {
 		spinnerFrame?: number;
 		expanded: boolean;
@@ -269,6 +297,7 @@ export class ToolExecutionComponent extends Container {
 		_toolCallId?: string,
 	) {
 		super();
+		this.#toolCallId = _toolCallId;
 		this.#toolName = toolName;
 		this.#toolLabel = tool?.label ?? toolName;
 		this.#showImages = options.showImages ?? true;
@@ -307,11 +336,47 @@ export class ToolExecutionComponent extends Container {
 		this.#visibleProjection = this.#captureLogicalVisibleProjection();
 
 		void this.#runPreviewDiff();
+		this.#bumpDurableRevision();
+	}
+	#bumpDurableRevision(): void {
+		this.#durableRevision += 1;
+	}
+
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined {
+		const identity = this.#toolCallId;
+		if (!identity) return undefined;
+
+		if (this.#durableRevision <= this.#durableAcknowledgedRevision) return undefined;
+		const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 1;
+		const snapshot = Object.freeze(this.render(safeWidth).slice());
+		return Object.freeze({
+			identity,
+			revision: this.#durableRevision,
+			final:
+				this.#argsComplete &&
+				!this.#isPartial &&
+				!this.#spinnerAnimation &&
+				this.#pendingPreviewWork === 0 &&
+				this.#pendingImageWork === 0,
+			snapshot,
+		});
+	}
+	getDurableHistoryEvents(width: number): readonly DurableHistoryEvent[] {
+		const event = this.getDurableHistoryEvent(width);
+		return event ? [event] : [];
+	}
+
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void {
+		if (identity !== this.#toolCallId) return;
+		if (!Number.isSafeInteger(revision) || revision <= 0 || revision > this.#durableRevision) return;
+		if (revision <= this.#durableAcknowledgedRevision) return;
+		this.#durableAcknowledgedRevision = revision;
 	}
 
 	updateArgs(args: any, _toolCallId?: string): void {
 		const argsChanged = !Bun.deepEquals(this.#args, args);
 		if (!argsChanged && !this.#editMode) return;
+		this.#bumpDurableRevision();
 		if (args !== this.#lastArgsReference) {
 			this.#lastArgsReference = args;
 			this.#argsIdentityVersion += 1;
@@ -328,6 +393,7 @@ export class ToolExecutionComponent extends Container {
 	 * This triggers an immediate final diff computation for edit-like tools.
 	 */
 	setArgsComplete(_toolCallId?: string): void {
+		this.#bumpDurableRevision();
 		this.#argsComplete = true;
 		this.#updateSpinnerAnimation();
 		void this.#runPreviewDiff();
@@ -365,6 +431,7 @@ export class ToolExecutionComponent extends Container {
 		this.#editDiffAbort?.abort();
 		const controller = new AbortController();
 		this.#editDiffAbort = controller;
+		this.#pendingPreviewWork += 1;
 
 		try {
 			const isStreaming = !this.#argsComplete;
@@ -388,6 +455,11 @@ export class ToolExecutionComponent extends Container {
 		} catch (err) {
 			if (this.#disposed || controller.signal.aborted) return;
 			logger.warn("Edit preview diff failed", { tool: this.#toolName, error: String(err) });
+		} finally {
+			this.#pendingPreviewWork -= 1;
+			if (!controller.signal.aborted && this.#editDiffAbort === controller) {
+				this.#bumpDurableRevision();
+			}
 		}
 	}
 
@@ -401,6 +473,7 @@ export class ToolExecutionComponent extends Container {
 		_toolCallId?: string,
 	): void {
 		if (this.#isPartial === isPartial && Bun.deepEquals(this.#result, result)) return;
+		this.#bumpDurableRevision();
 		this.#textOutputCache = undefined;
 		this.#result = result;
 		this.#invalidateStaleKittyConversions();
@@ -410,7 +483,6 @@ export class ToolExecutionComponent extends Container {
 			this.#argsComplete = true;
 		}
 		this.#updateSpinnerAnimation();
-		this.#updateDisplay();
 		// Convert non-PNG images to PNG for Kitty protocol (async)
 		this.#maybeConvertImagesForKitty();
 		this.#markVisibleMutationIfChanged();
@@ -427,30 +499,19 @@ export class ToolExecutionComponent extends Container {
 		return [...contentImages, ...detailImages];
 	}
 
-	#imageSource(image: { data?: string; mimeType?: string }): string | undefined {
-		return image.data && image.mimeType ? `${image.mimeType}\u0000${image.data}` : undefined;
-	}
 
 	#invalidateStaleKittyConversions(): void {
 		const images = this.#getAllImageBlocks();
-		const indices = new Set<number>();
-		for (let index = 0; index < images.length; index++) {
-			const source = this.#imageSource(images[index]);
-			if (!source) continue;
-			indices.add(index);
-			if (this.#convertedImages.get(index)?.source !== source) this.#convertedImages.delete(index);
-			if (this.#imageConversionsInFlight.get(index) !== source) {
-				this.#imageConversionsInFlight.delete(index);
-				this.#imageConversionGenerations.set(index, (this.#imageConversionGenerations.get(index) ?? 0) + 1);
+		for (const [index, converted] of this.#convertedImages) {
+			const current = images[index];
+			if (!current || !this.#sameImageSource(converted.source, current)) {
+				this.#convertedImages.delete(index);
 			}
 		}
-		for (const index of this.#convertedImages.keys()) {
-			if (!indices.has(index)) this.#convertedImages.delete(index);
-		}
-		for (const index of this.#imageConversionsInFlight.keys()) {
-			if (!indices.has(index)) {
+		for (const [index, source] of this.#imageConversionsInFlight) {
+			const current = images[index];
+			if (!current || !this.#sameImageSource(source, current)) {
 				this.#imageConversionsInFlight.delete(index);
-				this.#imageConversionGenerations.set(index, (this.#imageConversionGenerations.get(index) ?? 0) + 1);
 			}
 		}
 	}
@@ -458,43 +519,66 @@ export class ToolExecutionComponent extends Container {
 	/** Convert non-PNG images to PNG for Kitty graphics protocol. */
 	#maybeConvertImagesForKitty(): void {
 		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
-		for (const [index, image] of this.#getAllImageBlocks().entries()) {
-			const source = this.#imageSource(image);
-			if (!source || image.mimeType === "image/png") continue;
-			if (
-				this.#convertedImages.get(index)?.source === source ||
-				this.#imageConversionsInFlight.get(index) === source
-			)
-				continue;
-			const generation = this.#imageConversionGenerations.get(index) ?? 0;
-			this.#imageConversionsInFlight.set(index, source);
-			new Bun.Image(Buffer.from(image.data!, "base64"))
+		if (!this.#result) return;
+
+		const imageBlocks = this.#getAllImageBlocks();
+		for (const [index, converted] of this.#convertedImages) {
+			const current = imageBlocks[index];
+			if (!current || !this.#sameImageSource(converted.source, current)) {
+				this.#convertedImages.delete(index);
+			}
+		}
+
+		for (let i = 0; i < imageBlocks.length; i++) {
+			const img = imageBlocks[i];
+			if (!img.data || !img.mimeType || img.mimeType === "image/png") continue;
+
+			const source = this.#getImageConversionSource(i, img);
+			if (this.#convertedImages.get(i)?.source.version === source.version) continue;
+			if (this.#imageConversionsInFlight.get(i)?.version === source.version) continue;
+			this.#imageConversionsInFlight.set(i, source);
+			this.#pendingImageWork += 1;
+
+			// Convert async - catch errors from processing
+			const index = i;
+			new Bun.Image(Buffer.from(source.data, "base64"))
 				.png()
 				.toBase64()
 				.then(data => {
-					if (
-						this.#disposed ||
-						this.#imageConversionGenerations.get(index) !== generation ||
-						this.#imageConversionsInFlight.get(index) !== source ||
-						this.#imageSource(this.#getAllImageBlocks()[index] ?? {}) !== source
-					)
-						return;
-					this.#imageConversionsInFlight.delete(index);
-					this.#convertedImages.set(index, { data, mimeType: "image/png", source });
+					if (this.#disposed || this.#imageConversionsInFlight.get(index) !== source) return;
+					this.#convertedImages.set(index, { source, data, mimeType: "image/png" });
 					this.#updateDisplay();
 					this.#ui.requestRender();
 					this.#markVisibleMutationIfChanged(true);
 				})
 				.catch(() => {
-					if (
-						this.#disposed ||
-						this.#imageConversionGenerations.get(index) !== generation ||
-						this.#imageConversionsInFlight.get(index) !== source
-					)
-						return;
-					this.#imageConversionsInFlight.delete(index);
+					// Ignore conversion failures - display will use original image format
+				})
+				.finally(() => {
+					if (this.#imageConversionsInFlight.get(index) === source) {
+						this.#imageConversionsInFlight.delete(index);
+					}
+					this.#pendingImageWork -= 1;
+					this.#bumpDurableRevision();
 				});
 		}
+	}
+
+	#sameImageSource(source: ImageConversionSource, image: { data?: string; mimeType?: string }): boolean {
+		return source.image === image && source.data === image.data && source.mimeType === image.mimeType;
+	}
+
+	#getImageConversionSource(index: number, image: ImageConversionSource["image"]): ImageConversionSource {
+		const previous = this.#imageSourceVersions.get(index);
+		if (previous && this.#sameImageSource(previous, image)) return previous;
+		const source = {
+			image,
+			data: image.data!,
+			mimeType: image.mimeType!,
+			version: (previous?.version ?? 0) + 1,
+		};
+		this.#imageSourceVersions.set(index, source);
+		return source;
 	}
 
 	#captureLogicalVisibleProjection(): string {
@@ -540,11 +624,13 @@ export class ToolExecutionComponent extends Container {
 				if (frameCount === 0) return;
 				this.#spinnerFrame = ((this.#spinnerFrame ?? -1) + 1) % frameCount;
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
+				this.#bumpDurableRevision();
 				this.#ui.requestRender();
 			}, 80);
 		} else if (!needsSpinner && this.#spinnerAnimation) {
 			this.#spinnerAnimation.unregister();
 			this.#spinnerAnimation = undefined;
+			this.#bumpDurableRevision();
 		}
 	}
 
@@ -552,11 +638,13 @@ export class ToolExecutionComponent extends Container {
 	 * Stop spinner animation and cleanup resources.
 	 */
 	stopAnimation(): void {
+		const hadSpinner = !!this.#spinnerAnimation;
 		if (this.#spinnerAnimation) {
 			this.#spinnerAnimation.unregister();
 			this.#spinnerAnimation = undefined;
 			this.#spinnerFrame = undefined;
 		}
+		if (hadSpinner) this.#bumpDurableRevision();
 		this.#editDiffAbort?.abort();
 		this.#editDiffAbort = undefined;
 	}
@@ -564,7 +652,7 @@ export class ToolExecutionComponent extends Container {
 	override dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		this.#imageConversionGenerations.clear();
+		this.#imageSourceVersions.clear();
 		this.#imageConversionsInFlight.clear();
 		this.#convertedImages.clear();
 		this.stopAnimation();
@@ -573,7 +661,8 @@ export class ToolExecutionComponent extends Container {
 
 	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
-		if (this.#manuallyExpanded !== undefined) return;
+		if (this.#manuallyExpanded !== undefined || this.#expanded === expanded) return;
+		this.#bumpDurableRevision();
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
@@ -583,12 +672,16 @@ export class ToolExecutionComponent extends Container {
 	 * Transcript rebuilds recreate components from global state and drop this pin.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded === expanded && this.#expanded === expanded) return;
+		this.#bumpDurableRevision();
 		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
 
 	setShowImages(show: boolean): void {
+		if (this.#showImages === show) return;
+		this.#bumpDurableRevision();
 		this.#showImages = show;
 		this.#textOutputCache = undefined;
 		this.#updateDisplay();
@@ -596,11 +689,13 @@ export class ToolExecutionComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
+		this.#bumpDurableRevision();
 		this.#updateDisplay();
 	}
 
 	override render(width: number): string[] {
 		if (this.#displayBuiltWithGraphicsFallback !== isTerminalGraphicsFallbackActive()) {
+			this.#bumpDurableRevision();
 			this.#updateDisplay();
 		}
 		return super.render(width);
@@ -828,8 +923,9 @@ export class ToolExecutionComponent extends Container {
 				if (TERMINAL.imageProtocol && this.#showImages && img.data && img.mimeType) {
 					// Use converted PNG for Kitty protocol if available
 					const converted = this.#convertedImages.get(i);
-					const imageData = converted?.data ?? img.data;
-					const imageMimeType = converted?.mimeType ?? img.mimeType;
+					const validConverted = converted && this.#sameImageSource(converted.source, img) ? converted : undefined;
+					const imageData = validConverted?.data ?? img.data;
+					const imageMimeType = validConverted?.mimeType ?? img.mimeType;
 
 					// For Kitty, skip non-PNG images that haven't been converted yet
 					if (TERMINAL.imageProtocol === ImageProtocol.Kitty && imageMimeType !== "image/png") {

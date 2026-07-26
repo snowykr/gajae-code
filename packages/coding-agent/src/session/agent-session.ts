@@ -116,6 +116,7 @@ import {
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
 import { AttemptRecordStore } from "./attempt-record-store";
+import type { TuiTransactionObservation } from "@gajae-code/tui";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
 	BTW_MAX_QUESTION_UTF8_BYTES,
@@ -213,6 +214,7 @@ import { onAppendOnlyModeChanged } from "../config/settings";
 import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
+import { TuiTransactionHistory } from "../debug/tui-transaction-history";
 import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
@@ -589,6 +591,8 @@ export interface AgentSessionConfig {
 	onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	/** Per-session raw SSE diagnostic buffer */
 	rawSseDebugBuffer?: RawSseDebugBuffer;
+	/** Runtime-only shared TUI transaction metadata history. */
+	tuiTransactionHistory?: TuiTransactionHistory;
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
@@ -2274,6 +2278,7 @@ export class AgentSession {
 	#fastModeAutoDisabledProviderKeys = new Set<string>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
+	readonly tuiTransactionHistory: TuiTransactionHistory;
 
 	#acquirePowerAssertion(): void {
 		if (process.platform !== "darwin") return;
@@ -2693,6 +2698,8 @@ export class AgentSession {
 		this.#recoveryHydrationContext = config.recoveryHydrationContext;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
+		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
+		this.tuiTransactionHistory = config.tuiTransactionHistory ?? new TuiTransactionHistory();
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
@@ -10164,6 +10171,30 @@ export class AgentSession {
 		return transition;
 	}
 
+	async #initializeNewSessionWithLocalRoot(options?: NewSessionOptions): Promise<void> {
+		const rollbackSessionState = this.sessionManager.captureState();
+		await this.sessionManager.newSession(options);
+		const successorSessionFile = this.sessionFile;
+		try {
+			await initializeLocalRoot(this.#localProtocolOptions());
+		} catch (error) {
+			this.sessionManager.restoreState(rollbackSessionState);
+			this.#syncAgentSessionId(rollbackSessionState.sessionId);
+			this.#reconnectToAgent();
+			if (successorSessionFile && successorSessionFile !== rollbackSessionState.sessionFile) {
+				try {
+					await this.sessionManager.discardUncommittedSession(successorSessionFile);
+				} catch (cleanupError) {
+					logger.warn("Failed to remove orphaned session after local root rollback", {
+						path: successorSessionFile,
+						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+					});
+				}
+			}
+			throw error;
+		}
+	}
+
 	async #runNewSessionTransition(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 		const previousWorkflowGateSessionId = this.sessionId;
@@ -10215,6 +10246,8 @@ export class AgentSession {
 				}
 			}
 			this.#cancelOwnAsyncJobs();
+			if (!options?.drop) await this.sessionManager.flush();
+			await this.#initializeNewSessionWithLocalRoot(options);
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
@@ -10297,6 +10330,7 @@ export class AgentSession {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
+			await this.#initializeNewSessionWithLocalRoot(options);
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
@@ -12670,6 +12704,10 @@ export class AgentSession {
 
 	setRetainedMemorySampler(sampler: (() => RetainedMemorySample) | undefined): void {
 		this.#retainedMemorySampler = sampler;
+	}
+
+	recordTuiTransactionObservation(observation: TuiTransactionObservation): void {
+		this.tuiTransactionHistory.record(observation, this.sessionManager.getSessionId());
 	}
 
 	#defaultResourceSample(): EmergencyCompactionSample {

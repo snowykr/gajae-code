@@ -4,7 +4,6 @@ import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import {
 	listSdkSessionEndpoints,
-	readSdkBrokerDiscovery,
 	readSdkSessionEndpoint,
 	SdkClient,
 	SdkClientError,
@@ -150,9 +149,7 @@ async function confirmEndpointCredentialOutput(): Promise<boolean> {
 }
 
 async function connectBroker(agentDir: string): Promise<SdkClient> {
-	await ensureBroker({ agentDir });
-	const discovery = await readSdkBrokerDiscovery(agentDir);
-	if (!discovery) throw new SdkSessionCliError("broker_unavailable", "SDK broker discovery is unavailable.", 1);
+	const discovery = await ensureBroker({ agentDir });
 	return await SdkClient.connect(discovery.url, discovery.token);
 }
 

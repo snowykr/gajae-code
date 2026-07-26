@@ -37,6 +37,7 @@ describe("workflow permission policy", () => {
 		expect(workflows.map(workflow => workflow.file)).toEqual([
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
+			".github/workflows/pet-renderer-visual-qa.yml",
 			".github/workflows/public-site-sync.yml",
 		]);
 	});

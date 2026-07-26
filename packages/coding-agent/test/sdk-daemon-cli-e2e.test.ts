@@ -209,6 +209,14 @@ describe("SDK daemon session CLI", () => {
 				endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
 			});
 
+			const ambient = await runCli(root, agentDir, ["list"]);
+			expect(ambient.exitCode).toBe(0);
+			expect(
+				(JSON.parse(ambient.stdout).result.sessions as Array<{ sessionId: string }>).map(
+					session => session.sessionId,
+				),
+			).toEqual(["live"]);
+
 			const result = await runCli(root, agentDir, ["list", "--agent-dir", alternateAgentDir]);
 			expect(result.exitCode).toBe(0);
 			expect(

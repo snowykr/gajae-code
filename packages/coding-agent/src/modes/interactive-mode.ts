@@ -600,7 +600,16 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			},
 		});
-		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
+		this.ui.setTransactionObserver(observation => {
+			this.session.recordTuiTransactionObservation(observation);
+			if (observation.classification === "shared" && observation.outcome === "accepted" && observation.durable) {
+				if (observation.durableSourceCoverage !== undefined) {
+					for (const source of observation.durableSourceCoverage) source.acknowledge();
+				} else {
+					this.#eventController.acknowledgeAcceptedRenderEvent(this.ui.terminal.columns);
+				}
+			}
+		});
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
 		this.pendingMessagesContainer = new Container();
@@ -1470,6 +1479,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
+		this.ui.setTransactionObserver(undefined);
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+		}
 		this.#welcomeComponent?.dispose();
 		this.#welcomeComponent = undefined;
 		if (this.#sttController) {

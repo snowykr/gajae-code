@@ -12,7 +12,11 @@ import {
 	readArgsTargetInternalUrl,
 } from "../../modes/components/read-tool-group";
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
-import { ToolExecutionComponent, type ToolExecutionHandle } from "../../modes/components/tool-execution";
+import {
+	ToolExecutionComponent,
+	type DurableHistoryEvent,
+	type ToolExecutionHandle,
+} from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import {
@@ -129,6 +133,8 @@ export class EventController {
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
 	#renderedIrcComponents = new Map<string, readonly Component[]>();
 	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
+	#durableHistorySources = new Set<ToolExecutionHandle>();
+	#acknowledgedDurableHistoryRevisions = new WeakMap<ToolExecutionHandle, Map<string, number>>();
 	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
 	#visibleTranscriptChanged = false;
@@ -184,6 +190,7 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 		}
 		this.clearIrcExpiryTimers();
+		this.#durableHistorySources.clear();
 	}
 
 	#recordVisibleTranscriptMutation(): void {
@@ -206,6 +213,53 @@ export class EventController {
 		}
 	}
 
+	#trackDurableHistorySource(source: ToolExecutionHandle): void {
+		if (!source.getDurableHistoryEvent && !source.getDurableHistoryEvents) return;
+		this.#durableHistorySources.add(source);
+	}
+
+	/**
+	 * Consume durable tool snapshots only after the shared transcript write has
+	 * been accepted by the terminal.
+	 */
+	acknowledgeAcceptedRenderEvent(width = this.ctx.ui.terminal.columns): void {
+		let budget = 256;
+		for (const source of this.#durableHistorySources) {
+			if (budget <= 0) break;
+			let events: readonly DurableHistoryEvent[];
+			try {
+				events = source.getDurableHistoryEvents
+					? source.getDurableHistoryEvents(width)
+					: source.getDurableHistoryEvent
+						? [source.getDurableHistoryEvent(width)].filter(
+								(event): event is DurableHistoryEvent => event !== undefined,
+							)
+						: [];
+			} catch {
+				continue;
+			}
+			let acknowledged = this.#acknowledgedDurableHistoryRevisions.get(source);
+			const pending = events.filter(event => event.revision > (acknowledged?.get(event.identity) ?? 0));
+			const accepted = pending.slice(0, budget);
+			for (const event of accepted) {
+				source.acknowledgeDurableHistoryEvent?.(event.identity, event.revision);
+				if (source.acknowledgeDurableHistoryEvent) {
+					const revisions = acknowledged ?? new Map<string, number>();
+					revisions.set(event.identity, event.revision);
+					acknowledged = revisions;
+					this.#acknowledgedDurableHistoryRevisions.set(source, revisions);
+				}
+			}
+			budget -= accepted.length;
+			const revisions = this.#acknowledgedDurableHistoryRevisions.get(source);
+			const allAcknowledged = source.acknowledgeDurableHistoryEvent
+				? events.every(event => (revisions?.get(event.identity) ?? 0) >= event.revision)
+				: accepted.length === events.length;
+			if (events.length > 0 && events.every(event => event.final) && allAcknowledged) {
+				this.#durableHistorySources.delete(source);
+			}
+		}
+	}
 	#resetReadGroup(): void {
 		this.#lastReadGroup = undefined;
 	}
@@ -219,6 +273,7 @@ export class EventController {
 			group.setExpanded(this.ctx.toolOutputExpanded);
 			addChatChild(this.ctx, group);
 			this.#lastReadGroup = group;
+			this.#trackDurableHistorySource(group);
 		}
 		return this.#lastReadGroup;
 	}
@@ -301,6 +356,7 @@ export class EventController {
 		this.ctx.promptSuggestion?.onAgentStart();
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
+		this.#durableHistorySources.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
 		if (this.ctx.retryEscapeHandler) {
@@ -664,6 +720,7 @@ export class EventController {
 					component.setExpanded(this.ctx.toolOutputExpanded);
 					this.ctx.pendingTools.set(content.id, component);
 					addChatChild(this.ctx, component);
+					this.#trackDurableHistorySource(component);
 					this.#recordVisibleTranscriptMutation();
 				} else {
 					this.ctx.pendingTools.get(content.id)?.updateArgs(renderArgs, content.id);
@@ -785,6 +842,7 @@ export class EventController {
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.pendingTools.set(event.toolCallId, component);
+			this.#trackDurableHistorySource(component);
 			addChatChild(this.ctx, component);
 			this.#recordVisibleTranscriptMutation();
 

@@ -255,6 +255,37 @@ describe("ReadToolGroupComponent", () => {
 		new InputController(ctx).setToolsExpanded(true);
 		expect(setExpanded).toHaveBeenCalledWith(true);
 	});
+	it("acknowledges one grouped snapshot and safely reactivates newer revisions", () => {
+		const component = new ReadToolGroupComponent();
+		component.updateArgs({ path: "/tmp/one.ts" }, "read-1");
+		component.updateArgs({ path: "/tmp/two.ts" }, "read-2");
+
+		const initial = component.getDurableHistoryEvents(100);
+		expect(initial).toHaveLength(1);
+		expect(initial[0]?.identity).not.toBe("read-1");
+		expect(initial[0]?.identity).not.toBe("read-2");
+		expect(initial[0]?.final).toBe(false);
+
+		const initialIdentity = initial[0]!.identity;
+		const initialRevision = initial[0]!.revision;
+		component.acknowledgeDurableHistoryEvent(initialIdentity, initialRevision + 1);
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(1);
+
+		component.acknowledgeDurableHistoryEvent(initialIdentity, initialRevision);
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
+
+		component.updateResult({ content: [{ type: "text", text: "two" }] }, false, "read-2");
+		const updated = component.getDurableHistoryEvents(100);
+		expect(updated).toHaveLength(1);
+		expect(updated[0]?.identity).toBe(initialIdentity);
+		expect(updated[0]?.revision).toBeGreaterThan(initialRevision);
+
+		component.acknowledgeDurableHistoryEvent(initialIdentity, initialRevision);
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(1);
+
+		component.acknowledgeDurableHistoryEvent(initialIdentity, updated[0]!.revision);
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
+	});
 });
 
 describe("readArgsTargetInternalUrl", () => {

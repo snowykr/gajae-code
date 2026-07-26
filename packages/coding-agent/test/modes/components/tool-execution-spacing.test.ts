@@ -1,4 +1,6 @@
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { type IrcSidebarTheme, IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
@@ -66,6 +68,33 @@ describe("ToolExecutionComponent spacing", () => {
 		expect(trailing + leading).toBe(1);
 	});
 });
+it("uses a supplied bare relative cwd for apply_patch previews", async () => {
+	const relativeCwd = `worktree-${process.pid}-${Date.now()}`;
+	const absoluteCwd = path.join(process.cwd(), relativeCwd);
+	const fileName = "tool-execution-cwd.ts";
+	await fs.mkdir(absoluteCwd);
+	try {
+		await Bun.write(path.join(absoluteCwd, fileName), "const value = 1;\n");
+		const input = [
+			"*** Begin Patch",
+			`*** Update File: ${fileName}`,
+			"@@",
+			"-const value = 1;",
+			"+const value = 2;",
+			"*** End Patch",
+		].join("\n");
+		const component = new ToolExecutionComponent("apply_patch", { input }, {}, undefined, uiStub, relativeCwd);
+
+		component.setArgsComplete();
+		await Bun.sleep(50);
+
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+		expect(rendered).toContain("(preview)");
+		expect(rendered).toContain("const value = 2;");
+	} finally {
+		await fs.rm(absoluteCwd, { recursive: true, force: true });
+	}
+});
 it("preserves manual expansion through automatic updates and drops it on remount", () => {
 	const component = new ToolExecutionComponent("custom", { path: "/tmp/example.ts" }, {}, undefined, uiStub);
 	component.setManuallyExpanded(true);
@@ -101,4 +130,107 @@ it("replaces generic SIXEL output while the IRC sidebar is visible and restores 
 	expect(Bun.stripANSI(visible).split("[SIXEL image hidden while IRC sidebar is visible]").length - 1).toBe(1);
 	split.setVisible(false);
 	expect(split.render(120).join("\n")).toContain(sixel);
+});
+it("does not reuse a stale Kitty conversion after replacing an image at the same slot", async () => {
+	terminal.imageProtocol = ImageProtocol.Kitty;
+	const firstImage = Buffer.from(
+		await Bun.file(path.join(import.meta.dir, "../../../../../assets/tool-image-fixture.webp")).arrayBuffer(),
+	).toBase64();
+	const replacementImage =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+	const releases: Array<() => void> = [];
+	const originalToBase64 = Bun.Image.prototype.toBase64;
+	const toBase64Spy = vi.spyOn(Bun.Image.prototype, "toBase64").mockImplementation(function (this: Bun.Image) {
+		const deferred = Promise.withResolvers<string>();
+		releases.push(() => {
+			void originalToBase64.call(this).then(deferred.resolve, deferred.reject);
+		});
+		return deferred.promise;
+	});
+	let requests = 0;
+	const ui = { requestRender: () => requests++ } as unknown as TUI;
+	try {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, ui);
+		component.updateResult({ content: [{ type: "image", data: firstImage, mimeType: "image/webp" }] }, false);
+		component.updateResult({ content: [{ type: "image", data: replacementImage, mimeType: "image/webp" }] }, false);
+
+		expect(releases).toHaveLength(2);
+		releases[0]();
+		await Bun.sleep(10);
+		expect(requests).toBe(0);
+		expect(component.render(80).join("\n")).not.toContain("\x1b_G");
+
+		releases[1]();
+		await Bun.sleep(10);
+		expect(requests).toBe(1);
+		expect(component.render(80).join("\n")).toContain("\x1b_G");
+	} finally {
+		toBase64Spy.mockRestore();
+	}
+});
+
+describe("ToolExecutionComponent durable lifecycle", () => {
+	it("keeps the tool identity stable while revisions advance to a final event", () => {
+		const component = new ToolExecutionComponent(
+			"custom",
+			{ path: "/tmp/example.ts" },
+			{},
+			undefined,
+			uiStub,
+			".",
+			"tool-call-1",
+		);
+
+		const initial = component.getDurableHistoryEvent(80)!;
+		expect(initial.identity).toBe("tool-call-1");
+		expect(initial.revision).toBeGreaterThan(0);
+		expect(initial.final).toBe(false);
+
+		component.updateArgs({ path: "/tmp/example.ts", content: "updated" }, "different-call-id");
+		const streaming = component.getDurableHistoryEvent(80)!;
+		expect(streaming.identity).toBe(initial.identity);
+		expect(streaming.revision).toBeGreaterThan(initial.revision);
+		expect(streaming.final).toBe(false);
+
+		component.setArgsComplete("different-call-id");
+		const argsComplete = component.getDurableHistoryEvent(80)!;
+		expect(argsComplete.identity).toBe(initial.identity);
+		expect(argsComplete.revision).toBeGreaterThan(streaming.revision);
+		expect(argsComplete.final).toBe(false);
+
+		component.updateResult({ content: [{ type: "text", text: "done" }] }, false, "different-call-id");
+		const completed = component.getDurableHistoryEvent(80)!;
+		expect(completed.identity).toBe(initial.identity);
+		expect(completed.revision).toBeGreaterThan(argsComplete.revision);
+		expect(completed.final).toBe(true);
+		expect(completed.snapshot.join("\n")).toContain("done");
+	});
+
+	it("does not emit a durable event without a tool call identity", () => {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub);
+
+		expect(component.getDurableHistoryEvent(80)).toBeUndefined();
+	});
+
+	it("ignores invalid or foreign acknowledgements without changing the durable revision", () => {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub, ".", "tool-call-2");
+		const event = component.getDurableHistoryEvent(80)!;
+
+		component.acknowledgeDurableHistoryEvent("other-call", event.revision);
+		component.acknowledgeDurableHistoryEvent("tool-call-2", 0);
+		component.acknowledgeDurableHistoryEvent("tool-call-2", event.revision + 1);
+
+		const afterInvalidAcks = component.getDurableHistoryEvent(80)!;
+		expect(afterInvalidAcks.identity).toBe(event.identity);
+		expect(afterInvalidAcks.revision).toBe(event.revision);
+		expect(afterInvalidAcks.final).toBe(false);
+
+		component.acknowledgeDurableHistoryEvent("tool-call-2", event.revision);
+		expect(component.getDurableHistoryEvent(80)).toBeUndefined();
+
+		component.updateArgs({ changed: true });
+		const reactivated = component.getDurableHistoryEvent(80);
+		expect(reactivated).toBeDefined();
+		expect(reactivated!.revision).toBeGreaterThan(event.revision);
+	});
 });

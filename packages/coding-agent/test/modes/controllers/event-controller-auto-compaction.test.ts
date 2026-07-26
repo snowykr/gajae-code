@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import type { ToolExecutionHandle } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import type { AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
+import { Container } from "@gajae-code/tui";
 
 type AutoCompactionEndEvent = Extract<AgentSessionEvent, { type: "auto_compaction_end" }>;
 beforeAll(() => initTheme());
@@ -255,5 +257,58 @@ describe("EventController auto-compaction overflow status", () => {
 		expect(fixture.showWarning).not.toHaveBeenCalled();
 		expect(fixture.order.indexOf("loader.stop")).toBeLessThan(fixture.order.indexOf("showStatus"));
 		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+	});
+	it("acknowledges a later durable source when preceding reads share grouped coverage", async () => {
+		const pendingTools = new Map<string, ToolExecutionHandle>();
+		const context = {
+			isInitialized: true,
+			statusLine: { invalidate: vi.fn() },
+			updateEditorTopBorder: vi.fn(),
+			updateEditorBorderColor: vi.fn(),
+			setWorkingMessage: vi.fn(),
+			ui: { requestRender: vi.fn(), terminal: { columns: 80 } },
+			chatContainer: new Container(),
+			pendingTools,
+			settings: { get: () => false },
+			toolOutputExpanded: false,
+			addMessageToChat: vi.fn(),
+			session: {},
+		} as unknown as InteractiveModeContext;
+		const controller = new EventController(context);
+
+		await controller.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "read-0",
+			toolName: "read",
+			args: { path: "/tmp/read-0" },
+		});
+		const firstSource = pendingTools.get("read-0")!;
+		for (let index = 1; index < 257; index++) {
+			(firstSource as unknown as { updateArgs(args: unknown, toolCallId: string): void }).updateArgs(
+				{ path: `/tmp/read-${index}` },
+				`read-${index}`,
+			);
+		}
+
+		await controller.handleEvent({
+			type: "message_start",
+			message: {
+				role: "custom",
+				customType: "test-boundary",
+				content: "boundary",
+				timestamp: 1,
+			},
+		} as AgentSessionEvent);
+		await controller.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "read-257",
+			toolName: "read",
+			args: { path: "/tmp/read-257" },
+		});
+		const laterSource = pendingTools.get("read-257")!;
+		const acknowledgeLater = vi.spyOn(laterSource, "acknowledgeDurableHistoryEvent");
+
+		controller.acknowledgeAcceptedRenderEvent(80);
+		expect(acknowledgeLater).toHaveBeenCalledWith("read-257", expect.any(Number));
 	});
 });

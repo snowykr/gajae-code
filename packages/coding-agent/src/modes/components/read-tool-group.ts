@@ -5,7 +5,7 @@ import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import { splitPathAndSel } from "../../tools/path-utils";
 import { PREVIEW_LIMITS, replaceTabs, shortenPath } from "../../tools/render-utils";
 import { renderCodeCell } from "../../tui";
-import type { ToolExecutionHandle } from "./tool-execution";
+import type { DurableHistoryEvent, ToolExecutionHandle } from "./tool-execution";
 
 /**
  * Read calls whose target is resolved through {@link InternalUrlRouter} are
@@ -78,13 +78,19 @@ type ReadEntry = {
 	correctedFrom?: string;
 	contentText?: string;
 	conflictCount?: number;
+	durableRevision: number;
+	durableAcknowledgedRevision: number;
 };
 
 /** Number of code lines to show in collapsed preview mode */
 const COLLAPSED_PREVIEW_LINES = PREVIEW_LIMITS.OUTPUT_COLLAPSED;
+let nextReadGroupIdentity = 0;
 
 export class ReadToolGroupComponent extends Container implements ToolExecutionHandle {
 	#entries = new Map<string, ReadEntry>();
+	#groupIdentity = `read-group-${++nextReadGroupIdentity}`;
+	#durableGroupRevision = 0;
+	#groupCoverageByRevision = new Map<number, ReadonlyMap<string, number>>();
 	#text: Text;
 	#expanded = false;
 	#manuallyExpanded: boolean | undefined;
@@ -109,7 +115,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			toolCallId,
 			path: rawPath,
 			status: "pending",
+			durableRevision: 1,
+			durableAcknowledgedRevision: 0,
 		};
+		if (this.#entries.has(toolCallId)) this.#advanceDurableRevision(entry);
+		if (!this.#entries.has(toolCallId) && this.#entries.size >= 1) this.#durableGroupRevision += 1;
 		entry.path = rawPath;
 		this.#entries.set(toolCallId, entry);
 		this.#updateDisplayAndNotify();
@@ -123,6 +133,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		if (!toolCallId) return;
 		const entry = this.#entries.get(toolCallId);
 		if (!entry) return;
+		this.#advanceDurableRevision(entry);
 		if (isPartial) return;
 		const details = result.details as ReadToolResultDetails | undefined;
 		const suffixResolution = getSuffixResolution(details);
@@ -141,14 +152,21 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		this.#updateDisplayAndNotify();
 	}
 
-	setArgsComplete(_toolCallId?: string): void {
+	setArgsComplete(toolCallId?: string): void {
+		if (toolCallId) {
+			const entry = this.#entries.get(toolCallId);
+			if (entry) this.#advanceDurableRevision(entry);
+		} else {
+			for (const entry of this.#entries.values()) this.#advanceDurableRevision(entry);
+		}
 		this.#updateDisplayAndNotify();
 	}
 
 	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
-		if (this.#manuallyExpanded !== undefined) return;
+		if (this.#manuallyExpanded !== undefined || this.#expanded === expanded) return;
 		this.#expanded = expanded;
+		for (const entry of this.#entries.values()) this.#advanceDurableRevision(entry);
 		this.#updateDisplayAndNotify();
 	}
 
@@ -157,13 +175,81 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	 * Transcript rebuilds recreate components from global state and drop this pin.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded === expanded && this.#expanded === expanded) return;
 		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
+		for (const entry of this.#entries.values()) this.#advanceDurableRevision(entry);
 		this.#updateDisplayAndNotify();
 	}
 
+	getDurableHistoryEvents(width: number): readonly DurableHistoryEvent[] {
+		const entries = [...this.#entries.values()].filter(
+			entry => entry.durableRevision > entry.durableAcknowledgedRevision,
+		);
+		if (entries.length === 0) return Object.freeze([]);
+
+		const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 1;
+		const snapshot = Object.freeze(this.render(safeWidth).slice());
+		if (this.#entries.size === 1) {
+			const entry = entries[0];
+			return Object.freeze([
+				Object.freeze({
+					identity: entry.toolCallId,
+					revision: entry.durableRevision,
+					final: entry.status !== "pending",
+					snapshot,
+				}),
+			]);
+		}
+
+		const revision = this.#durableGroupRevision;
+		let coverage = this.#groupCoverageByRevision.get(revision);
+		if (!coverage) {
+			coverage = new Map(entries.map(entry => [entry.toolCallId, entry.durableRevision]));
+			this.#groupCoverageByRevision.set(revision, coverage);
+		}
+		return Object.freeze([
+			Object.freeze({
+				identity: this.#groupIdentity,
+				revision,
+				final: [...this.#entries.values()].every(entry => entry.status !== "pending"),
+				snapshot,
+			}),
+		]);
+	}
+
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined {
+		return this.getDurableHistoryEvents(width)[0];
+	}
+
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void {
+		if (!Number.isSafeInteger(revision) || revision <= 0) return;
+		if (identity === this.#groupIdentity) {
+			if (revision > this.#durableGroupRevision) return;
+			const coverage = this.#groupCoverageByRevision.get(revision);
+			if (!coverage) return;
+			for (const [toolCallId, coveredRevision] of coverage) {
+				const entry = this.#entries.get(toolCallId);
+				if (
+					entry &&
+					coveredRevision <= entry.durableRevision &&
+					coveredRevision > entry.durableAcknowledgedRevision
+				) {
+					entry.durableAcknowledgedRevision = coveredRevision;
+				}
+			}
+			return;
+		}
+		const entry = this.#entries.get(identity);
+		if (!entry || revision > entry.durableRevision) return;
+		if (revision > entry.durableAcknowledgedRevision) entry.durableAcknowledgedRevision = revision;
+	}
 	getComponent(): Component {
 		return this;
+	}
+	#advanceDurableRevision(entry: ReadEntry): void {
+		entry.durableRevision += 1;
+		if (this.#entries.size >= 2) this.#durableGroupRevision += 1;
 	}
 
 	consumeVisibleTranscriptChange(): boolean {

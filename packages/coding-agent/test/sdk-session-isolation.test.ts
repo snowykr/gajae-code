@@ -348,6 +348,60 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	}, 30_000);
+	it("rolls back a new session when local root safety gating fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-rollback-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		const unsafeArtifactsDir = path.join(tempDir, "unsafe-artifacts");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(unsafeArtifactsDir, { recursive: true });
+		fs.writeFileSync(path.join(unsafeArtifactsDir, "local"), "not a directory\n");
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		const predecessorSessionId = manager.getSessionId();
+		const predecessorSessionFile = manager.getSessionFile();
+		const originalGetArtifactsDir = manager.getArtifactsDir;
+		const originalIsManagedDestination = manager.isManagedDestination;
+		const originalNewSession = manager.newSession.bind(manager);
+		let successorSessionFile: string | undefined;
+		manager.getArtifactsDir = () => unsafeArtifactsDir;
+		manager.isManagedDestination = () => false;
+		manager.newSession = async options => {
+			const result = await originalNewSession(options);
+			successorSessionFile = manager.getSessionFile();
+			return result;
+		};
+
+		try {
+			await expect(session.newSession()).rejects.toThrow();
+			expect(manager.getSessionId()).toBe(predecessorSessionId);
+			expect(manager.getSessionFile()).toBe(predecessorSessionFile);
+			expect(successorSessionFile).toBeDefined();
+			expect(successorSessionFile).not.toBe(predecessorSessionFile);
+			expect(fs.existsSync(successorSessionFile!)).toBe(false);
+		} finally {
+			manager.getArtifactsDir = originalGetArtifactsDir;
+			manager.isManagedDestination = originalIsManagedDestination;
+			manager.newSession = originalNewSession;
+			await session.dispose();
+		}
+	}, 30_000);
 
 	it("initializes a default local root without shadowing an explicit owner", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-owner-${Snowflake.next()}-`));
