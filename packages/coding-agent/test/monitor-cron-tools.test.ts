@@ -218,7 +218,7 @@ describe("MonitorTool", () => {
 			persistent: true,
 		});
 		await manager.waitForAll();
-		await new Promise(resolve => setTimeout(resolve, 300));
+		await Bun.sleep(300);
 
 		expect(steered.length).toBe(1);
 		expect(steered[0]?.content).toContain("third");

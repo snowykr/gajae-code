@@ -26,6 +26,91 @@ const EXECUTOR_QA_EVIDENCE =
 /** Common Ultragoal skill spawn phrasing: "executor QA/red-team lane". */
 const EXECUTOR_QA_LANE = /\bexecutor\b[\s\S]{0,48}\b(?:qa|red[-\s]?team)\s+lane\b/i;
 
+const NEGATION_NEARBY =
+	/\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|not|no|without|avoid|refuse\s+to|decline\s+to)\b/i;
+const NEGATED_ACTIVATION_AFTER =
+	/\b(?:(?:(?:is|are|was|were)\s+)?(?:not|never)|(?:isn't|aren't|wasn't|weren't))\s+(?:requested|needed|wanted|required|necessary|allowed|available|applicable|run|produce|activate|perform)\b|\b(?:must|should|cannot|can't)\s+(?:not\s+)?(?:run|produce|activate|perform)\b|\bunnecessary\b/i;
+/** Explicit omission-negation phrasing ("do not skip" or "without skipping") is affirmative. */
+const NEGATED_OMISSION =
+	/\b(?:do\s+not|don't|never|must\s+not|should\s+not)\s+(?:skip|omit|avoid|decline|refuse|forget|fail|neglect)\b|\bwithout\s+(?:skipping|omitting|avoiding|declining|refusing|forgetting|failing|neglecting)\b/i;
+function hasScopedNegatedOmission(clause: string, matchStart: number): boolean {
+	const beforeMatch = clause.slice(0, matchStart);
+	const omissionMatcher = new RegExp(NEGATED_OMISSION.source, `${NEGATED_OMISSION.flags}g`);
+	let omissionEnd = -1;
+	for (const omission of beforeMatch.matchAll(omissionMatcher)) {
+		const index = omission.index;
+		if (index === undefined) continue;
+		omissionEnd = index + omission[0].length;
+	}
+
+	if (omissionEnd < 0) return false;
+	const requestTail = beforeMatch.slice(omissionEnd);
+	return !NEGATION_NEARBY.test(requestTail) && !/\b(?:and|but|however|then|yet)\b/i.test(requestTail);
+}
+function getActivationScope(
+	clause: string,
+	matchStart: number,
+	matchEnd: number,
+): {
+	start: number;
+	end: number;
+} {
+	let start = 0;
+	let end = clause.length;
+	const separatorMatcher = /[,;]|\b(?:and|but|however|then|yet)\b/gi;
+
+	for (const separator of clause.matchAll(separatorMatcher)) {
+		const index = separator.index;
+		if (index === undefined) continue;
+		const separatorEnd = index + separator[0].length;
+		if (separatorEnd <= matchStart) {
+			start = separatorEnd;
+		} else if (index >= matchEnd) {
+			end = index;
+			break;
+		}
+	}
+
+	return { start, end };
+}
+
+function hasScopedNegation(clause: string, matchStart: number, matchEnd: number): boolean {
+	const beforeMatch = clause.slice(0, matchStart).replace(/\bnot\s+(?:only|just)\b/gi, "");
+	if (NEGATION_NEARBY.test(beforeMatch)) return true;
+	return NEGATED_ACTIVATION_AFTER.test(clause.slice(matchEnd));
+}
+
+function hasAffirmativeActivation(text: string, pattern: RegExp): boolean {
+	const matcher = new RegExp(pattern.source, `${pattern.flags}g`);
+	for (const match of text.matchAll(matcher)) {
+		const index = match.index;
+		if (index === undefined) continue;
+
+		const clauseStart = Math.max(
+			text.lastIndexOf(".", index),
+			text.lastIndexOf("!", index),
+			text.lastIndexOf("?", index),
+			text.lastIndexOf(";", index),
+			text.lastIndexOf("\n", index),
+		);
+		const clauseEndOffset = text.slice(index).search(/[.!?;\n]/);
+		const clauseEnd = clauseEndOffset < 0 ? text.length : index + clauseEndOffset;
+		const clause = text.slice(clauseStart + 1, clauseEnd);
+		const matchStart = index - clauseStart - 1;
+		const scope = getActivationScope(clause, matchStart, matchStart + match[0].length);
+		const scopedClause = clause.slice(scope.start, scope.end);
+		const scopedMatchStart = matchStart - scope.start;
+		const scopedMatchEnd = scopedMatchStart + match[0].length;
+		if (
+			!hasScopedNegation(scopedClause, scopedMatchStart, scopedMatchEnd) ||
+			hasScopedNegatedOmission(scopedClause, scopedMatchStart)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
 export function isExecutorExecutionMode(value: unknown): value is ExecutorExecutionMode {
 	return value === "default" || value === "ultragoal-red-team";
 }
@@ -55,7 +140,11 @@ export function parseExecutorExecutionMode(value: unknown): ExecutorExecutionMod
 export function assignmentRequestsUltragoalRedTeam(assignment: string | undefined): boolean {
 	const text = assignment?.trim() ?? "";
 	if (text.length === 0) return false;
-	return ULTRAGOAL_COMPLETION_QA.test(text) || EXECUTOR_QA_EVIDENCE.test(text) || EXECUTOR_QA_LANE.test(text);
+	return (
+		hasAffirmativeActivation(text, ULTRAGOAL_COMPLETION_QA) ||
+		hasAffirmativeActivation(text, EXECUTOR_QA_EVIDENCE) ||
+		hasAffirmativeActivation(text, EXECUTOR_QA_LANE)
+	);
 }
 
 export interface ResolveUltragoalRedTeamArgs {

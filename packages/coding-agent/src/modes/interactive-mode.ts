@@ -610,6 +610,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			}
 		});
+		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
 		this.pendingMessagesContainer = new Container();

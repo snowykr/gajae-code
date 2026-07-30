@@ -179,6 +179,15 @@ export interface NestedRepoPatch {
 	relativePath: string;
 	patch: string;
 }
+export class NestedPatchApplicationError extends Error {
+	constructor(
+		message: string,
+		readonly rollbackFailures: readonly string[],
+	) {
+		super(message);
+		this.name = "NestedPatchApplicationError";
+	}
+}
 
 export interface DeltaPatchResult {
 	rootPatch: string;
@@ -299,7 +308,10 @@ export async function applyNestedPatches(repoRoot: string, patches: NestedRepoPa
 		const rollback = rollbackFailures.length
 			? `; rollback failed for: ${rollbackFailures.join(", ")}`
 			: "; earlier nested patches were rolled back";
-		throw new Error(`Nested repository patch application failed: ${message}${rollback}`);
+		throw new NestedPatchApplicationError(
+			`Nested repository patch application failed: ${message}${rollback}`,
+			rollbackFailures,
+		);
 	}
 }
 

@@ -356,7 +356,7 @@ describe("createAgentSession session storage isolation", () => {
 		const unsafeArtifactsDir = path.join(tempDir, "unsafe-artifacts");
 		fs.mkdirSync(cwd, { recursive: true });
 		fs.mkdirSync(unsafeArtifactsDir, { recursive: true });
-		fs.writeFileSync(path.join(unsafeArtifactsDir, "local"), "not a directory\n");
+		await Bun.write(path.join(unsafeArtifactsDir, "local"), "not a directory\n");
 
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
@@ -376,17 +376,16 @@ describe("createAgentSession session storage isolation", () => {
 
 		const predecessorSessionId = manager.getSessionId();
 		const predecessorSessionFile = manager.getSessionFile();
-		const originalGetArtifactsDir = manager.getArtifactsDir;
-		const originalIsManagedDestination = manager.isManagedDestination;
-		const originalNewSession = manager.newSession.bind(manager);
+		const originalPrepareNewSession = manager.prepareNewSession.bind(manager);
 		let successorSessionFile: string | undefined;
-		manager.getArtifactsDir = () => unsafeArtifactsDir;
-		manager.isManagedDestination = () => false;
-		manager.newSession = async options => {
-			const result = await originalNewSession(options);
-			successorSessionFile = manager.getSessionFile();
-			return result;
+		manager.prepareNewSession = async options => {
+			const prepared = await originalPrepareNewSession(options);
+			successorSessionFile = prepared.sessionFile;
+			Object.defineProperty(prepared, "artifactsDir", { value: unsafeArtifactsDir, configurable: true });
+			return prepared;
 		};
+		const originalIsManagedDestination = manager.isManagedDestination;
+		manager.isManagedDestination = () => false;
 
 		try {
 			await expect(session.newSession()).rejects.toThrow();
@@ -396,9 +395,8 @@ describe("createAgentSession session storage isolation", () => {
 			expect(successorSessionFile).not.toBe(predecessorSessionFile);
 			expect(fs.existsSync(successorSessionFile!)).toBe(false);
 		} finally {
-			manager.getArtifactsDir = originalGetArtifactsDir;
 			manager.isManagedDestination = originalIsManagedDestination;
-			manager.newSession = originalNewSession;
+			manager.prepareNewSession = originalPrepareNewSession;
 			await session.dispose();
 		}
 	}, 30_000);

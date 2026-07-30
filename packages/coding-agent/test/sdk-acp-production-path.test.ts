@@ -123,6 +123,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let releasePermissionModeSet: (() => void) | undefined;
 	let activeModelPreset = "test-preset";
 	let completeNextPromptBeforeAck = false;
+	let replayStaleFinalOnPrompt = false;
+	let queuedPreAcknowledgementTextOnPrompt = false;
+	let holdQueuedPreAcknowledgementFrame = false;
+	let queuedPreAcknowledgementFrameBlocked = false;
+	let releaseQueuedPreAcknowledgementFrame: (() => void) | undefined;
 
 	let server!: ReturnType<typeof Bun.serve>;
 	server = Bun.serve({
@@ -278,6 +283,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 											{ name: "ralplan", description: "Build a consensus plan" },
 											{ name: "ultragoal", description: "Execute durable goals" },
 											{ name: "team", description: "Run parallel workers" },
+											{ name: "deep-interview", description: "Duplicate should be ignored" },
 										]
 									: frame.query === "session.metadata"
 										? [{ sessionId: "owned-session", name: "MCP List Request", cwd }]
@@ -371,6 +377,25 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								}),
 							);
 						}
+						if (queuedPreAcknowledgementTextOnPrompt) {
+							socket.send(JSON.stringify({ type: "activity", sessionId: "owned-session", state: "idle" }));
+							socket.send(
+								JSON.stringify({
+									type: "event",
+									payload: {
+										event_type: "message_update",
+										event: {
+											type: "message_update",
+											message: {
+												role: "assistant",
+												content: [{ type: "text", text: "queued pre-ack text" }],
+											},
+											assistantMessageEvent: { type: "text_delta", delta: "queued pre-ack text" },
+										},
+									},
+								}),
+							);
+						}
 					}
 					socket.send(
 						JSON.stringify({
@@ -385,6 +410,66 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 										: {},
 						}),
 					);
+					if (frame.operation === "turn.prompt" && replayStaleFinalOnPrompt) {
+						replayStaleFinalOnPrompt = false;
+						setTimeout(() => {
+							socket.send(
+								JSON.stringify({
+									type: "event",
+									payload: {
+										event_type: "message_update",
+										event: {
+											type: "message_update",
+											commandId: "stale-command",
+											turnId: "stale-turn",
+											message: {
+												role: "assistant",
+												content: [{ type: "text", text: "stale replayed chunk" }],
+											},
+											assistantMessageEvent: { type: "text_delta", delta: "stale replayed chunk" },
+										},
+									},
+								}),
+							);
+							socket.send(
+								JSON.stringify({
+									type: "agent_end",
+									sessionId: "owned-session",
+									commandId: "stale-command",
+									turnId: "stale-turn",
+									finalText: "stale final",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+								}),
+							);
+							socket.send(
+								JSON.stringify({
+									type: "agent_end",
+									sessionId: "owned-session",
+									commandId: "prompt-command",
+									turnId: "prompt-turn",
+									finalText: "fresh final",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+								}),
+							);
+						}, 0);
+					}
+					if (frame.operation === "turn.prompt" && queuedPreAcknowledgementTextOnPrompt) {
+						queuedPreAcknowledgementTextOnPrompt = false;
+						setTimeout(
+							() =>
+								socket.send(
+									JSON.stringify({
+										type: "agent_end",
+										sessionId: "owned-session",
+										commandId: "prompt-command",
+										turnId: "prompt-turn",
+										finalText: "owned final after queued text",
+										outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+									}),
+								),
+							0,
+						);
+					}
 				}
 			},
 		},
@@ -410,6 +495,16 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		{
 			sessionUpdate: async (update: SessionNotification) => {
 				updates.push(update);
+				if (
+					holdQueuedPreAcknowledgementFrame &&
+					update.update.sessionUpdate === "session_info_update" &&
+					(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "idle"
+				) {
+					queuedPreAcknowledgementFrameBlocked = true;
+					const gate = Promise.withResolvers<void>();
+					releaseQueuedPreAcknowledgementFrame = gate.resolve;
+					await gate.promise;
+				}
 			},
 			signal: controller.signal,
 			closed: Promise.withResolvers<void>().promise,
@@ -525,9 +620,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	);
 	const availableCommands = updates.find(update => update.update.sessionUpdate === "available_commands_update")
 		?.update as { availableCommands?: Array<{ name: string }> };
-	expect(availableCommands.availableCommands?.map(command => command.name)).toEqual(
-		expect.arrayContaining(["skill:deep-interview", "skill:ralplan", "skill:ultragoal", "skill:team"]),
+	const commandNames = availableCommands.availableCommands?.map(command => command.name) ?? [];
+	expect(commandNames).toEqual(
+		expect.arrayContaining(["model", "skill:deep-interview", "skill:ralplan", "skill:ultragoal", "skill:team"]),
 	);
+	expect(new Set(commandNames).size).toBe(commandNames.length);
 	const listedOwned = await bounded(agent.listSessions({ cwd }), "list owned session");
 	expect(listedOwned.sessions).toEqual([
 		expect.objectContaining({
@@ -798,6 +895,33 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 				(update.update as { content?: { text?: string } }).content?.text === "fast",
 		),
 	).toBe(true);
+	replayStaleFinalOnPrompt = true;
+	const freshFinalPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "fresh final after replay" }],
+	});
+	expect(await bounded(freshFinalPrompt, "fresh final prompt completion")).toEqual({ stopReason: "end_turn" });
+	const finalChunks = updates
+		.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+		.map(update => (update.update as { content: { text: string } }).content.text);
+	expect(finalChunks).not.toContain("fresh final");
+	expect(finalChunks).toContain("stale replayed chunk");
+	expect(finalChunks).not.toContain("stale final");
+	holdQueuedPreAcknowledgementFrame = true;
+	queuedPreAcknowledgementTextOnPrompt = true;
+	const queuedTextPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "queued pre-ack text" }],
+	});
+	await waitFor(() => queuedPreAcknowledgementFrameBlocked, "queued pre-acknowledgement frame");
+	holdQueuedPreAcknowledgementFrame = false;
+	releaseQueuedPreAcknowledgementFrame?.();
+	expect(await bounded(queuedTextPrompt, "queued pre-ack text prompt completion")).toEqual({ stopReason: "end_turn" });
+	const queuedTextChunks = updates
+		.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+		.map(update => (update.update as { content: { text: string } }).content.text);
+	expect(queuedTextChunks).toContain("queued pre-ack text");
+	expect(queuedTextChunks).not.toContain("owned final after queued text");
 
 	await expect(
 		agent.prompt({
@@ -1116,7 +1240,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		() => undefined,
 		(error: unknown) => error,
 	);
-	await waitFor(() => promptInputs.length === 6, "delete prompt delivery");
+	await waitFor(() => promptInputs.length === 7, "delete prompt delivery");
 	await expect(
 		bounded(agent.deleteSession({ sessionId: created.sessionId }), "owned session delete"),
 	).resolves.toEqual({});
@@ -1157,7 +1281,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "frame failure" }],
 	});
-	await waitFor(() => promptInputs.length === 7, "frame failure prompt delivery");
+	await waitFor(() => promptInputs.length === 9, "frame failure prompt delivery");
 	rejectFrameUpdates = true;
 	promptSocket!.send(
 		JSON.stringify({
@@ -1213,7 +1337,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		sessionId: created.sessionId,
 		prompt: [{ type: "text", text: "follow up" }],
 	});
-	await waitFor(() => promptInputs.length === 8, "restored-session follow-up prompt delivery");
+	await waitFor(() => promptInputs.length === 10, "restored-session follow-up prompt delivery");
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
 	promptSocket!.send(

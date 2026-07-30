@@ -84,6 +84,7 @@ function mockIsolation(): void {
 	vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue(BASELINE);
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue(ISOLATION);
 	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+	vi.spyOn(worktreeModule, "cleanupTaskBranches").mockResolvedValue();
 	vi.spyOn(repositoryBindingModule, "resolveTaskRepositoryBinding").mockResolvedValue({
 		schema: "gjc.repository_binding.v1",
 		worktreeRoot: "/repo",
@@ -284,6 +285,23 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).not.toContain("merge failed");
 	});
 
+	it("keeps branch-mode nested-only edits as recovery after a safe rollback", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("BranchNestedRollback", 0));
+		const nestedPatches = [{ relativePath: "vendor/nested", patch: "nested patch" }];
+		vi.spyOn(worktreeModule, "commitToBranch").mockResolvedValue({ nestedPatches });
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches });
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(false);
+		const applyText = vi.spyOn(git.patch, "applyText").mockResolvedValue();
+
+		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("BranchNestedRollback")]);
+
+		expect(applyText).toHaveBeenCalledWith("/repo/vendor/nested", "nested patch\n", { reverse: true });
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("Recovery patch:");
+		expect(resultText).not.toContain("changes persisted to the owner worktree");
+	});
 	it("downgrades branch results when merge setup throws before apply", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("BranchThrow", 0));
@@ -307,7 +325,7 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).toContain("local://subagents/");
 	});
 
-	it("keeps stash-pop-conflicted merged branches recovery-only", async () => {
+	it("retains recovery for overlapping merged/failed branches after a stash-pop conflict", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("StashConflict", 0));
 		const branchName = "gjc/task/StashConflict";
@@ -324,12 +342,13 @@ describe("isolated task persistence recovery", () => {
 
 		const resultText = await runTask(await TaskTool.create(createSession("branch")), [task("StashConflict")]);
 
-		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");
-		expect(resultText).toContain("local://subagents/");
+		expect(resultText).toContain("merge failed");
+		expect(resultText).toContain("stash pop: conflict with owner changes");
+		expect(worktreeModule.cleanupTaskBranches).not.toHaveBeenCalled();
 	});
 
-	it("downgrades root and nested recovery after a post-apply proof throws", async () => {
+	it("retains applied persistence when a failed root proof cannot be rolled back", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("ProofThrow", 0));
 		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
@@ -337,17 +356,34 @@ describe("isolated task persistence recovery", () => {
 			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
 		});
 		vi.spyOn(git.patch, "canApplyText").mockResolvedValue(true);
-		const applyText = vi.spyOn(git.patch, "applyText").mockResolvedValue();
+		const applyText = vi
+			.spyOn(git.patch, "applyText")
+			.mockResolvedValueOnce()
+			.mockRejectedValueOnce(new Error("rollback conflict"));
 		vi.spyOn(worktreeModule, "verifyRootPatchesApplied").mockRejectedValue(new Error("git inspection failed"));
 		const applyNested = vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
-
+		const writes = vi.spyOn(Bun, "write");
 		const resultText = await runTask(await TaskTool.create(createSession()), [task("ProofThrow")]);
 
-		expect(applyText).toHaveBeenCalledTimes(1);
+		expect(applyText).toHaveBeenCalledTimes(2);
+		expect(applyText.mock.calls[1]?.[2]).toEqual({ reverse: true });
 		expect(applyNested).not.toHaveBeenCalled();
-		expect(resultText).toContain("merge failed");
-		expect(resultText).toContain("changes were not persisted to the owner worktree");
-		expect(resultText).toContain("local://subagents/");
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		const recoveryBundles = writes.mock.calls
+			.map(([, data]) =>
+				data instanceof Buffer ? data.toString("utf8") : typeof data === "string" ? data : undefined,
+			)
+			.filter((data): data is string =>
+				Boolean(data?.includes("root patch applied before proof") || data?.includes("nested patch")),
+			);
+		expect(recoveryBundles.at(-1)).toContain("nested patch");
+		const recoveryBundle = JSON.parse(recoveryBundles.at(-1)!) as {
+			rootPatch?: string;
+			nestedPatches?: unknown[];
+		};
+		expect(recoveryBundle.rootPatch).toBe("");
+		expect(recoveryBundle.nestedPatches).toEqual([{ relativePath: "vendor/nested", patch: "nested patch" }]);
+		expect(resultText).not.toContain("changes were not persisted to the owner worktree");
 	});
 
 	it("preserves root recovery when nested capture is incomplete", async () => {
@@ -434,6 +470,26 @@ describe("isolated task persistence recovery", () => {
 		expect(resultText).toContain("local://subagents/");
 	});
 
+	it("retains owner-applied persistence when nested apply rollback is incomplete", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NestedApplyRollback", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
+		});
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockRejectedValue(
+			new worktreeModule.NestedPatchApplicationError(
+				"Nested repository patch application failed: nested conflict; rollback failed for: vendor/nested",
+				["vendor/nested"],
+			),
+		);
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedApplyRollback")]);
+
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		expect(resultText).not.toContain("changes were not persisted to the owner worktree");
+		expect(resultText).not.toContain("Recovery patch:");
+	});
 	it("downgrades nested changes when exact post-apply proof fails", async () => {
 		mockIsolation();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NestedProof", 0));
@@ -442,12 +498,114 @@ describe("isolated task persistence recovery", () => {
 			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
 		});
 		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		const applyText = vi.spyOn(git.patch, "applyText").mockResolvedValue();
 		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(false);
 
 		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedProof")]);
+		expect(applyText).toHaveBeenCalledTimes(1);
+		expect(applyText.mock.calls[0]?.[0]).toBe("/repo/vendor/nested");
+		expect(applyText.mock.calls[0]?.[2]).toEqual({ reverse: true });
 
 		expect(resultText).toContain("merge failed");
 		expect(resultText).toContain("changes were not persisted to the owner worktree");
 		expect(resultText).toContain("local://subagents/");
+	});
+
+	it("retains owner-applied persistence when nested proof rollback fails", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("NestedProofRollback", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch" }],
+		});
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(false);
+		const applyText = vi.spyOn(git.patch, "applyText").mockRejectedValue(new Error("nested rollback conflict"));
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("NestedProofRollback")]);
+
+		expect(applyText).toHaveBeenCalledTimes(1);
+		expect(applyText.mock.calls[0]?.[2]).toEqual({ reverse: true });
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		expect(resultText).not.toContain("changes were not persisted to the owner worktree");
+		expect(resultText).not.toContain("Recovery patch:");
+	});
+	it("preserves applied root changes while recovering safely rolled-back nested changes", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("RootNestedProof", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({
+			rootPatch: "root patch applied",
+			nestedPatches: [{ relativePath: "vendor/nested", patch: "nested patch rolled back" }],
+		});
+		vi.spyOn(git.patch, "canApplyText").mockResolvedValue(true);
+		const applyText = vi.spyOn(git.patch, "applyText").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyRootPatchesApplied").mockResolvedValue(true);
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockResolvedValue();
+		vi.spyOn(worktreeModule, "verifyNestedPatchesApplied").mockResolvedValue(false);
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("RootNestedProof")]);
+
+		expect(applyText).toHaveBeenCalledTimes(2);
+		expect(applyText.mock.calls[1]?.[2]).toEqual({ reverse: true });
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		expect(resultText).not.toContain("changes were not persisted to the owner worktree");
+	});
+
+	it("keeps recovery for nested repositories rolled back successfully during a partial rollback failure", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess")
+			.mockResolvedValueOnce(makeResult("NestedRollbackFailed", 0))
+			.mockResolvedValueOnce(makeResult("NestedRollbackSafe", 0));
+		vi.spyOn(worktreeModule, "captureDeltaPatch")
+			.mockResolvedValueOnce({
+				rootPatch: "",
+				nestedPatches: [{ relativePath: "vendor/failed", patch: "failed nested patch" }],
+			})
+			.mockResolvedValueOnce({
+				rootPatch: "",
+				nestedPatches: [{ relativePath: "vendor/safe", patch: "safe nested patch" }],
+			});
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockRejectedValue(
+			new worktreeModule.NestedPatchApplicationError(
+				"Nested repository patch application failed: nested conflict; rollback failed for: vendor/failed",
+				["vendor/failed"],
+			),
+		);
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [
+			task("NestedRollbackFailed"),
+			task("NestedRollbackSafe"),
+		]);
+
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		expect(resultText).toContain("changes were not persisted to the owner worktree");
+		expect(resultText).toContain("local://subagents/");
+	});
+	it("retains only safely rolled-back nested material from a mixed-repository task when a failed repo path contains commas", async () => {
+		mockIsolation();
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("MixedNestedRollback", 0));
+		const nestedPatches = [
+			{ relativePath: "vendor/failed,with,comma", patch: "failed nested patch" },
+			{ relativePath: "vendor/safe", patch: "safe nested patch" },
+		];
+		vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches });
+		vi.spyOn(worktreeModule, "applyNestedPatches").mockRejectedValue(
+			new worktreeModule.NestedPatchApplicationError(
+				"Nested repository patch application failed: nested conflict; rollback failed for: vendor/failed,with,comma",
+				["vendor/failed,with,comma"],
+			),
+		);
+		const writeSpy = vi.spyOn(Bun, "write");
+
+		const resultText = await runTask(await TaskTool.create(createSession()), [task("MixedNestedRollback")]);
+
+		expect(resultText).toContain("changes persisted to the owner worktree");
+		const bundles = writeSpy.mock.calls
+			.map(call => call[1] as unknown)
+			.filter((value): value is Uint8Array => value instanceof Uint8Array)
+			.map(value => new TextDecoder().decode(value));
+		expect(
+			bundles.some(bundle => bundle.includes("safe nested patch") && !bundle.includes("failed nested patch")),
+		).toBe(true);
 	});
 });

@@ -238,6 +238,11 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 					entry.durableAcknowledgedRevision = coveredRevision;
 				}
 			}
+			// Acknowledging a revision advances every covered entry; older coverage
+			// cannot contribute to a future acknowledgement and can be released.
+			for (const coveredRevision of this.#groupCoverageByRevision.keys()) {
+				if (coveredRevision <= revision) this.#groupCoverageByRevision.delete(coveredRevision);
+			}
 			return;
 		}
 		const entry = this.#entries.get(identity);

@@ -2208,3 +2208,172 @@ describe("managed session write protocol", () => {
 		expect(await fs.readlink(pending.detachedArtifactsPath)).toBe(replacementTarget);
 	});
 });
+describe("acquireManagedLock stale successor race", () => {
+	it("restores a successor moved into quarantine after stale-owner observation", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-lock-race-"));
+		temporaryDirectories.push(root);
+		const locksDirectory = path.join(root, "locks");
+		await fs.mkdir(locksDirectory);
+		const lockPath = path.join(locksDirectory, "session.lock");
+		const now = Date.now();
+		await Bun.write(
+			lockPath,
+			JSON.stringify({
+				attemptId: "stale-owner",
+				pid: process.pid,
+				processStartId: "stale-process",
+				createdAt: now - 120_000,
+				heartbeatAt: now - 120_000,
+				leaseExpiresAt: now - 60_000,
+			}),
+		);
+		const successorFixturePath = path.join(root, "successor.fixture");
+		await Bun.write(
+			successorFixturePath,
+			JSON.stringify({
+				attemptId: "successor",
+				pid: process.pid,
+				processStartId: "successor-process",
+				createdAt: now,
+				heartbeatAt: now,
+				leaseExpiresAt: now - 1,
+			}),
+		);
+
+		const originalRename = syncFs.renameSync;
+		vi.spyOn(syncFs, "renameSync").mockImplementation((source, destination) => originalRename(source, destination));
+		const originalLstat = syncFs.lstatSync;
+		let injectedSuccessor = false;
+		vi.spyOn(syncFs, "lstatSync").mockImplementation(((pathname: syncFs.PathLike, options?: syncFs.StatOptions) => {
+			const result = originalLstat(pathname, options as never);
+			if (
+				!injectedSuccessor &&
+				pathname === lockPath &&
+				typeof options === "object" &&
+				options !== null &&
+				"bigint" in options &&
+				options.bigint === true
+			) {
+				const detachedPath = `${lockPath}.observed`;
+				originalRename(lockPath, detachedPath);
+				originalRename(successorFixturePath, lockPath);
+				injectedSuccessor = true;
+			}
+			return result;
+		}) as never);
+
+		let restoredSuccessor = false;
+		const restoredSnapshotPath = path.join(root, "restored-successor.snapshot");
+		const originalLink = syncFs.linkSync;
+		vi.spyOn(syncFs, "linkSync").mockImplementation((source, destination) => {
+			const result = originalLink(source, destination);
+			if (destination === lockPath && !restoredSuccessor) {
+				restoredSuccessor = true;
+				originalLink(lockPath, restoredSnapshotPath);
+			}
+			return result;
+		});
+
+		try {
+			const lock = await managedSessionStorage.acquireManagedLock(locksDirectory, "session");
+			expect(injectedSuccessor).toBe(true);
+			expect(restoredSuccessor).toBe(true);
+			expect(await Bun.file(restoredSnapshotPath).json()).toMatchObject({ attemptId: "successor" });
+			await lock.release();
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+	it("revokes a quarantined successor when a third contender wins the lock path", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-lock-three-way-race-"));
+		temporaryDirectories.push(root);
+		const locksDirectory = path.join(root, "locks");
+		await fs.mkdir(locksDirectory);
+		const lockPath = path.join(locksDirectory, "session.lock");
+		const now = Date.now();
+		await Bun.write(
+			lockPath,
+			JSON.stringify({
+				attemptId: "stale-owner",
+				pid: process.pid,
+				processStartId: "stale-process",
+				createdAt: now - 120_000,
+				heartbeatAt: now - 120_000,
+				leaseExpiresAt: now - 60_000,
+			}),
+		);
+		const successorFixturePath = path.join(root, "successor.fixture");
+		const thirdContenderFixturePath = path.join(root, "third-contender.fixture");
+		await Bun.write(
+			successorFixturePath,
+			JSON.stringify({
+				attemptId: "successor",
+				pid: process.pid,
+				processStartId: "successor-process",
+				createdAt: now,
+				heartbeatAt: now,
+				leaseExpiresAt: now + 60_000,
+			}),
+		);
+		await Bun.write(
+			thirdContenderFixturePath,
+			JSON.stringify({
+				attemptId: "third-contender",
+				pid: process.pid,
+				processStartId: "third-process",
+				createdAt: now,
+				heartbeatAt: now,
+				leaseExpiresAt: now + 60_000,
+			}),
+		);
+
+		const originalRename = syncFs.renameSync;
+		vi.spyOn(syncFs, "renameSync").mockImplementation((source, destination) => originalRename(source, destination));
+		const originalLstat = syncFs.lstatSync;
+		let injectedSuccessor = false;
+		vi.spyOn(syncFs, "lstatSync").mockImplementation(((pathname: syncFs.PathLike, options?: syncFs.StatOptions) => {
+			const result = originalLstat(pathname, options as never);
+			if (
+				!injectedSuccessor &&
+				pathname === lockPath &&
+				typeof options === "object" &&
+				options !== null &&
+				"bigint" in options &&
+				options.bigint === true
+			) {
+				const detachedPath = `${lockPath}.observed`;
+				originalRename(lockPath, detachedPath);
+				originalRename(successorFixturePath, lockPath);
+				injectedSuccessor = true;
+			}
+			return result;
+		}) as never);
+
+		let injectedThirdContender = false;
+		const originalLink = syncFs.linkSync;
+		vi.spyOn(syncFs, "linkSync").mockImplementation((source, destination) => {
+			if (!injectedThirdContender && destination === lockPath) {
+				injectedThirdContender = true;
+				originalRename(thirdContenderFixturePath, lockPath);
+				setTimeout(() => {
+					try {
+						syncFs.unlinkSync(lockPath);
+					} catch {
+						/* the contender may already have released its lock */
+					}
+				}, 25);
+			}
+			return originalLink(source, destination);
+		});
+
+		try {
+			const lock = await managedSessionStorage.acquireManagedLock(locksDirectory, "session");
+			expect(injectedSuccessor).toBe(true);
+			expect(injectedThirdContender).toBe(true);
+			expect((await fs.readdir(locksDirectory)).some(entry => entry.endsWith(".stale"))).toBe(false);
+			await lock.release();
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+});

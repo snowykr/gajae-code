@@ -10171,30 +10171,6 @@ export class AgentSession {
 		return transition;
 	}
 
-	async #initializeNewSessionWithLocalRoot(options?: NewSessionOptions): Promise<void> {
-		const rollbackSessionState = this.sessionManager.captureState();
-		await this.sessionManager.newSession(options);
-		const successorSessionFile = this.sessionFile;
-		try {
-			await initializeLocalRoot(this.#localProtocolOptions());
-		} catch (error) {
-			this.sessionManager.restoreState(rollbackSessionState);
-			this.#syncAgentSessionId(rollbackSessionState.sessionId);
-			this.#reconnectToAgent();
-			if (successorSessionFile && successorSessionFile !== rollbackSessionState.sessionFile) {
-				try {
-					await this.sessionManager.discardUncommittedSession(successorSessionFile);
-				} catch (cleanupError) {
-					logger.warn("Failed to remove orphaned session after local root rollback", {
-						path: successorSessionFile,
-						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-					});
-				}
-			}
-			throw error;
-		}
-	}
-
 	async #runNewSessionTransition(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 		const previousWorkflowGateSessionId = this.sessionId;
@@ -10247,19 +10223,24 @@ export class AgentSession {
 			}
 			this.#cancelOwnAsyncJobs();
 			if (!options?.drop) await this.sessionManager.flush();
-			await this.#initializeNewSessionWithLocalRoot(options);
-			this.#closeAllProviderSessions("new session");
-			this.#rebindProviderSessionState(new Map());
-			this.agent.reset();
-			if (!options?.drop) await this.sessionManager.flush();
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
+				// Persist the successor while the predecessor is still the published
+				// session. A persistence failure must not cross the commit boundary.
+				await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
 			} catch (error) {
-				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+				try {
+					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
+				} finally {
+					this.#reconnectToAgent();
+				}
 			}
+			this.#closeAllProviderSessions("new session");
+			this.#rebindProviderSessionState(new Map());
+			this.agent.reset();
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -10270,6 +10251,7 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.sessionManager.flush();
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);
@@ -10323,6 +10305,9 @@ export class AgentSession {
 			}
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
+				// Persist the successor while the predecessor is still the published
+				// session. A persistence failure must not cross the commit boundary.
+				await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.sessionManager.commitPreparedNewSession(prepared);
@@ -10330,7 +10315,6 @@ export class AgentSession {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
-			await this.#initializeNewSessionWithLocalRoot(options);
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
@@ -10344,6 +10328,7 @@ export class AgentSession {
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			await this.#initializeNewSessionState(nextDiscoverySessionToolNames, previousSessionFile);
+			await this.sessionManager.flush();
 			if (options?.drop && previousSessionFile) {
 				try {
 					await this.sessionManager.dropSession(previousSessionFile);

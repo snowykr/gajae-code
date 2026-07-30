@@ -1,6 +1,6 @@
 /** File-backed team task store, claims, leases, and completion evidence. */
-import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import * as asyncHooks from "node:async_hooks";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { sessionIdFromDirName } from "./session-layout";
@@ -330,7 +330,7 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
  * before contending for the cross-process lock.
  */
 const teamMutationFenceTails = new Map<string, Promise<void>>();
-const activeTeamMutationFences = new AsyncLocalStorage<ReadonlySet<string>>();
+const activeTeamMutationFences = new asyncHooks.AsyncLocalStorage<ReadonlySet<string>>();
 
 export async function withGjcTeamMutationFence<T>(dir: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = path.join(dir, "operations", "team-mutation.json");
@@ -738,7 +738,7 @@ export class GjcTeamTaskStore {
 		if (existing && !expired(existing.leased_until)) return { ok: false, reason: `task_already_claimed:${task.id}` };
 		const claim: GjcTeamTaskClaim = {
 			owner: worker.id,
-			token: randomUUID(),
+			token: crypto.randomUUID(),
 			leased_until: new Date(Date.now() + 30 * 60_000).toISOString(),
 		};
 		try {

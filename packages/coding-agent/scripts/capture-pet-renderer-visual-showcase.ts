@@ -1,4 +1,4 @@
-import type { Stats } from "node:fs";
+import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -75,7 +75,7 @@ function parseArgs(args: string[]): { head: string; base: string; output?: strin
 }
 
 async function assertDirectoryNotSymlink(directory: string, label: string): Promise<void> {
-	let stat: Stats;
+	let stat: nodeFs.Stats;
 	try {
 		stat = await fs.lstat(directory);
 	} catch {
@@ -142,7 +142,7 @@ async function sourceProvenance(head: string, base: string): Promise<PetRenderer
 	const sourcePaths = [FIXTURE_PATH, "packages/coding-agent/scripts/capture-pet-renderer-visual-showcase.ts"];
 	const sourceFiles = [];
 	for (const relative of sourcePaths) {
-		const content = await fs.readFile(path.join(REPOSITORY_ROOT, relative));
+		const content = await Bun.file(path.join(REPOSITORY_ROOT, relative)).bytes();
 		sourceFiles.push({ path: relative, sha256: sha256Bytes(content), byte_length: content.byteLength });
 	}
 	return {
@@ -182,7 +182,7 @@ async function writeArtifact(
 ): Promise<PetRendererVisualArtifactFile> {
 	assertNoReceiptFile(path.relative(outputRoot, filePath));
 	assertSafeEvidenceText(content, path.relative(outputRoot, filePath));
-	await fs.writeFile(filePath, content, "utf8");
+	await Bun.write(filePath, content);
 	return {
 		path: path.relative(outputRoot, filePath).split(path.sep).join("/"),
 		sha256: sha256Bytes(content),
@@ -327,8 +327,8 @@ async function main(): Promise<void> {
 				"Confirm this bundle contains no raw PTY bytes or receipt.",
 			],
 		});
-		await fs.writeFile(path.join(stageRoot, "manifest.json"), manifestText, "utf8");
-		await fs.writeFile(path.join(stageRoot, "visual-review-input.json"), reviewInput, "utf8");
+		await Bun.write(path.join(stageRoot, "manifest.json"), manifestText);
+		await Bun.write(path.join(stageRoot, "visual-review-input.json"), reviewInput);
 		if ((await fs.readdir(stageRoot)).some(name => name.toLowerCase().includes("receipt")))
 			die("capture attempted to create a receipt");
 		await fs.rename(stageRoot, outputRoot);

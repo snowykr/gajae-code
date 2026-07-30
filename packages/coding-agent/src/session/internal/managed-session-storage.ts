@@ -1018,12 +1018,18 @@ export class ManagedSessionDescendantStore {
 	removeExpected(relativePath: string, expected: ManagedFileSnapshot): void {
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = exactUnlink(this.#resolve(relativePath), {
+			const pathname = this.#resolve(relativePath);
+			const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+			const current = fs.lstatSync(pathname, { bigint: true });
+			const removed = exactUnlink(pathname, {
 				dev: expected.identity.dev,
 				ino: expected.identity.ino,
+				nlink: current.nlink,
 				size: BigInt(expected.identity.size),
 				mtimeNs: expected.identity.mtimeNs,
 				sha256: expected.identity.sha256,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
 				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
 			});
 			if (
@@ -1191,7 +1197,9 @@ export class ManagedSessionDescendantStore {
 	removeTreeExpected(relativePath: string, expected: NativeDirectoryTreeSnapshot): void {
 		this.#assertBound();
 		if (!this.#authority) {
-			const removed = exactRemoveDirectoryTree(this.#resolve(relativePath), expected);
+			const resolved = this.#resolve(relativePath);
+			const parent = fs.lstatSync(path.dirname(resolved), { bigint: true });
+			const removed = exactRemoveDirectoryTree(resolved, expected, { dev: parent.dev, ino: parent.ino });
 			if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
 			this.#assertBound();
 			return;
@@ -1765,9 +1773,40 @@ export async function acquireManagedLock(
 				if (ownerGone || Date.now() - staleObservedAt >= LOCK_STALE_RECHECK_MS) {
 					const quarantine = `${lockPath}.${randomUUID()}.stale`;
 					try {
+						const observedIdentity = fs.lstatSync(lockPath, { bigint: true });
 						fs.renameSync(lockPath, quarantine);
+						const quarantinedIdentity = fs.lstatSync(quarantine, { bigint: true });
 						const quarantined = parseLock(quarantine);
-						if (!quarantined || quarantined.attemptId !== owner.attemptId) throw new Error("migration_busy");
+						if (
+							!sameFileIdentity(observedIdentity, quarantinedIdentity) ||
+							!quarantined ||
+							quarantined.attemptId !== owner.attemptId ||
+							quarantined.leaseExpiresAt >= Date.now()
+						) {
+							// The pathname raced to a successor between observation and rename.
+							// Restore the moved successor without ever replacing a newer lock.
+							try {
+								fs.linkSync(quarantine, lockPath);
+								fs.unlinkSync(quarantine);
+								fsyncDirectory(locksDirectory);
+							} catch (restoreError) {
+								if ((restoreError as NodeJS.ErrnoException).code === "EEXIST") {
+									try {
+										// A different contender won the pathname while the successor was
+										// quarantined. Never replace that lock: revoke only the detached
+										// successor inode so its inode-bound owner can no longer pass fencing.
+										const quarantinedStill = fs.lstatSync(quarantine, { bigint: true });
+										if (sameFileIdentity(quarantinedStill, quarantinedIdentity)) {
+											fs.unlinkSync(quarantine);
+											fsyncDirectory(locksDirectory);
+										}
+									} catch {
+										/* retry owner observation */
+									}
+								}
+							}
+							throw new Error("migration_busy");
+						}
 						fs.unlinkSync(quarantine);
 						fsyncDirectory(locksDirectory);
 					} catch {
@@ -1777,7 +1816,7 @@ export async function acquireManagedLock(
 				}
 			} else staleObservedAt = undefined;
 			if (Date.now() >= deadline) throw new Error("migration_busy");
-			await new Promise<void>(resolve => setTimeout(resolve, 50));
+			await Bun.sleep(50);
 		}
 	}
 }

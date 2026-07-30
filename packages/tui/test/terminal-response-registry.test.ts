@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 describe("ProcessTerminal response boundary", () => {
-	it("forwards an expired partial response through input handling once", () => {
+	it("discards an expired partial response from input handling", () => {
 		vi.useFakeTimers();
 		const received: string[] = [];
 		vi.spyOn(process, "kill").mockReturnValue(true);
@@ -71,10 +71,10 @@ describe("ProcessTerminal response boundary", () => {
 		expect(received).toEqual([]);
 
 		vi.advanceTimersByTime(10);
-		expect(received).toEqual(["\x1b]42;partial"]);
+		expect(received).toEqual([]);
 
 		terminal.stop();
-		expect(received).toEqual(["\x1b]42;partial"]);
+		expect(received).toEqual([]);
 	});
 
 	it("discards a partial response when the terminal stops", () => {
@@ -145,7 +145,7 @@ describe("TerminalResponseRegistry", () => {
 		expect(completed).toEqual(["high", "later"]);
 	});
 
-	it("forwards buffered bytes when a request expires", () => {
+	it("discards a parser-recognized partial when a request expires", () => {
 		vi.useFakeTimers();
 		const forwarded: string[] = [];
 		const expired: string[] = [];
@@ -161,8 +161,60 @@ describe("TerminalResponseRegistry", () => {
 		expect(registry.consume("\x1b[?62")).toBe("");
 		vi.advanceTimersByTime(20);
 		expect(expired).toEqual(["expired"]);
-		expect(forwarded).toEqual(["\x1b[?62"]);
+		expect(forwarded).toEqual([]);
 		expect(registry.pendingCount).toBe(0);
+	});
+	it("preserves a shared partial when a persistent parser expires", () => {
+		vi.useFakeTimers();
+		const forwarded: string[] = [];
+		const completed: string[] = [];
+		const registry = new TerminalResponseRegistry({ onForward: data => forwarded.push(data) });
+		const armMode = (): void => {
+			registry.arm({
+				id: "mode2031",
+				expiresInMs: 20,
+				parse: parser(/\x1b\[\?997;([12])n/u, /\x1b\[\?(?:9(?:9(?:7(?:;[12]?)?)?)?)?$/u),
+				onComplete: () => {},
+				onExpire: armMode,
+			});
+		};
+		armMode();
+		registry.arm({
+			id: "da1",
+			parse: parser(/\x1b\[\?([\d;]+)c/u, /\x1b\[\?[\d;]*$/u),
+			onComplete: value => completed.push(value),
+		});
+
+		expect(registry.consume("\x1b[?")).toBe("");
+		vi.advanceTimersByTime(20);
+		expect(forwarded).toEqual([]);
+		expect(registry.consume("62c")).toBe("");
+		expect(completed).toEqual(["62"]);
+		expect(registry.pendingCount).toBe(1);
+	});
+	it("drops an expired partial before forwarding a later unrelated frame", () => {
+		vi.useFakeTimers();
+		const forwarded: string[] = [];
+		const completed: string[] = [];
+		const registry = new TerminalResponseRegistry({ onForward: data => forwarded.push(data) });
+
+		registry.arm({
+			id: "unrelated",
+			parse: parser(/\x1b\[\?([\d;]+)c/u, /\x1b\[\?[\d;]*$/u),
+			onComplete: value => completed.push(value),
+		});
+		registry.arm({
+			id: "expiring",
+			expiresInMs: 20,
+			parse: parser(/\x1b\]42;([^\x07]*)\x07/u, /\x1b\]42;[^\x07]*$/u),
+			onComplete: () => {},
+		});
+
+		expect(registry.consume("ordinary\x1b]42;partial")).toBe("ordinary");
+		vi.advanceTimersByTime(20);
+		expect(forwarded).toEqual([]);
+		expect(registry.consume("\x1b[?62c")).toBe("");
+		expect(completed).toEqual(["62"]);
 	});
 
 	it("flushes and disarms when the raw buffer exceeds its bound", () => {

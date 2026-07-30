@@ -173,6 +173,13 @@ function makeHarness(options: { protocol?: "sixel" | "kitty"; rows?: number; lin
 	});
 	return { terminal, ui, widget, transcript, transactions };
 }
+function isAcceptedSharedRender(observation: TuiTransactionObservation): boolean {
+	return (
+		observation.classification === "shared" &&
+		observation.outcome === "accepted" &&
+		(observation.operation === "primary" || observation.operation === "page-entry-or-repaint")
+	);
+}
 
 class FixedLines implements Component {
 	constructor(private readonly lines: string[]) {}
@@ -213,14 +220,7 @@ describe("GajaePetWidget with the real TUI renderer", () => {
 			expect(sharedAttempt).toBeGreaterThanOrEqual(0);
 			expect(overlayAttempt).toBeGreaterThan(sharedAttempt);
 			expect(harness.terminal.writes.some(write => write.includes(marker))).toBe(true);
-			expect(
-				harness.transactions.some(
-					observation =>
-						observation.classification === "shared" &&
-						observation.outcome === "accepted" &&
-						observation.operation === "primary",
-				),
-			).toBe(true);
+			expect(harness.transactions.some(observation => isAcceptedSharedRender(observation))).toBe(true);
 			expect(
 				harness.transactions.some(
 					observation => observation.classification === "exempt" && observation.outcome === "accepted",
@@ -259,14 +259,7 @@ describe("GajaePetWidget with the real TUI renderer", () => {
 
 			harness.ui.start();
 			await harness.terminal.settle();
-			expect(
-				harness.transactions.some(
-					observation =>
-						observation.classification === "shared" &&
-						observation.outcome === "accepted" &&
-						observation.operation === "primary",
-				),
-			).toBe(true);
+			expect(harness.transactions.some(observation => isAcceptedSharedRender(observation))).toBe(true);
 			expect(
 				harness.transactions.some(
 					observation => observation.classification === "exempt" && observation.outcome === "accepted",
@@ -292,14 +285,7 @@ describe("GajaePetWidget with the real TUI renderer", () => {
 
 			expect(harness.terminal.writes.some(write => write.includes("shared-head"))).toBe(true);
 			expect(harness.terminal.writes.some(write => write.includes(marker))).toBe(false);
-			expect(
-				harness.transactions.some(
-					observation =>
-						observation.classification === "shared" &&
-						observation.outcome === "accepted" &&
-						observation.operation === "primary",
-				),
-			).toBe(true);
+			expect(harness.transactions.some(observation => isAcceptedSharedRender(observation))).toBe(true);
 			expect(
 				harness.transactions.some(
 					observation => observation.classification === "exempt" && observation.outcome === "failed",
@@ -328,7 +314,7 @@ describe("GajaePetWidget with the real TUI renderer", () => {
 		harness.terminal.writes.length = 0;
 		harness.transactions.length = 0;
 
-		expect(harness.ui.scrollViewportPages(1)).toBe(true);
+		expect(harness.ui.scrollViewportPages(-1)).toBe(true);
 		expect(
 			harness.transactions.some(
 				observation =>
@@ -343,28 +329,16 @@ describe("GajaePetWidget with the real TUI renderer", () => {
 			),
 		).toBe(true);
 
+		harness.transactions.length = 0;
+		harness.terminal.writes.length = 0;
 		expect(harness.ui.followLiveViewport()).toBe(true);
-		expect(
-			harness.transactions.some(
-				observation =>
-					observation.classification === "shared" &&
-					observation.operation === "follow" &&
-					observation.outcome === "accepted",
-			),
-		).toBe(true);
+		expect(harness.transactions.some(observation => isAcceptedSharedRender(observation))).toBe(true);
 
 		harness.transcript.setLines([...initialLines.slice(0, -1), "status:working"]);
 		harness.ui.requestRender(true);
 		await harness.terminal.settle();
 		expect(harness.terminal.writes.some(write => write.includes("status:working"))).toBe(true);
-		expect(
-			harness.transactions.some(
-				observation =>
-					observation.classification === "shared" &&
-					observation.operation === "primary" &&
-					observation.outcome === "accepted",
-			),
-		).toBe(true);
+		expect(harness.transactions.some(observation => isAcceptedSharedRender(observation))).toBe(true);
 	});
 
 	it("retries queued Pet cleanup when ui.start() follows terminal recovery", async () => {

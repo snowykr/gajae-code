@@ -226,6 +226,23 @@ describe("synchronous visible revisions", () => {
 		expect(component.consumeVisibleTranscriptChange()).toBe(false);
 	});
 
+	it("refreshes a pending bash display to completed text synchronously", () => {
+		const component = new ToolExecutionComponent(
+			"bash",
+			{ command: "printf command" },
+			{},
+			undefined,
+			ui,
+			process.cwd(),
+		);
+		const pending = Bun.stripANSI(component.render(80).join("\n"));
+		expect(pending).not.toContain("completed output");
+
+		component.updateResult({ content: [{ type: "text", text: "completed output" }] }, false);
+
+		const completed = Bun.stripANSI(component.render(80).join("\n"));
+		expect(completed).toContain("completed output");
+	});
 	it("handles cyclic and BigInt args without serialization", () => {
 		const cyclic: { command: string; self?: unknown; value: bigint } = { command: "printf ok", value: 1n };
 		cyclic.self = cyclic;

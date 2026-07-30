@@ -48,6 +48,7 @@ import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "..
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "../../slash-commands/acp-builtins";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -219,7 +220,9 @@ function pageItems(value: unknown): unknown[] {
 
 /** Build the ACP command palette from the shared builtins and live SDK skill state. */
 export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand[] {
-	const commands = new Map<string, AvailableCommand>();
+	const commands = new Map<string, AvailableCommand>(
+		ACP_BUILTIN_SLASH_COMMANDS.map(command => [command.name, command] as const),
+	);
 	for (const item of pageItems(query)) {
 		const skill = object(item);
 		if (typeof skill?.name !== "string" || !skill.name) continue;
@@ -1048,6 +1051,9 @@ export class AcpAgent implements Agent {
 			};
 			record.activePrompt = waiter;
 		});
+		// Teardown can reject the waiter before command acknowledgement completes.
+		// Observe that early rejection while preserving it for the caller.
+		void response.catch(() => undefined);
 		try {
 			const acknowledgement = await record.adapter.prompt({
 				text: payload.text,
@@ -1073,10 +1079,12 @@ export class AcpAgent implements Agent {
 					);
 			this.#settlePrompt(record, waiter);
 		} catch (error) {
-			waiter.deferredFrames.length = 0;
-			waiter.terminal = undefined;
-			waiter.settled = true;
-			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			const activePrompt = this.#sessions.get(params.sessionId)?.activePrompt;
+			if (activePrompt !== waiter) return await response;
+			activePrompt.deferredFrames.length = 0;
+			activePrompt.terminal = undefined;
+			activePrompt.settled = true;
+			record.activePrompt = undefined;
 			throw error;
 		}
 		return await response;

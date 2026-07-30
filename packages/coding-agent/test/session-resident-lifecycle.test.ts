@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -61,7 +61,7 @@ function installVerifiedNativeCleanup(): void {
 		)
 			throw new Error("resident cleanup file identity mismatch");
 		if (identity.sha256) {
-			const digest = createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
+			const digest = crypto.createHash("sha256").update(fs.readFileSync(pathname)).digest("hex");
 			if (digest !== identity.sha256) throw new Error("resident cleanup file digest mismatch");
 		}
 		if (identity.directory && identity.quarantineName) {

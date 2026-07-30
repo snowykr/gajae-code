@@ -40,6 +40,14 @@ async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 		}),
 	]);
 }
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(5);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+}
 
 describe("ACP production cancellation completion", () => {
 	let tempDir: TempDir;
@@ -192,6 +200,15 @@ describe("ACP production cancellation completion", () => {
 		expect(controlOperations).toContain("model.set");
 		expect(controlOperations).not.toContain("model.profile.set");
 
+		await waitFor(
+			() => updates.some(update => update.update.sessionUpdate === "available_commands_update"),
+			"available commands fallback",
+		);
+		const availableCommands = updates.find(update => update.update.sessionUpdate === "available_commands_update")
+			?.update as { availableCommands?: Array<{ name: string }> };
+		expect(availableCommands.availableCommands?.map(command => command.name)).toEqual(
+			expect.arrayContaining(["model"]),
+		);
 		const firstDelivered = Promise.withResolvers<void>();
 		promptWaiters.push(firstDelivered);
 		let firstResolutions = 0;

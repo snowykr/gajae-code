@@ -174,6 +174,7 @@ describe("AgentSession newSession clears todo artifacts", () => {
 
 				release.resolve();
 				await expect(transition).resolves.toBe(true);
+				expect(readiness).toHaveBeenCalledTimes(1);
 				expect(session.sessionId).not.toBe(predecessor.id);
 				expect(session.sessionFile).not.toBe(predecessor.file);
 				expect(sessionManager.getArtifactsDir()).not.toBe(predecessor.artifacts);
@@ -223,6 +224,38 @@ describe("AgentSession newSession clears todo artifacts", () => {
 			await expect(session.newSession()).resolves.toBe(true);
 			expect(session.sessionId).not.toBe(beforeId);
 			expect(session.getTodoPhases()).toHaveLength(0);
+		});
+		it("retains predecessor identity and agent state when successor persistence fails", async () => {
+			session.setTodoPhases([{ name: "Persist", tasks: [{ content: "preserve predecessor", status: "pending" }] }]);
+			session.queueDeferredMessageForTests(
+				{
+					role: "custom",
+					customType: "test",
+					content: "predecessor executable queue",
+					display: false,
+					timestamp: Date.now(),
+				},
+				false,
+			);
+			const beforeId = session.sessionId;
+			const beforeFile = session.sessionFile;
+			const beforeAgentSessionId = session.agent.sessionId;
+			const beforeTodos = session.getTodoPhases();
+			const beforeQueue = session.getPendingNextTurnMessagesForTests();
+			const ensurePersistence = vi
+				.spyOn(sessionManager, "ensurePreparedNewSessionOnDisk")
+				.mockRejectedValueOnce(new Error("new persistence boom"));
+			const commit = vi.spyOn(sessionManager, "commitPreparedNewSession");
+
+			await expect(session.newSession()).rejects.toThrow("new persistence boom");
+
+			expect(ensurePersistence).toHaveBeenCalledTimes(1);
+			expect(commit).not.toHaveBeenCalled();
+			expect(session.sessionId).toBe(beforeId);
+			expect(session.sessionFile).toBe(beforeFile);
+			expect(session.agent.sessionId).toBe(beforeAgentSessionId);
+			expect(session.getTodoPhases()).toEqual(beforeTodos);
+			expect(session.getPendingNextTurnMessagesForTests()).toEqual(beforeQueue);
 		});
 	});
 });

@@ -237,7 +237,9 @@ async function singleRequest(
 async function main(): Promise<void> {
 	const { n, warmup, port, seed } = parseArgs(process.argv.slice(2));
 	const { server, captures } = createDeterministicServer();
-	await new Promise<void>(resolve => server.listen(port, resolve));
+	const { promise, resolve } = Promise.withResolvers<void>();
+	server.listen(port, resolve);
+	await promise;
 	const address = server.address();
 	const actualPort = typeof address === "object" && address ? address.port : 0;
 	const baseUrl = `http://127.0.0.1:${actualPort}`;

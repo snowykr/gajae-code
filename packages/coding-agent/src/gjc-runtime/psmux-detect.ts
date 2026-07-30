@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 
 /**
@@ -85,7 +85,7 @@ const DEFAULT_EXECUTABLE_IDENTITY_RESOLVER: ExecutableIdentityResolver = executa
 				named.ctimeNs !== before.ctimeNs
 			)
 				return null;
-			return `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}:${createHash("sha256").update(bytes).digest("hex")}`;
+			return `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}:${crypto.createHash("sha256").update(bytes).digest("hex")}`;
 		} finally {
 			fs.closeSync(fd);
 		}

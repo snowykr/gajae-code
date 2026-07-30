@@ -66,6 +66,11 @@ export function dashscopeTokenPlanDefaultHeaders(
  * map, reproducing upstream buildHeaders() precedence EXACTLY:
  *   `{ ...defaultHeaders, ...customHeaders }` — caller wins per header.
  *
+ * Header names are matched case-insensitively so the canonical key is replaced
+ * instead of leaving duplicate logical headers for `Headers` to combine.
+ * Caller casing is preserved, and the last caller value wins if the caller map
+ * itself contains case variants.
+ *
  * This mirrors GJC's existing kimi-code injection order
  * (`headers = { ...getKimiCommonHeaders(), ...headers }`): canonical identity as
  * the base, caller-supplied headers overriding individual keys. A caller that
@@ -80,5 +85,16 @@ export function mergeDashScopeTokenPlanHeaders(
 ): Record<string, string> {
 	const defaults = dashscopeTokenPlanDefaultHeaders(version);
 	if (!callerHeaders) return { ...defaults };
-	return { ...defaults, ...callerHeaders };
+
+	const merged = { ...defaults };
+	for (const [callerName, callerValue] of Object.entries(callerHeaders)) {
+		const callerNameLower = callerName.toLowerCase();
+		for (const existingName of Object.keys(merged)) {
+			if (existingName.toLowerCase() === callerNameLower) {
+				delete merged[existingName];
+			}
+		}
+		merged[callerName] = callerValue;
+	}
+	return merged;
 }

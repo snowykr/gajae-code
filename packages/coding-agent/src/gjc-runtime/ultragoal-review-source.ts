@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { RepositoryBinding } from "./repository-binding";
@@ -85,7 +85,7 @@ interface CapturedReviewSource {
 }
 
 function hashBytes(value: string | Uint8Array): string {
-	return createHash("sha256").update(value).digest("hex");
+	return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function stableJson(value: unknown): string {
@@ -126,7 +126,7 @@ async function untrackedCommitments(
 			path: relativePath,
 			mode: stat.mode,
 			kind: "file",
-			digest: hashBytes(await fs.readFile(absolutePath)),
+			digest: hashBytes(await Bun.file(absolutePath).bytes()),
 		});
 	}
 	return rows;
@@ -186,7 +186,7 @@ export function createReviewSourceCohort(input: {
 }): ReviewSourceCohort {
 	return {
 		schema: REVIEW_SOURCE_COHORT_SCHEMA,
-		cohortId: randomUUID(),
+		cohortId: crypto.randomUUID(),
 		workflow: input.workflow,
 		generation: input.generation,
 		snapshotId: input.snapshotId,

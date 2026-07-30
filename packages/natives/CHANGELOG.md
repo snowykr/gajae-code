@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Windows owner-only security APIs that accept caller file descriptors bind mutation and verification to those descriptors and stable file identity, rejecting pathname substitution. Exact unlink, restore, and replace bind identity validation, deletion, and publication to retained no-follow handles and parents.
 
 ## [0.12.5] - 2026-07-30
 

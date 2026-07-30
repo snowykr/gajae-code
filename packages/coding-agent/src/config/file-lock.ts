@@ -63,26 +63,33 @@ function writeLockInfo(lockPath: string): Promise<LockInfo> {
 }
 
 async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(await fs.readFile(`${lockPath}/info`, "utf-8"));
-	} catch (error) {
-		if (isEnoent(error) || error instanceof SyntaxError) return null;
-		throw error;
-	}
+	for (let attempt = 0; ; attempt++) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await Bun.file(`${lockPath}/info`).text());
+		} catch (error) {
+			if (isEnoent(error) || error instanceof SyntaxError) return null;
+			const code = (error as NodeJS.ErrnoException).code;
+			if (attempt < 3 && (code === "EACCES" || code === "EBUSY" || code === "EPERM")) {
+				await Bun.sleep(5 * (attempt + 1));
+				continue;
+			}
+			throw error;
+		}
 
-	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, timestamp } = parsed as Partial<LockInfo>;
-	if (
-		typeof pid !== "number" ||
-		!Number.isInteger(pid) ||
-		pid <= 0 ||
-		typeof timestamp !== "number" ||
-		!Number.isFinite(timestamp) ||
-		(start_time !== undefined && (typeof start_time !== "string" || !start_time))
-	)
-		return null;
-	return { pid, start_time, timestamp };
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+		const { pid, start_time, timestamp } = parsed as Partial<LockInfo>;
+		if (
+			typeof pid !== "number" ||
+			!Number.isInteger(pid) ||
+			pid <= 0 ||
+			typeof timestamp !== "number" ||
+			!Number.isFinite(timestamp) ||
+			(start_time !== undefined && (typeof start_time !== "string" || !start_time))
+		)
+			return null;
+		return { pid, timestamp, ...(start_time === undefined ? {} : { start_time }) };
+	}
 }
 
 /** @internal */

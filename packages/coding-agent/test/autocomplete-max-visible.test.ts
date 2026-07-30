@@ -67,6 +67,16 @@ describe("autocompleteMaxVisible setting", () => {
 
 		expect(setAutocompleteMaxVisible).toHaveBeenCalledWith(10);
 	});
+	it("applies clear-on-shrink changes to the live TUI", () => {
+		const setClearOnShrink = vi.fn();
+		const controller = new SelectorController({
+			ui: { setClearOnShrink },
+		} as unknown as ConstructorParameters<typeof SelectorController>[0]);
+
+		controller.handleSettingChange("clearOnShrink", true);
+
+		expect(setClearOnShrink).toHaveBeenCalledWith(true);
+	});
 
 	it("should work with isolated instances", () => {
 		const settings = Settings.isolated({ autocompleteMaxVisible: 12 });

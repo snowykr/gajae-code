@@ -73,20 +73,19 @@ import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateSpawnGate } from "./spawn-gate";
+import * as taskWorktree from "./worktree";
 import {
-	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
 	cleanupIsolation,
-	cleanupTaskBranches,
 	commitToBranch,
 	ensureIsolation,
 	getRepoRoot,
 	type IsolationHandle,
-	mergeTaskBranches,
+	NestedPatchApplicationError,
+	type NestedRepoPatch,
 	parseIsolationMode,
 	serializeRecoveryPatchBundle,
-	verifyNestedPatchesApplied,
 	verifyRootPatchesApplied,
 	type WorktreeBaseline,
 } from "./worktree";
@@ -437,6 +436,35 @@ export function resolveForkContextMaxTokens(configured: number, model: Model | u
 			? Math.max(1, Math.floor(contextWindow * 0.15))
 			: 15_000;
 	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
+}
+async function rollbackNestedPatches(
+	repoRoot: string,
+	patches: readonly NestedRepoPatch[],
+): Promise<ReadonlySet<string>> {
+	const byRepo = new Map<string, NestedRepoPatch[]>();
+	for (const patch of patches) {
+		if (!patch.patch.trim()) continue;
+		const group = byRepo.get(patch.relativePath) ?? [];
+		group.push(patch);
+		byRepo.set(patch.relativePath, group);
+	}
+
+	const rollbackFailures = new Set<string>();
+	const entries = [...byRepo.entries()].sort(([left], [right]) => left.localeCompare(right)).reverse();
+	for (const [relativePath, repoPatches] of entries) {
+		try {
+			await git.patch.applyText(
+				path.join(repoRoot, relativePath),
+				git.patch.join(repoPatches.map(entry => entry.patch)),
+				{
+					reverse: true,
+				},
+			);
+		} catch {
+			rollbackFailures.add(relativePath);
+		}
+	}
+	return rollbackFailures;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2065,12 +2093,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let rootPatchTexts: string[] = [];
 			let mergedBranchesForNestedPatches: Set<string> | null = null;
 			let mergePhaseFailed = false;
+			let rootPatchVerificationIndeterminate = false;
+			let nestedPatchVerificationIndeterminate = false;
 			const setRecoveryAvailable = (result: SingleResult): void => {
 				if (!result.recoveryRef) return;
 				result.persistence = {
 					outcome: "recovery_available",
 					ownerWorktreeApplied: false,
 					recoveryRef: result.recoveryRef,
+				};
+			};
+			const setNestedRecoveryAvailable = async (result: SingleResult): Promise<void> => {
+				if (!result.nestedPatches?.length || !result.recoveryRef) {
+					result.recoveryRef = undefined;
+					return;
+				}
+				const recoveryBytes = Buffer.from(
+					serializeRecoveryPatchBundle({ rootPatch: "", nestedPatches: result.nestedPatches }),
+					"utf8",
+				);
+				const recoveryPath = resolveLocalUrlToPath(result.recoveryRef.uri, localProtocolOptions);
+				await Bun.write(recoveryPath, recoveryBytes);
+				result.recoveryRef = {
+					...result.recoveryRef,
+					sizeBytes: recoveryBytes.byteLength,
+					sha256: createHash("sha256").update(recoveryBytes).digest("hex"),
 				};
 			};
 			if (isIsolated && repoRoot) {
@@ -2086,21 +2133,26 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							hadAnyChanges = false;
 							mergeSummary = "\n\nNo changes to apply.";
 						} else {
-							const mergeResult = await mergeTaskBranches(repoRoot, branchEntries);
-							mergedBranchesForNestedPatches = new Set(
-								mergeResult.merged.filter(branchName => !mergeResult.failed.includes(branchName)),
-							);
-							changesApplied = mergeResult.failed.length === 0;
+							const mergeResult = await taskWorktree.mergeTaskBranches(repoRoot, branchEntries);
+							const mergedBranches = new Set(mergeResult.merged);
+							const unmergedBranches = mergeResult.conflict
+								? mergeResult.failed
+								: mergeResult.failed.filter(branchName => !mergedBranches.has(branchName));
+							mergedBranchesForNestedPatches = mergeResult.conflict ? new Set() : mergedBranches;
+							changesApplied = !mergeResult.conflict && unmergedBranches.length === 0;
 							hadAnyChanges = changesApplied && mergeResult.merged.length > 0;
 
 							if (changesApplied) {
 								mergeSummary = hadAnyChanges
 									? `\n\nMerged ${mergeResult.merged.length} branch${mergeResult.merged.length === 1 ? "" : "es"}: ${mergeResult.merged.join(", ")}`
 									: "\n\nNo changes to apply.";
+								if (mergeResult.conflict) {
+									mergeSummary += `\n\n<system-notification>${mergeResult.conflict}</system-notification>`;
+								}
 							} else {
 								const mergedPart =
 									mergeResult.merged.length > 0 ? `Merged: ${mergeResult.merged.join(", ")}.\n` : "";
-								const failedPart = `Failed: ${mergeResult.failed.join(", ")}.`;
+								const failedPart = `Failed: ${unmergedBranches.join(", ")}.`;
 								const conflictPart = mergeResult.conflict ? `\nConflict: ${mergeResult.conflict}` : "";
 								mergeSummary = `\n\n<system-notification>Branch merge failed. ${mergedPart}${failedPart}${conflictPart}\nUnmerged branches remain for manual resolution.</system-notification>`;
 							}
@@ -2137,7 +2189,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						// Clean up merged branches (keep failed ones for manual resolution)
 						const allBranches = branchEntries.map(b => b.branchName);
 						if (changesApplied) {
-							await cleanupTaskBranches(repoRoot, allBranches);
+							await taskWorktree.cleanupTaskBranches(repoRoot, allBranches);
 						}
 					} else {
 						// Patch mode: combine and apply only successful task patches. Failed/interrupted patches remain recovery-only.
@@ -2189,7 +2241,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						}
 
 						if (changesApplied && rootPatchTexts.length > 0 && baseline) {
-							changesApplied = await verifyRootPatchesApplied(repoRoot, baseline, rootPatchTexts);
+							let proofSucceeded = false;
+							try {
+								proofSucceeded = await verifyRootPatchesApplied(repoRoot, baseline, rootPatchTexts);
+							} catch {
+								// Treat an unavailable proof as a failed proof and attempt to roll back.
+							}
+							if (!proofSucceeded) {
+								try {
+									const combinedPatch = rootPatchTexts
+										.map(text => (text.endsWith("\n") ? text : `${text}\n`))
+										.join("");
+									await git.patch.applyText(repoRoot, combinedPatch, { reverse: true });
+									changesApplied = false;
+									hadAnyChanges = false;
+								} catch {
+									// The patch may still be present; retain an applied status rather than
+									// advertising a recovery patch that could be applied twice.
+									rootPatchVerificationIndeterminate = true;
+									changesApplied = true;
+									hadAnyChanges = true;
+								}
+							}
 						}
 
 						for (const result of results) {
@@ -2209,13 +2282,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								continue;
 							}
 							if (
-								changesApplied &&
 								patchBytes &&
 								result.exitCode === 0 &&
 								!result.error &&
 								!result.aborted &&
-								!result.paused
+								!result.paused &&
+								(changesApplied || rootPatchVerificationIndeterminate)
 							) {
+								if (rootPatchVerificationIndeterminate) {
+									// The root patch may still be present after an indeterminate rollback; only
+									// expose nested patches that were never attempted.
+									await setNestedRecoveryAvailable(result);
+								}
 								result.persistence = {
 									outcome: "applied",
 									ownerWorktreeApplied: true,
@@ -2231,7 +2309,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						}
 
 						if (changesApplied) {
-							mergeSummary = hadAnyChanges ? "\n\nApplied patches: yes" : "\n\nNo changes to apply.";
+							mergeSummary = hadAnyChanges
+								? rootPatchVerificationIndeterminate
+									? "\n\nApplied patches: yes (verification failed; retained in the owner worktree.)"
+									: "\n\nApplied patches: yes"
+								: "\n\nNo changes to apply.";
 						} else {
 							const notification =
 								"<system-notification>Patches were not applied and must be handled manually.</system-notification>";
@@ -2257,64 +2339,181 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 
 			// Apply nested repo patches (separate from parent git)
-			if (isIsolated && repoRoot && !mergePhaseFailed && (mergeMode === "branch" || changesApplied !== false)) {
-				const allNestedPatches = results
-					.filter(r => {
-						if (
-							!r.nestedPatches ||
-							r.nestedPatches.length === 0 ||
-							r.exitCode !== 0 ||
-							r.error ||
-							r.aborted ||
-							r.paused
-						) {
-							return false;
+			if (
+				isIsolated &&
+				repoRoot &&
+				!mergePhaseFailed &&
+				(mergeMode === "branch" || changesApplied !== false) &&
+				!rootPatchVerificationIndeterminate
+			) {
+				const nestedResults = results.filter(r => {
+					if (
+						!r.nestedPatches ||
+						r.nestedPatches.length === 0 ||
+						r.exitCode !== 0 ||
+						r.error ||
+						r.aborted ||
+						r.paused
+					) {
+						return false;
+					}
+					if (mergeMode !== "branch") {
+						return true;
+					}
+					if (!r.branchName) {
+						return true;
+					}
+					if (!mergedBranchesForNestedPatches) {
+						return false;
+					}
+					return mergedBranchesForNestedPatches.has(r.branchName);
+				});
+				const allNestedPatches = nestedResults.flatMap(r => r.nestedPatches!);
+				const rootWasApplied = (result: SingleResult): boolean => {
+					if (
+						result.exitCode !== 0 ||
+						result.error ||
+						result.aborted ||
+						result.paused ||
+						mergePhaseFailed ||
+						rootPatchVerificationIndeterminate
+					) {
+						return false;
+					}
+					if (mergeMode === "branch") {
+						return Boolean(result.branchName && mergedBranchesForNestedPatches?.has(result.branchName));
+					}
+					const patchBytes = result.patchPath ? isolatedPatchBytes.get(result.patchPath) : undefined;
+					return Boolean(patchBytes?.toString("utf8").trim()) && changesApplied === true;
+				};
+				const markNestedRollbackResults = async (failedRepos?: ReadonlySet<string>): Promise<void> => {
+					for (const result of nestedResults) {
+						const nestedPatches = result.nestedPatches ?? [];
+						const failedNestedPatches = failedRepos
+							? nestedPatches.filter(patch => failedRepos.has(patch.relativePath))
+							: [];
+						const safelyRolledBackPatches = failedRepos
+							? nestedPatches.filter(patch => !failedRepos.has(patch.relativePath))
+							: nestedPatches;
+						if (failedNestedPatches.length > 0) {
+							// Keep recovery material for repositories whose rollback succeeded, but withhold
+							// patches from repositories that may still be applied.
+							result.nestedPatches = safelyRolledBackPatches;
+							if (safelyRolledBackPatches.length > 0) {
+								await setNestedRecoveryAvailable(result);
+							} else {
+								result.recoveryRef = undefined;
+							}
+							result.persistence = {
+								outcome: "applied",
+								ownerWorktreeApplied: true,
+								recoveryRef: result.recoveryRef,
+							};
+							continue;
 						}
-						if (mergeMode !== "branch") {
-							return true;
+						result.nestedPatches = safelyRolledBackPatches;
+						await setNestedRecoveryAvailable(result);
+						if (rootWasApplied(result)) {
+							result.persistence = {
+								outcome: "applied",
+								ownerWorktreeApplied: true,
+								recoveryRef: result.recoveryRef,
+							};
+						} else {
+							result.persistence = {
+								outcome: "recovery_available",
+								ownerWorktreeApplied: false,
+								recoveryRef: result.recoveryRef,
+							};
 						}
-						if (!r.branchName) {
-							return true;
-						}
-						if (!mergedBranchesForNestedPatches) {
-							return false;
-						}
-						return mergedBranchesForNestedPatches.has(r.branchName);
-					})
-					.flatMap(r => r.nestedPatches!);
+					}
+				};
 				if (allNestedPatches.length > 0) {
+					const rootWasAppliedForNested =
+						mergeMode === "branch"
+							? nestedResults.some(result =>
+									Boolean(result.branchName && mergedBranchesForNestedPatches?.has(result.branchName)),
+								)
+							: changesApplied === true && rootPatchTexts.length > 0;
 					try {
-						await applyNestedPatches(repoRoot, allNestedPatches);
-						if (!baseline || !(await verifyNestedPatchesApplied(repoRoot, baseline, allNestedPatches))) {
-							throw new Error("Nested repository persistence proof failed");
+						await taskWorktree.applyNestedPatches(repoRoot, allNestedPatches);
+						let proofSucceeded = false;
+						try {
+							proofSucceeded = Boolean(
+								baseline &&
+									(await taskWorktree.verifyNestedPatchesApplied(repoRoot, baseline, allNestedPatches)),
+							);
+						} catch {
+							// Treat an unavailable proof as a failed proof and attempt to roll back.
 						}
-						for (const result of results) {
-							const rootApplied =
-								mergeMode !== "branch"
-									? changesApplied !== false
-									: !result.branchName || Boolean(mergedBranchesForNestedPatches?.has(result.branchName));
-							if (
-								result.nestedPatches?.length &&
-								result.exitCode === 0 &&
-								!result.error &&
-								!result.aborted &&
-								!result.paused &&
-								rootApplied
-							) {
-								result.persistence = {
-									outcome: "applied",
-									ownerWorktreeApplied: true,
-									recoveryRef: result.recoveryRef,
-								};
+						if (!proofSucceeded) {
+							const rollbackFailures = await rollbackNestedPatches(repoRoot, allNestedPatches);
+							if (rollbackFailures.size > 0) {
+								nestedPatchVerificationIndeterminate = true;
+								changesApplied = true;
+								hadAnyChanges = true;
+								await markNestedRollbackResults(new Set(rollbackFailures));
+								mergeSummary +=
+									"\n\n<system-notification>Nested repository persistence proof failed and rollback was incomplete; changes remain in the owner worktree.</system-notification>";
+							} else {
+								await markNestedRollbackResults();
+								if (!rootWasAppliedForNested) {
+									changesApplied = false;
+									hadAnyChanges = false;
+								}
+								throw new Error("Nested repository persistence proof failed");
+							}
+						} else {
+							for (const result of results) {
+								const rootApplied =
+									mergeMode !== "branch"
+										? changesApplied !== false
+										: !result.branchName || Boolean(mergedBranchesForNestedPatches?.has(result.branchName));
+								if (
+									result.nestedPatches?.length &&
+									result.exitCode === 0 &&
+									!result.error &&
+									!result.aborted &&
+									!result.paused &&
+									rootApplied
+								) {
+									result.persistence = {
+										outcome: "applied",
+										ownerWorktreeApplied: true,
+										recoveryRef: result.recoveryRef,
+									};
+								}
 							}
 						}
-					} catch {
-						changesApplied = false;
-						for (const result of results) {
-							if (result.nestedPatches?.length) setRecoveryAvailable(result);
+					} catch (nestedErr) {
+						if (!nestedPatchVerificationIndeterminate) {
+							const rollbackFailures =
+								nestedErr instanceof NestedPatchApplicationError && nestedErr.rollbackFailures.length > 0
+									? new Set(nestedErr.rollbackFailures)
+									: undefined;
+							if (rollbackFailures && rollbackFailures.size > 0) {
+								nestedPatchVerificationIndeterminate = true;
+								changesApplied = true;
+								hadAnyChanges = true;
+								await markNestedRollbackResults(rollbackFailures);
+								mergeSummary +=
+									"\n\n<system-notification>Nested repository patch application failed and rollback was incomplete; changes may remain in the owner worktree.</system-notification>";
+							} else {
+								const rootWasAppliedBeforeNestedFailure =
+									mergeMode === "branch"
+										? nestedResults.some(result =>
+												Boolean(
+													result.branchName && mergedBranchesForNestedPatches?.has(result.branchName),
+												),
+											)
+										: changesApplied === true && rootPatchTexts.length > 0;
+								changesApplied = rootWasAppliedBeforeNestedFailure;
+								hadAnyChanges = rootWasAppliedBeforeNestedFailure;
+								await markNestedRollbackResults();
+								mergeSummary +=
+									"\n\n<system-notification>Some nested repository patches failed to apply; affected tasks remain recovery-only.</system-notification>";
+							}
 						}
-						mergeSummary +=
-							"\n\n<system-notification>Some nested repository patches failed to apply; affected tasks remain recovery-only.</system-notification>";
 					}
 				}
 			}

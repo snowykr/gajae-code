@@ -34,6 +34,23 @@ export function isUnsolicitedProbeReply(sequence: string): boolean {
 	}
 	return false;
 }
+const PROBE_REPLY_SEARCH_PATTERNS: ReadonlyArray<RegExp> = PROBE_REPLY_PATTERNS.map(({ pattern }) => {
+	const source = pattern.source.replace(/^\^/u, "").replace(/\$$/u, "");
+	return new RegExp(source, "gu");
+});
+
+/**
+ * Remove complete terminal capability-probe replies that no longer have an
+ * armed registry request. Incomplete escape fragments and all other input are
+ * left untouched for the normal input path.
+ */
+function stripUnsolicitedProbeReplies(data: string): string {
+	let filtered = data;
+	for (const pattern of PROBE_REPLY_SEARCH_PATTERNS) {
+		filtered = filtered.replace(pattern, "");
+	}
+	return filtered;
+}
 
 /**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
@@ -253,7 +270,9 @@ interface TerminalResponseRegistryEntry {
  *
  * A response is consumed only after its request is armed and its framer has
  * produced a complete frame. Bytes before an armed frame, interrupted partial
- * frames, expired buffers, and over-limit buffers are returned unchanged.
+ * frames, and over-limit buffers are returned unchanged. A partial frame
+ * recognized by an expiring request is discarded only when no other armed
+ * framer claims the same range; unrelated bytes are preserved for normal input handling.
  */
 export class TerminalResponseRegistry {
 	#buffer = "";
@@ -278,6 +297,7 @@ export class TerminalResponseRegistry {
 		this.#requests.push(entry);
 		if (request.expiresInMs !== undefined && request.expiresInMs > 0) {
 			entry.timer = setTimeout(() => {
+				this.#dropPartial(entry);
 				this.#remove(entry);
 				this.#emit(this.#drain());
 				request.onExpire?.();
@@ -356,7 +376,10 @@ export class TerminalResponseRegistry {
 				const earliestCompleteStart = Math.min(...complete.map(candidate => candidate.frame.start));
 				const nextEscape = this.#buffer.indexOf("\x1b", partialStart + 1);
 				if (nextEscape > partialStart && nextEscape <= earliestCompleteStart) {
-					forwarded += this.#buffer.slice(0, nextEscape);
+					// The partial armed probe is interrupted by another armed response.
+					// Drop the known probe fragment before consuming the complete frame;
+					// forwarding it would leak dangling probe bytes as editor input.
+					forwarded += this.#buffer.slice(0, partialStart);
 					this.#buffer = this.#buffer.slice(nextEscape);
 					continue;
 				}
@@ -396,6 +419,49 @@ export class TerminalResponseRegistry {
 
 	#emit(data: string): void {
 		if (data) this.#onForward?.(data);
+	}
+	#dropPartial(entry: TerminalResponseRegistryEntry): void {
+		if (this.#buffer.length === 0) return;
+		const parsed = entry.request.parse(this.#buffer);
+		const partialStart = parsed.partialStart;
+		const frame = parsed.frame;
+		if (
+			(frame && frame.start >= 0 && frame.end > frame.start && frame.end <= this.#buffer.length) ||
+			partialStart === undefined ||
+			partialStart < 0 ||
+			partialStart >= this.#buffer.length
+		) {
+			return;
+		}
+		const nextEscape = this.#buffer.indexOf("\x1b", partialStart + 1);
+		const partialEnd = nextEscape > partialStart ? nextEscape : this.#buffer.length;
+		for (const other of this.#requests) {
+			if (other === entry) continue;
+			const otherParsed = other.request.parse(this.#buffer);
+			let otherStart: number | undefined;
+			let otherEnd: number | undefined;
+			if (
+				otherParsed.frame &&
+				otherParsed.frame.start >= 0 &&
+				otherParsed.frame.end > otherParsed.frame.start &&
+				otherParsed.frame.end <= this.#buffer.length
+			) {
+				otherStart = otherParsed.frame.start;
+				otherEnd = otherParsed.frame.end;
+			} else if (
+				otherParsed.partialStart !== undefined &&
+				otherParsed.partialStart >= 0 &&
+				otherParsed.partialStart < this.#buffer.length
+			) {
+				otherStart = otherParsed.partialStart;
+				const otherNextEscape = this.#buffer.indexOf("\x1b", otherStart + 1);
+				otherEnd = otherNextEscape > otherStart ? otherNextEscape : this.#buffer.length;
+			}
+			if (otherStart !== undefined && otherEnd !== undefined && otherStart < partialEnd && partialStart < otherEnd) {
+				return;
+			}
+		}
+		this.#buffer = this.#buffer.slice(0, partialStart) + this.#buffer.slice(partialEnd);
 	}
 
 	#remove(entry: TerminalResponseRegistryEntry): void {
@@ -679,7 +745,7 @@ export class ProcessTerminal implements Terminal {
 		const armModeResponse = (): void => {
 			this.#responseRegistry!.arm({
 				id: "terminal.appearance.mode2031",
-				parse: regexResponseParser(/\x1b\[\?997;([12])n/u, /\x1b\[\?997;[12]?$/u, match =>
+				parse: regexResponseParser(/\x1b\[\?997;([12])n/u, /\x1b\[\?(?:9(?:9(?:7(?:;[12]?)?)?)?)?$/u, match =>
 					match[1] === "1" ? "dark" : "light",
 				),
 				onComplete: () => {
@@ -707,23 +773,26 @@ export class ProcessTerminal implements Terminal {
 			const inputHandler = this.#inputHandler;
 			if (!inputHandler) return;
 
+			const filteredData = stripUnsolicitedProbeReplies(data);
+			if (filteredData.length === 0) return;
+
 			let cursor = 0;
-			let probeStart = data.indexOf("\x1b");
+			let probeStart = filteredData.indexOf("\x1b");
 			while (probeStart >= 0) {
-				const nextEscape = data.indexOf("\x1b", probeStart + 1);
+				const nextEscape = filteredData.indexOf("\x1b", probeStart + 1);
 				if (
 					nextEscape > probeStart &&
-					(/^\x1b\]11;[^\x1b\x07]*$/u.test(data.slice(probeStart, nextEscape)) ||
-						/^\x1b\[\?[\d;]*$/u.test(data.slice(probeStart, nextEscape)))
+					(/^\x1b\]11;[^\x1b\x07]*$/u.test(filteredData.slice(probeStart, nextEscape)) ||
+						/^\x1b\[\?[\d;]*$/u.test(filteredData.slice(probeStart, nextEscape)))
 				) {
-					if (probeStart > cursor) inputHandler(data.slice(cursor, probeStart));
+					if (probeStart > cursor) inputHandler(filteredData.slice(cursor, probeStart));
 					cursor = nextEscape;
-					probeStart = data.indexOf("\x1b", cursor);
+					probeStart = filteredData.indexOf("\x1b", cursor);
 					continue;
 				}
-				probeStart = data.indexOf("\x1b", probeStart + 1);
+				probeStart = filteredData.indexOf("\x1b", probeStart + 1);
 			}
-			if (cursor < data.length) inputHandler(data.slice(cursor));
+			if (cursor < filteredData.length) inputHandler(filteredData.slice(cursor));
 		};
 
 		this.#stdinBuffer.on("data", (sequence: string) => {
@@ -834,7 +903,6 @@ export class ProcessTerminal implements Terminal {
 			if (this.#dead) return;
 			if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) return;
 			this.#osc11Pending = false;
-			this.#osc11ResponseBuffer = "";
 			this.#pendingDa1Sentinels = 0;
 			if (this.#osc11QueryQueued && !this.#dead) {
 				this.#osc11QueryQueued = false;

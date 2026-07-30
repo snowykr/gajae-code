@@ -974,6 +974,15 @@ export const SETTINGS_SCHEMA = {
 		default: true, // will be computed based on platform if undefined
 		ui: { tab: "appearance", label: "Show Hardware Cursor", description: "Show terminal cursor for IME support" },
 	},
+	clearOnShrink: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			label: "Clear on Shrink",
+			description: "Clear and redraw when rendered content shrinks",
+		},
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Model

@@ -7,6 +7,7 @@ import { types as nodeUtilTypes } from "node:util";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
@@ -245,6 +246,31 @@ class HarmonyLeakInterruption extends Error {
 		super(`Detected GPT-5 Harmony protocol leakage (${signalListLabel(detection.signals)})`);
 		this.name = "HarmonyLeakInterruption";
 	}
+}
+
+function harmonyDiscardedAssistantMessage(message: AssistantMessage): AssistantMessage {
+	return {
+		...message,
+		content: [],
+		providerPayload: undefined,
+		stopReason: "aborted",
+		errorMessage: "Assistant response discarded after Harmony protocol leakage",
+	};
+}
+
+function emitHarmonyDiscardedAssistantMessageEnd(
+	stream: Pick<EventStream<AgentEvent, AgentMessage[]>, "push">,
+	message: AssistantMessage | undefined,
+): void {
+	if (
+		message === undefined ||
+		message.stopReason === "error" ||
+		message.stopReason === "aborted" ||
+		!message.content.some(content => content.type === "toolCall")
+	) {
+		return;
+	}
+	stream.push({ type: "message_end", message: harmonyDiscardedAssistantMessage(message) });
 }
 
 /**
@@ -1421,6 +1447,7 @@ async function runLoopBody(
 	// the loop could run forever. Any turn that produces a non-malformed batch
 	// resets the counter, so healthy runs are unaffected.
 	let consecutiveMalformedTurns = 0;
+	let malformedCircuitBreakerTriggered = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -1505,7 +1532,7 @@ async function runLoopBody(
 
 			// Stream assistant response
 			let recovered: HarmonyRecoveredToolCall | undefined;
-			let message: AssistantMessage;
+			let message: AssistantMessage | undefined;
 			const attemptTransaction = transaction;
 			try {
 				const attemptConfig = attemptTransaction
@@ -1572,11 +1599,17 @@ async function runLoopBody(
 					throw err;
 				}
 				if (config.fallbackManaged) {
+					attemptTransaction?.discard();
+					currentContext.messages.splice(contextMessageCount);
+					newMessages.splice(newMessageCount);
 					await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
 					throw err;
 				}
 				if (err.recovered) {
 					if (harmonyTruncateResumeCount >= 2) {
+						emitHarmonyDiscardedAssistantMessageEnd(attemptStream, message);
+						currentContext.messages.splice(contextMessageCount);
+						newMessages.splice(newMessageCount);
 						await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
 						throw new Error(
 							`GPT-5 Harmony leak recurred after truncate-and-resume recovery (${signalListLabel(err.detection.signals)}).`,
@@ -1597,6 +1630,9 @@ async function runLoopBody(
 					await emitHarmonyAudit(config, err, "truncate_resume", harmonyRetryAttempt);
 				} else {
 					if (harmonyRetryAttempt >= 2) {
+						emitHarmonyDiscardedAssistantMessageEnd(attemptStream, message);
+						currentContext.messages.splice(contextMessageCount);
+						newMessages.splice(newMessageCount);
 						await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
 						throw new Error(
 							`GPT-5 Harmony leak persisted after ${harmonyRetryAttempt} retries (${signalListLabel(err.detection.signals)}).`,
@@ -1613,24 +1649,32 @@ async function runLoopBody(
 							currentContext.messages.splice(idx, 1);
 						}
 					}
+					// Tool-bearing messages defer their terminal event so it can precede
+					// tool events. This attempt is discarded, so close it before retrying.
+					emitHarmonyDiscardedAssistantMessageEnd(attemptStream, message);
 					continue;
 				}
 			}
+			if (message === undefined) {
+				throw new Error("Assistant stream ended without a message.");
+			}
+			const completedMessage = message;
 			const deferredAssistantMessageEnd =
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				message.content.some(content => content.type === "toolCall");
-			const bufferedAssistantEvents: AgentEvent[] = [];
-			const assistantEventStream = {
-				push: (event: AgentEvent) => bufferedAssistantEvents.push(event),
-			} as unknown as EventStream<AgentEvent, AgentMessage[]>;
 			let assistantMessageEndEmitted = false;
 			const emitAssistantMessageEnd = (): void => {
 				if (assistantMessageEndEmitted || !deferredAssistantMessageEnd) return;
 				assistantMessageEndEmitted = true;
-				attemptStream.push({ type: "message_end", message });
-				for (const event of bufferedAssistantEvents) attemptStream.push(event);
+				attemptStream.push({ type: "message_end", message: completedMessage });
 			};
+			const assistantEventStream = {
+				push: (event: AgentEvent) => {
+					emitAssistantMessageEnd();
+					attemptStream.push(event);
+				},
+			} as unknown as EventStream<AgentEvent, AgentMessage[]>;
 			// Session-level invalid_prompt circuit breaker (bounded, neutralize-only).
 			// A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is
 			// a deterministic content fault: re-sending the same history re-triggers it,
@@ -1839,7 +1883,6 @@ async function runLoopBody(
 				pendingMessages = (await config.getSteeringMessages?.()) || [];
 			}
 			const pauseRequested = pendingMessages.length === 0 && (config.shouldPause?.() ?? false);
-			let breakerTriggered = false;
 			if (pendingMessages.length === 0 && !pauseRequested) {
 				if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
 					recoveryState.pending = true;
@@ -1853,16 +1896,44 @@ async function runLoopBody(
 					// stop rather than burn the provider budget. Terminates on consecutive
 					// count, not argument signatures, so rotating invalid shapes are bounded
 					// too.
-					message.stopReason = "error";
 					const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
-					message.errorMessage = message.errorMessage
-						? `${message.errorMessage} | ${breakerMessage}`
-						: breakerMessage;
-					breakerTriggered = true;
+					malformedCircuitBreakerTriggered = true;
+					// Tool execution events may already have made the original tool-use
+					// message durable. Persist the terminal error separately so resuming
+					// the session observes the circuit breaker rather than the stale
+					// successful tool-use status.
+					if (assistantMessageEndEmitted) {
+						const terminalMessage: AssistantMessage = {
+							...message,
+							content: [],
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "error",
+							errorMessage: message.errorMessage
+								? `${message.errorMessage} | ${breakerMessage}`
+								: breakerMessage,
+							timestamp: Date.now(),
+						};
+						message = terminalMessage;
+						currentContext.messages.push(terminalMessage);
+						newMessages.push(terminalMessage);
+						attemptStream.push({ type: "message_start", message: terminalMessage });
+						attemptStream.push({ type: "message_end", message: terminalMessage });
+					} else {
+						message.stopReason = "error";
+						message.errorMessage = message.errorMessage
+							? `${message.errorMessage} | ${breakerMessage}`
+							: breakerMessage;
+					}
 				}
 			}
 			emitAssistantMessageEnd();
-			stream.push({ type: "turn_end", message, toolResults });
 			if (pendingMessages.length > 0) continue;
 			if (config.shouldPause?.()) {
 				publishAgentEnd(
@@ -1886,11 +1957,14 @@ async function runLoopBody(
 				// stop rather than burn the provider budget. Terminates on consecutive
 				// count, not argument signatures, so rotating invalid shapes are bounded
 				// too.
-				message.stopReason = "error";
-				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${breakerMessage}`
-					: breakerMessage;
+				if (!malformedCircuitBreakerTriggered) {
+					malformedCircuitBreakerTriggered = true;
+					const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+					message.stopReason = "error";
+					message.errorMessage = message.errorMessage
+						? `${message.errorMessage} | ${breakerMessage}`
+						: breakerMessage;
+				}
 				publishAgentEnd(
 					stream,
 					config,
@@ -2103,7 +2177,7 @@ async function streamAssistantResponse(
 				await finishChat(aborted);
 				return aborted;
 			}
-			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
+			let responsePromise: Promise<AssistantMessageEventStream>;
 			try {
 				responsePromise = Promise.resolve(
 					streamFunction(config.model, llmContext, {

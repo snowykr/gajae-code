@@ -146,12 +146,17 @@ describe("malformed tool-call circuit breaker", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
 		const stream = agentLoopContinue(context, config, undefined, mock.stream);
-		const messageEnds: AgentMessage[] = [];
-		for await (const event of stream) {
-			if (event.type === "message_end" && event.message.role === "assistant") {
-				messageEnds.push(structuredClone(event.message));
-			}
-		}
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const messageEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> => event.type === "message_end",
+		);
+		const turnEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "turn_end" }> => event.type === "turn_end",
+		);
+		// A malformed circuit-breaker terminal message is part of the final logical turn,
+		// not an additional lifecycle turn.
+		expect(turnEnds).toHaveLength(calls);
 		const produced = (await stream.result()) as AgentMessage[];
 
 		// The terminating assistant message carries a diagnosable reason.
@@ -160,11 +165,103 @@ describe("malformed tool-call circuit breaker", () => {
 		if (last?.role !== "assistant") throw new Error("expected an assistant message");
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("consecutive turns of malformed tool calls");
-		const persisted = messageEnds.at(-1);
-		expect(persisted?.role).toBe("assistant");
-		if (persisted?.role !== "assistant") throw new Error("expected persisted assistant message");
-		expect(persisted.stopReason).toBe("error");
-		expect(persisted.errorMessage).toContain("consecutive turns of malformed tool calls");
+		expect(last.errorMessage?.match(/Stopping after/g)).toHaveLength(1);
+
+		const terminalStarts = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_start" }> =>
+				event.type === "message_start" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "error",
+		);
+		const terminalEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error",
+		);
+		expect(terminalStarts).toHaveLength(1);
+		expect(terminalEnds).toHaveLength(1);
+		expect(terminalStarts[0]?.message).toEqual(terminalEnds[0]?.message);
+		const terminalAgentEnd = events.findLast(
+			(event): event is Extract<AgentEvent, { type: "agent_end" }> => event.type === "agent_end",
+		);
+		expect(terminalAgentEnd?.messages.at(-1)).toEqual(terminalEnds[0]?.message);
+
+		// The original tool-use message is emitted once, then paired with its result.
+		const assistantToolCallEnds = messageEnds.filter(
+			event =>
+				event.message.role === "assistant" && event.message.content.some(content => content.type === "toolCall"),
+		);
+		expect(assistantToolCallEnds).toHaveLength(calls);
+		const terminalIndex = messageEnds.findLastIndex(
+			event => event.message.role === "assistant" && event.message.stopReason === "error",
+		);
+		expect(terminalIndex).toBe(messageEnds.length - 1);
+		expect(messageEnds[terminalIndex - 1]?.message.role).toBe("toolResult");
+
+		// The terminal error is a separate durable assistant message, after the
+		// final tool result, so every persisted tool call remains paired.
+		const persistedTerminalIndex = context.messages.findLastIndex(
+			message => message.role === "assistant" && message.stopReason === "error",
+		);
+		expect(persistedTerminalIndex).toBe(context.messages.length - 1);
+		expect(context.messages[persistedTerminalIndex - 1]?.role).toBe("toolResult");
+		expect(
+			context.messages.filter(
+				message => message.role === "assistant" && message.content.some(content => content.type === "toolCall"),
+			),
+		).toHaveLength(calls);
+		assertToolPairing(context.messages);
+	}, 30_000);
+	it("does not duplicate provider usage on the synthetic terminal message", async () => {
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [throwingTool()],
+		};
+		let calls = 0;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				if (calls > RUNAWAY_CAP) return { content: ["runaway guard"] };
+				return {
+					content: [{ type: "toolCall" as const, id: `tool-${calls}`, name: "echo", arguments: {} }],
+					usage: {
+						input: 11,
+						output: 7,
+						cacheRead: 5,
+						cacheWrite: 3,
+						totalTokens: 26,
+						cost: { input: 0.11, output: 0.07, cacheRead: 0.05, cacheWrite: 0.03, total: 0.26 },
+					},
+				};
+			},
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+		const produced = (await stream.result()) as AgentMessage[];
+
+		const assistants = produced.filter(message => message.role === "assistant");
+		const terminal = assistants.at(-1);
+		if (terminal?.role !== "assistant") throw new Error("expected terminal assistant message");
+		const providerMessages = assistants.filter(message =>
+			message.content.some(content => content.type === "toolCall"),
+		);
+
+		expect(providerMessages).toHaveLength(calls);
+		expect(providerMessages.every(message => message.usage.totalTokens === 26)).toBe(true);
+		expect(assistants.reduce((total, message) => total + message.usage.totalTokens, 0)).toBe(calls * 26);
+		expect(assistants.reduce((total, message) => total + message.usage.cost.total, 0)).toBeCloseTo(calls * 0.26);
+		expect(terminal.usage).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
 	}, 30_000);
 
 	it("does not fire when the model recovers into a real answer", async () => {
@@ -308,6 +405,102 @@ describe("malformed tool-call circuit breaker", () => {
 		if (toolResultEnd?.message.role !== "toolResult") throw new Error("expected tool result message_end");
 		expect(toolResultEnd.message.toolCallId).toBe("tool-1");
 	});
+	it("forwards pending tool start and progress before completion", async () => {
+		const pending = Promise.withResolvers<{
+			content: [{ type: "text"; text: string }];
+			details: { value: string };
+		}>();
+		let toolStarted = false;
+		let toolResolved = false;
+		const pendingTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				toolStarted = true;
+				onUpdate?.({ content: [{ type: "text", text: "working" }], details: { value: "partial" } });
+				const result = await pending.promise;
+				toolResolved = true;
+				return result;
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: [""],
+			messages: [createUserMessage("echo something")],
+			tools: [pendingTool],
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "ok" } }] },
+				{ content: ["all good"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoopContinue(context, config, undefined, mock.stream);
+		const iterator = stream[Symbol.asyncIterator]();
+		const events: AgentEvent[] = [];
+		let toolStartIndex = -1;
+		while (toolStartIndex < 0) {
+			const next = await iterator.next();
+			if (next.done) throw new Error("stream ended before tool execution started");
+			events.push(next.value);
+			if (next.value.type === "tool_execution_start") toolStartIndex = events.length - 1;
+		}
+
+		expect(toolStarted).toBe(true);
+		expect(toolResolved).toBe(false);
+		const assistantToolCallEndIndex = events.findIndex(
+			event =>
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(content => content.type === "toolCall"),
+		);
+		expect(assistantToolCallEndIndex).toBeGreaterThanOrEqual(0);
+		const assistantToolCallEnds = events.filter(
+			event =>
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some(content => content.type === "toolCall"),
+		);
+		expect(assistantToolCallEnds).toHaveLength(1);
+		expect(assistantToolCallEndIndex).toBeLessThan(toolStartIndex);
+
+		const update = await iterator.next();
+		if (update.done) throw new Error("stream ended before tool execution progress");
+		events.push(update.value);
+		expect(update.value.type).toBe("tool_execution_update");
+		expect(toolResolved).toBe(false);
+
+		pending.resolve({ content: [{ type: "text", text: "ok" }], details: { value: "ok" } });
+		while (true) {
+			const next = await iterator.next();
+			if (next.done) break;
+			events.push(next.value);
+		}
+		await stream.result();
+
+		const toolStarts = events.filter(event => event.type === "tool_execution_start");
+		const toolUpdates = events.filter(event => event.type === "tool_execution_update");
+		const toolEnds = events.filter(event => event.type === "tool_execution_end");
+		const toolResultEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "toolResult",
+		);
+		expect(toolStarts).toHaveLength(1);
+		expect(toolUpdates).toHaveLength(1);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolResultEnds).toHaveLength(1);
+		expect(toolResolved).toBe(true);
+
+		const toolEndIndex = events.findIndex(event => event.type === "tool_execution_end");
+		const toolResultEndIndex = events.findIndex(
+			event => event.type === "message_end" && event.message.role === "toolResult",
+		);
+		expect(toolEndIndex).toBeGreaterThan(events.findIndex(event => event.type === "tool_execution_update"));
+		expect(toolResultEndIndex).toBeGreaterThan(toolEndIndex);
+	}, 30_000);
 	it("does not count healthy tool turns toward the bound", async () => {
 		let executions = 0;
 		const okTool: AgentTool<typeof toolSchema, { value: string }> = {

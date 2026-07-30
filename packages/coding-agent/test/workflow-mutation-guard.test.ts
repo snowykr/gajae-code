@@ -10,6 +10,7 @@ import {
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
 import {
+	assertWorkflowMutationAllowed,
 	assertWorkflowMutationRawPathsAllowed,
 	DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE,
 	getWorkflowMutationDecision,
@@ -1007,9 +1008,6 @@ describe("workflow mutation guard", () => {
 		// Mirrors the agent-session bash wrapper: assertWorkflowMutationAllowed runs
 		// before BashTool.execute. A blocked mutation must not touch product or
 		// workflow state bytes — decision-only tests alone do not prove that.
-		const { assertWorkflowMutationAllowed } = await import(
-			"@gajae-code/coding-agent/skill-state/workflow-mutation-guard"
-		);
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
 		await fs.mkdir(path.join(cwd, "src"), { recursive: true });

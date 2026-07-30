@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import type { TuiTransactionObservation } from "@gajae-code/tui";
 import { TuiTransactionHistory } from "../../src/debug/tui-transaction-history";
 
@@ -29,7 +29,7 @@ describe("TuiTransactionHistory", () => {
 				operation: "page",
 				outcome: "failed",
 				byteLength: Buffer.byteLength(bytes, "utf8"),
-				sha256: createHash("sha256").update(bytes, "utf8").digest("hex"),
+				sha256: crypto.createHash("sha256").update(bytes, "utf8").digest("hex"),
 			},
 		]);
 		expect(snapshot.records[0]).not.toHaveProperty("bytes");

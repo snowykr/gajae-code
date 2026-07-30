@@ -157,13 +157,90 @@ it("does not reuse a stale Kitty conversion after replacing an image at the same
 		expect(releases).toHaveLength(2);
 		releases[0]();
 		await Bun.sleep(10);
-		expect(requests).toBe(0);
+		expect(requests).toBe(1);
 		expect(component.render(80).join("\n")).not.toContain("\x1b_G");
 
 		releases[1]();
 		await Bun.sleep(10);
-		expect(requests).toBe(1);
+		expect(requests).toBe(2);
 		expect(component.render(80).join("\n")).toContain("\x1b_G");
+	} finally {
+		toBase64Spy.mockRestore();
+	}
+});
+it("reuses a Kitty conversion for a recreated equivalent image object", async () => {
+	terminal.imageProtocol = ImageProtocol.Kitty;
+	const image = Buffer.from(
+		await Bun.file(path.join(import.meta.dir, "../../../../../assets/tool-image-fixture.webp")).arrayBuffer(),
+	).toBase64();
+	const releases: Array<() => void> = [];
+	const originalToBase64 = Bun.Image.prototype.toBase64;
+	const toBase64Spy = vi.spyOn(Bun.Image.prototype, "toBase64").mockImplementation(function (this: Bun.Image) {
+		const deferred = Promise.withResolvers<string>();
+		releases.push(() => {
+			void originalToBase64.call(this).then(deferred.resolve, deferred.reject);
+		});
+		return deferred.promise;
+	});
+	let requests = 0;
+	const ui = { requestRender: () => requests++ } as unknown as TUI;
+	try {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, ui);
+		component.updateResult(
+			{
+				content: [
+					{ type: "image", data: image, mimeType: "image/webp" },
+					{ type: "text", text: "first update" },
+				],
+			},
+			true,
+		);
+		component.updateResult(
+			{
+				content: [
+					{ type: "image", data: image, mimeType: "image/webp" },
+					{ type: "text", text: "second update" },
+				],
+			},
+			true,
+		);
+
+		expect(releases).toHaveLength(1);
+		releases[0]();
+		await Bun.sleep(10);
+		expect(requests).toBe(1);
+		component.updateResult(
+			{
+				content: [
+					{ type: "image", data: image, mimeType: "image/webp" },
+					{ type: "text", text: "third update" },
+				],
+			},
+			true,
+		);
+		expect(releases).toHaveLength(1);
+		expect(component.render(80).join("\n")).toContain("\x1b_G");
+	} finally {
+		toBase64Spy.mockRestore();
+	}
+});
+it("requests a render after a Kitty conversion rejects", async () => {
+	terminal.imageProtocol = ImageProtocol.Kitty;
+	const image = Buffer.from(
+		await Bun.file(path.join(import.meta.dir, "../../../../../assets/tool-image-fixture.webp")).arrayBuffer(),
+	).toBase64();
+	const toBase64Spy = vi
+		.spyOn(Bun.Image.prototype, "toBase64")
+		.mockImplementation(() => Promise.reject(new Error("conversion failed")));
+	let requests = 0;
+	const ui = { requestRender: () => requests++ } as unknown as TUI;
+	try {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, ui);
+		component.updateResult({ content: [{ type: "image", data: image, mimeType: "image/webp" }] }, false);
+
+		await Bun.sleep(10);
+
+		expect(requests).toBe(1);
 	} finally {
 		toBase64Spy.mockRestore();
 	}
@@ -232,5 +309,24 @@ describe("ToolExecutionComponent durable lifecycle", () => {
 		const reactivated = component.getDurableHistoryEvent(80);
 		expect(reactivated).toBeDefined();
 		expect(reactivated!.revision).toBeGreaterThan(event.revision);
+	});
+	it("does not reopen an acknowledged final revision on layout invalidation", () => {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub, ".", "tool-call-3");
+		component.updateResult({ content: [{ type: "text", text: "done" }] }, false);
+
+		const finalEvent = component.getDurableHistoryEvent(80)!;
+		expect(finalEvent.final).toBe(true);
+		component.acknowledgeDurableHistoryEvent("tool-call-3", finalEvent.revision);
+		expect(component.getDurableHistoryEvent(80)).toBeUndefined();
+
+		component.invalidate();
+		expect(component.getDurableHistoryEvent(80)).toBeUndefined();
+
+		component.updateResult({ content: [{ type: "text", text: "changed" }] }, false);
+		const changedEvent = component.getDurableHistoryEvent(80);
+		expect(changedEvent).toBeDefined();
+		expect(changedEvent!.revision).toBeGreaterThan(finalEvent.revision);
+		expect(changedEvent!.final).toBe(true);
+		expect(changedEvent!.snapshot.join("\n")).toContain("changed");
 	});
 });

@@ -85,6 +85,7 @@ import {
 	normalizeReviewSourceCohorts,
 	type ReviewDeliveryDisposition,
 	type ReviewSourceCohort,
+	type ReviewSourceDispatch,
 	type ReviewSourceLane,
 } from "./ultragoal-review-source";
 
@@ -4093,7 +4094,7 @@ export async function dispatchUltragoalReviewLane(input: {
 	taskId: string;
 	lane: ReviewSourceLane;
 	rerunCommand: string;
-}): Promise<ReturnType<typeof createReviewSourceDispatch>> {
+}): Promise<ReviewSourceDispatch> {
 	return mutateReviewCohorts(input.cwd, plan => {
 		const cohort = plan.reviewCohorts?.find(item => item.cohortId === input.cohortId);
 		if (!cohort) throw new Error(`Unknown review cohort ${input.cohortId}`);

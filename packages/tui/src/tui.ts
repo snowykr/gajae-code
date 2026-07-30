@@ -201,7 +201,27 @@ type TuiDurableHistoryEvent = {
 	readonly snapshot: readonly string[];
 };
 
-type TuiDurableHistorySource = {
+type TuiRenderedChildMapping = {
+	readonly component: Component;
+	/** Width used to render the child represented by this row range. */
+	readonly width: number;
+	/** Zero-based row range within the parent's rendered rows. */
+	readonly start: number;
+	readonly end: number;
+};
+
+type TuiRenderedChildMappingProvider = {
+	/**
+	 * Internal wrapper contract for transformed layouts. This deliberately
+	 * remains duck-typed rather than becoming part of the public Component API.
+	 */
+	readonly getTuiRenderedChildMappings?: (
+		width: number,
+		renderedLines: readonly string[],
+	) => readonly TuiRenderedChildMapping[] | undefined;
+};
+
+type TuiDurableHistorySource = TuiRenderedChildMappingProvider & {
 	readonly children?: readonly unknown[];
 	readonly getDurableHistoryEvent?: (width: number) => TuiDurableHistoryEvent | undefined;
 	readonly getDurableHistoryEvents?: (width: number) => readonly TuiDurableHistoryEvent[];
@@ -501,12 +521,14 @@ function isViewportSensitiveHost(
 	includeNativeWindows: boolean,
 	includeProcessTerminal: boolean,
 ): boolean {
-	return (
-		isMultiplexerSession(env) ||
-		isWindowsTerminalSession(env) ||
-		includeProcessTerminal ||
-		(includeNativeWindows && platform === "win32")
-	);
+	const underMultiplexer = isMultiplexerSession(env);
+	if (underMultiplexer) {
+		// Preserve the documented opt-in for the legacy clear/replay path. This
+		// must take precedence over the process-terminal capability because tmux
+		// and screen sessions commonly expose a real process terminal as well.
+		return !envIsEnabled(env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER);
+	}
+	return isWindowsTerminalSession(env) || includeProcessTerminal || (includeNativeWindows && platform === "win32");
 }
 /**
  * True when repainting only the live viewport is safer than clearing/replaying
@@ -730,6 +752,194 @@ function safeRenderComponentWithViewportAnchorSource(
 		return { lines, anchors: lines.map(() => null) };
 	}
 }
+type DurableSourceRange = {
+	source: TuiDurableHistorySource;
+	start: number;
+	end: number;
+	width: number;
+	readonly renderedLines?: readonly string[];
+	readonly renderedStart?: number;
+};
+type DurableSourceLineSpace = {
+	readonly lines: readonly string[];
+	readonly start: number;
+};
+
+function isComponent(value: unknown): value is Component {
+	if (value === null || typeof value !== "object") return false;
+	try {
+		return typeof (value as Component).render === "function";
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Return the component-valued children exposed by a rendered container or wrapper.
+ *
+ * Traversal remains opt-in: wrappers expose their rendered child through the same
+ * `children` shape as Container, while unrelated object properties stay private.
+ */
+function getNestedComponents(component: Component): Component[] {
+	const nested: Component[] = [];
+	const seen = new Set<Component>();
+	const add = (value: unknown): void => {
+		if (Array.isArray(value)) {
+			for (const child of value) add(child);
+			return;
+		}
+		if (!isComponent(value) || seen.has(value)) return;
+		seen.add(value);
+		nested.push(value);
+	};
+
+	try {
+		add((component as TuiDurableHistorySource).children);
+	} catch {
+		// A hostile children getter must not interrupt rendering.
+	}
+	return nested;
+}
+function getMappedRenderedChildren(
+	component: Component,
+	width: number,
+	renderedLines: readonly string[],
+	children: readonly Component[],
+): readonly TuiRenderedChildMapping[] | undefined {
+	const provider = component as Component & TuiRenderedChildMappingProvider;
+	if (typeof provider.getTuiRenderedChildMappings !== "function") return undefined;
+
+	let mappings: readonly TuiRenderedChildMapping[] | undefined;
+	try {
+		mappings = provider.getTuiRenderedChildMappings(width, renderedLines);
+	} catch {
+		return undefined;
+	}
+	if (mappings === undefined) return undefined;
+
+	const childSet = new Set(children);
+	const seenChildren = new Set<Component>();
+	const valid: TuiRenderedChildMapping[] = [];
+	for (const mapping of mappings) {
+		if (
+			!mapping ||
+			!childSet.has(mapping.component) ||
+			seenChildren.has(mapping.component) ||
+			!Number.isSafeInteger(mapping.width) ||
+			mapping.width < 0 ||
+			!Number.isSafeInteger(mapping.start) ||
+			!Number.isSafeInteger(mapping.end) ||
+			mapping.start < 0 ||
+			mapping.end <= mapping.start ||
+			mapping.end > renderedLines.length
+		) {
+			continue;
+		}
+		if (valid.some(existing => mapping.start < existing.end && existing.start < mapping.end)) return undefined;
+		seenChildren.add(mapping.component);
+		valid.push(mapping);
+	}
+	return valid;
+}
+
+function findUniqueRenderedRange(
+	lines: readonly string[],
+	childLines: readonly string[],
+): { start: number; end: number } | undefined {
+	if (childLines.length === 0 || childLines.length > lines.length) return undefined;
+	let match: { start: number; end: number } | undefined;
+	for (let start = 0; start + childLines.length <= lines.length; start += 1) {
+		if (!childLines.every((line, offset) => lines[start + offset] === line)) continue;
+		if (match !== undefined) return undefined;
+		match = { start, end: start + childLines.length };
+	}
+	return match;
+}
+
+function collectNestedDurableSourceRanges(
+	component: Component,
+	renderedLines: readonly string[],
+	width: number,
+	componentStart: number,
+	sourceRanges: DurableSourceRange[],
+	ancestors: Set<Component>,
+	lineSpace?: DurableSourceLineSpace,
+): void {
+	if (ancestors.has(component)) return;
+	ancestors.add(component);
+	const children = getNestedComponents(component);
+	const mappedChildren = getMappedRenderedChildren(component, width, renderedLines, children);
+	if (mappedChildren !== undefined) {
+		for (const mapping of mappedChildren) {
+			const childLines = safeRenderComponentWithViewportAnchors(
+				mapping.component,
+				mapping.width,
+				"nested-mapped-child",
+			).lines.map(stripTerminalEraseControls);
+			if (childLines.length !== mapping.end - mapping.start) continue;
+
+			const childStart = componentStart + mapping.start;
+			const durableChild = mapping.component as TuiDurableHistorySource;
+			if (durableChild.getDurableHistoryEvents || durableChild.getDurableHistoryEvent) {
+				sourceRanges.push({
+					source: durableChild,
+					start: childStart,
+					end: componentStart + mapping.end,
+					width: mapping.width,
+					renderedLines: childLines,
+					renderedStart: childStart,
+				});
+			}
+			collectNestedDurableSourceRanges(
+				mapping.component,
+				childLines,
+				mapping.width,
+				childStart,
+				sourceRanges,
+				ancestors,
+				{ lines: childLines, start: childStart },
+			);
+		}
+		ancestors.delete(component);
+		return;
+	}
+	const renderedChildren = children.map(child => ({
+		child,
+		lines: safeRenderComponentWithViewportAnchors(child, width, "nested-child").lines.map(stripTerminalEraseControls),
+	}));
+	let childOffset = 0;
+	const childrenComposeParent =
+		renderedChildren.reduce((length, rendered) => length + rendered.lines.length, 0) === renderedLines.length &&
+		renderedChildren.every(rendered => {
+			const matches = rendered.lines.every((line, offset) => renderedLines[childOffset + offset] === line);
+			childOffset += rendered.lines.length;
+			return matches;
+		});
+	childOffset = 0;
+	for (const { child, lines: childLines } of renderedChildren) {
+		const childRange = childrenComposeParent
+			? { start: childOffset, end: childOffset + childLines.length }
+			: children.length === 1
+				? findUniqueRenderedRange(renderedLines, childLines)
+				: undefined;
+		childOffset += childLines.length;
+		if (childRange === undefined) continue;
+
+		const childStart = componentStart + childRange.start;
+		const durableChild = child as TuiDurableHistorySource;
+		if (durableChild.getDurableHistoryEvents || durableChild.getDurableHistoryEvent) {
+			sourceRanges.push({
+				source: durableChild,
+				start: childStart,
+				end: componentStart + childRange.end,
+				width,
+				...(lineSpace === undefined ? {} : { renderedLines: lineSpace.lines, renderedStart: lineSpace.start }),
+			});
+		}
+		collectNestedDurableSourceRanges(child, childLines, width, childStart, sourceRanges, ancestors, lineSpace);
+	}
+	ancestors.delete(component);
+}
 
 type LineNormalizationCacheEntry = {
 	normalized: string;
@@ -873,11 +1083,58 @@ function hasDistinctPostContractionRows(
 	latestFrameLines: string[],
 	nextFrameLines: string[],
 	durableFrameLines: string[],
+	_width: number,
+	rawLines: readonly string[],
+	sourceRanges: readonly DurableSourceRange[],
 ): boolean {
 	if (nextFrameLines.length <= latestFrameLines.length || nextFrameLines.length > durableFrameLines.length)
 		return false;
 	for (let index = latestFrameLines.length; index < nextFrameLines.length; index += 1) {
 		if (nextFrameLines[index] !== durableFrameLines[index]) return true;
+	}
+	for (const {
+		source,
+		start: sourceStart,
+		end: sourceEnd,
+		width: sourceWidth,
+		renderedLines: sourceLines,
+		renderedStart = sourceStart,
+	} of sourceRanges) {
+		let events: readonly TuiDurableHistoryEvent[];
+		try {
+			events = source.getDurableHistoryEvents
+				? source.getDurableHistoryEvents(sourceWidth)
+				: source.getDurableHistoryEvent
+					? [source.getDurableHistoryEvent(sourceWidth)].filter(
+							(event): event is TuiDurableHistoryEvent => event !== undefined,
+						)
+					: [];
+		} catch {
+			continue;
+		}
+		for (const event of events) {
+			if (
+				!event.identity ||
+				!Number.isSafeInteger(event.revision) ||
+				event.revision <= 0 ||
+				event.snapshot.length === 0
+			)
+				continue;
+			const snapshot = event.snapshot.map(stripTerminalEraseControls);
+			const comparisonLines = sourceLines ?? rawLines;
+			for (let index = sourceStart; index + snapshot.length <= sourceEnd; index += 1) {
+				const snapshotEnd = index + snapshot.length;
+				if (index >= nextFrameLines.length || snapshotEnd <= latestFrameLines.length) continue;
+				const comparisonStart = sourceLines === undefined ? index : index - renderedStart;
+				if (
+					comparisonStart >= 0 &&
+					comparisonStart + snapshot.length <= comparisonLines.length &&
+					snapshot.every((line, offset) => comparisonLines[comparisonStart + offset] === line)
+				) {
+					return true;
+				}
+			}
+		}
 	}
 	return false;
 }
@@ -893,14 +1150,6 @@ export class TUI extends Container {
 	#latestRenderedTranscriptLineCount = 0;
 	#latestRenderedSuffixLineCount = 0;
 	#latestRenderedPlacementOwners = new Map<string, KittyPlacementOwner>();
-	/**
-	 * Raw (pre-normalization) lines from the latest frame, kept only
-	 * when the virtual-viewport flag is on. Used to detect whether the off-screen
-	 * prefix is unchanged (by raw value equality, with a fast reference short-circuit
-	 * when components return stable string instances) so its normalized form can be reused
-	 * (bounded normalize).
-	 */
-	#previousRaw: string[] = [];
 	#kittyPlacementSpans: KittyPlacementSpan[] = [];
 	#latestRaw: string[] = [];
 	#durableLineCount = 0;
@@ -959,6 +1208,7 @@ export class TUI extends Container {
 	#viewportTopRow = 0; // Content row currently mapped to screen row 0
 	#scrollbackResumeViewportTop: number | undefined; // Reflowed history below this frontier is already committed
 	#nativeScrollbackViewportTop = 0;
+	#nativeScrollbackAdmissionPending = false;
 	#transcriptIdentityResetPending = false;
 	#manualViewportTop: number | undefined;
 	#viewportAnchorComponent: Component | null = null;
@@ -1268,6 +1518,7 @@ export class TUI extends Container {
 		this.#viewportAnchorFrame = null;
 		this.#scrollbackResumeViewportTop = undefined;
 		this.#nativeScrollbackViewportTop = 0;
+		this.#nativeScrollbackAdmissionPending = false;
 		this.#transcriptIdentityResetPending = true;
 		this.#manualOutputNotice = false;
 		this.#paintedManualOutputNotice = false;
@@ -1479,7 +1730,7 @@ export class TUI extends Container {
 				suffixLineCount: this.#latestRenderedSuffixLineCount,
 			},
 			"page",
-			true
+			true,
 		);
 		if (!contentPainted) {
 			this.#manualViewportTop = previousManualViewportTop;
@@ -1538,9 +1789,11 @@ export class TUI extends Container {
 				this.#previousLines = liveLines;
 				this.#manualTranscriptLineCount = liveTranscriptLineCount;
 				this.#manualSuffixLineCount = liveSuffixLineCount;
+				this.#latestRenderedLines = liveLines.slice();
 				if (this.#scrollbackResumeViewportTop === undefined) {
 					this.#nativeScrollbackViewportTop = liveViewportTop;
 				}
+				this.#nativeScrollbackAdmissionPending = liveLines.length > this.#durableLineCount;
 				// A settled width repair was deferred while the user was reading
 				// scrollback (repainting mid-read would have destroyed their
 				// position). The transactional live repaint above has committed, so
@@ -2089,10 +2342,10 @@ export class TUI extends Container {
 		// focus/listener state is intentionally preserved so input routing survives
 		// a resume.
 		this.#latestRenderedLines = [];
-		this.#previousRaw = [];
 		this.#kittyPlacementSpans = [];
 		this.#latestRaw = [];
 		this.#durableLineCount = 0;
+		this.#nativeScrollbackAdmissionPending = false;
 		this.#durableRenderedLines.length = 0;
 		this.#transcriptIdentityReplaced = false;
 		this.#lineNormalizationCache.clear();
@@ -2130,7 +2383,13 @@ export class TUI extends Container {
 		this.#lastObservedWidth = observedWidth;
 		const heightChanged = this.#previousHeight !== this.terminal.rows;
 		if (widthChanged) this.#scheduleWidthSettleRedraw();
-		this.requestRender(heightChanged && !useViewportRepaintPath(this.terminal), "resize");
+		this.requestRender(
+			heightChanged &&
+				!shouldUseViewportRepaintForHost(Bun.env, process.platform, {
+					includeProcessTerminal: this.terminal.isProcessTerminal === true,
+				}),
+			"resize",
+		);
 	}
 
 	/**
@@ -3030,7 +3289,6 @@ export class TUI extends Container {
 		return lineWidth >= width ? line : line + " ".repeat(width - lineWidth);
 	}
 
-
 	#kittyPlacementKey(reference: KittyPlacementReference): string {
 		return `${reference.imageId}:${reference.placementId}`;
 	}
@@ -3300,7 +3558,6 @@ export class TUI extends Container {
 		let nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
 		if (paintManual)
 			nextViewportTop = this.#kittyViewportTopIncludingPlacementAnchors(nextViewportTop, placementsToPaint);
-		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - this.#viewportTopRow));
 		const transcriptCapacity = paintManual ? this.#manualTranscriptCapacity(height, suffixLineCount) : height;
 		const noticeRows = paintManual && this.#manualOutputNotice && height > suffixLineCount ? 1 : 0;
 		const deletePlan = this.#kittyPlacementDeletePlan(
@@ -3317,10 +3574,7 @@ export class TUI extends Container {
 				]
 			: [{ top: nextViewportTop, bottom: nextViewportTop + height }];
 		let buffer = `\x1b[?2026h${deletePlan.output}`;
-		if (currentScreenRow > 0) {
-			buffer += `\x1b[${currentScreenRow}A`;
-		}
-		buffer += "\r";
+		buffer += "\x1b[H";
 		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (screenRow > 0) buffer += avoidScrollback ? "\r\x1b[1B" : "\r\n";
@@ -3477,10 +3731,13 @@ export class TUI extends Container {
 			return targetScreenRow - currentScreenRow;
 		};
 
-		// Render direct children once so the registered transcript component retains row ownership.
+		// Render children once so source ranges retain ownership of their rendered rows.
+		// Coverage candidates are restricted to rows owned by durable-history sources;
+		// matching text in extension/non-source rows must never acknowledge a source.
 		const renderTreeStart = renderMetrics.now();
 		const renderedLines: string[] = [];
 		const renderedChildren = new Map<Component, string[]>();
+		const durableSourceRanges: DurableSourceRange[] = [];
 		let anchorFrame: ViewportAnchorFrame | null = null;
 		let previousKittyPlacementSpans = this.#kittyPlacementSpans;
 		const placementOwners = new Map<string, KittyPlacementOwner>();
@@ -3493,8 +3750,9 @@ export class TUI extends Container {
 			const rendered = safeRenderComponentWithViewportAnchors(child, width, "tui-child");
 			const safeLines = rendered.lines.map(stripTerminalEraseControls);
 			renderedChildren.set(child, safeLines);
+			const childStart = renderedLines.length;
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
-				anchorFrame = { startRow: renderedLines.length, anchors: rendered.anchors };
+				anchorFrame = { startRow: childStart, anchors: rendered.anchors };
 			}
 			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
 			for (let lineIndex = 0; lineIndex < rendered.lines.length; lineIndex++) {
@@ -3504,6 +3762,16 @@ export class TUI extends Container {
 				}
 				renderedLines.push(safeLines[lineIndex] ?? line);
 			}
+			const durableChild = child as TuiDurableHistorySource;
+			if (durableChild.getDurableHistoryEvents || durableChild.getDurableHistoryEvent) {
+				durableSourceRanges.push({
+					source: durableChild,
+					start: childStart,
+					end: renderedLines.length,
+					width,
+				});
+			}
+			collectNestedDurableSourceRanges(child, safeLines, width, childStart, durableSourceRanges, new Set());
 		}
 		const sourceTranscriptLineCount = hasStickySuffix
 			? this.children
@@ -3550,7 +3818,7 @@ export class TUI extends Container {
 			this.#lineEmitWidthCache.clear();
 		}
 		const heightChanged = this.#previousHeight !== 0 && this.#previousHeight !== height;
-		const initialRender = this.#latestRenderedLines.length === 0 && this.#maxLinesRendered === 0;
+		const initialRender = this.#previousLines.length === 0 && this.#maxLinesRendered === 0;
 		let coalescedWidthAppend = false;
 		let coalescedTabAppend = false;
 
@@ -3576,6 +3844,7 @@ export class TUI extends Container {
 			this.#virtualViewport &&
 			!widthChanged &&
 			this.#latestRaw.length > 0 &&
+			!tabWidthInvalidation &&
 			this.#latestRenderedLines.length === this.#latestRaw.length
 		) {
 			const winTop = Math.max(0, total - height - VIEWPORT_NORMALIZE_OVERSCAN);
@@ -3610,6 +3879,9 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		const nextKittyPlacementSpans = this.#kittyPlacementSpansForLines(newLines, placementOwners);
+		const previousLogicalFrame = this.#latestRenderedLines.slice();
+		const previousRawFrame = this.#latestRaw.slice();
+		const previousRenderedLength = previousLogicalFrame.length;
 		this.#latestRenderedLines = newLines;
 		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
 		this.#latestRenderedSuffixLineCount = nextSuffixLineCount;
@@ -3690,11 +3962,14 @@ export class TUI extends Container {
 				// A formerly valid semantic target is temporarily absent (provider removal,
 				// replacement, eviction, or object deletion). Keep the last resolved frame
 				// instead of silently reinterpreting manual intent as a numeric viewport.
-				const retainedLines = this.#latestRenderedLines.length > 0
-					? this.#latestRenderedLines
-					: this.#previousLines.length > 0
+				// Keep the committed physical baseline first: #latestRenderedLines may already
+				// reflect source changes that are intentionally hidden until the anchor recovers.
+				const retainedLines =
+					this.#previousLines.length > 0
 						? this.#previousLines
-						: newLines;
+						: previousLogicalFrame.length > 0
+							? previousLogicalFrame
+							: newLines;
 				contentPainted = false;
 				this.#repaintViewportFromLines(
 					retainedLines,
@@ -3759,12 +4034,19 @@ export class TUI extends Container {
 			return;
 		}
 		// Helper to clear scrollback and viewport and render all new lines
-		let viewportRepaint: (reason: string, targetViewportTop?: number) => boolean;
+		const shouldPreserveScrollbackOnFullClear = shouldUseViewportRepaintForHost(Bun.env, process.platform, {
+			includeProcessTerminal: this.terminal.isProcessTerminal === true,
+		});
+		let viewportRepaint: (
+			reason: string,
+			targetViewportTopOrAllowPastLiveBottom?: number | boolean,
+			allowPastLiveBottom?: boolean,
+		) => boolean;
 		const fullRender = (clear: boolean, reason = "full render", forceScrollbackClear = false): void => {
 			if (
 				clear &&
 				!forceScrollbackClear &&
-				shouldPreserveScrollbackOnFullClear(this.terminal) &&
+				shouldPreserveScrollbackOnFullClear &&
 				this.#scrollbackResumeViewportTop !== undefined
 			) {
 				viewportRepaint(`preserving full replay blocked after scrollback-unsafe contraction: ${reason}`);
@@ -3786,9 +4068,7 @@ export class TUI extends Container {
 			// of the stale-width copy instead of replacing it).
 			if (clear)
 				buffer +=
-					!forceScrollbackClear && shouldPreserveScrollbackOnFullClear(this.terminal)
-						? "\x1b[2J\x1b[H"
-						: "\x1b[2J\x1b[H\x1b[3J";
+					!forceScrollbackClear && shouldPreserveScrollbackOnFullClear ? "\x1b[2J\x1b[H" : "\x1b[2J\x1b[H\x1b[3J";
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				// Lines were pre-terminated/normalized by #applyLineResets; image
@@ -3799,15 +4079,22 @@ export class TUI extends Container {
 			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, cursorRow);
 			buffer += seq;
 			buffer += "\x1b[?2026l"; // End synchronized output
+			const durableSourceCoverage = this.#getDurableSourceCoverage(
+				width,
+				rawLines,
+				0,
+				newLines.length,
+				durableSourceRanges,
+			);
 			if (
 				!this.#writeRenderBufferAndReanchorImeCursor(
 					buffer,
 					cursorPos,
 					newLines.length,
 					"primary",
-					clear,
+					true,
 					rawLines,
-					undefined,
+					durableSourceCoverage,
 					() => {
 						this.#cursorRow = cursorRow;
 						this.#hardwareCursorRow = toRow;
@@ -3816,7 +4103,7 @@ export class TUI extends Container {
 						this.#nativeScrollbackViewportTop = clear
 							? this.#viewportTopRow
 							: Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-						if (clear && (forceScrollbackClear || !shouldPreserveScrollbackOnFullClear(this.terminal))) {
+						if (clear && (forceScrollbackClear || !shouldPreserveScrollbackOnFullClear)) {
 							this.#scrollbackResumeViewportTop = undefined;
 						}
 						this.#previousLines = newLines;
@@ -3831,98 +4118,56 @@ export class TUI extends Container {
 						this.#manualTranscriptLineCount = nextTranscriptLineCount;
 						this.#manualSuffixLineCount = nextSuffixLineCount;
 						this.#refreshPaintedLiveViewportObservation(height);
+						this.#durableLineCount = newLines.length;
+						this.#durableRenderedLines = newLines.slice();
 					},
 				)
 			)
 				return;
+			if (this.#virtualViewport) this.#latestRaw = rawLines;
 		};
 
-		viewportRepaint = (reason: string, targetViewportTop = Math.max(0, newLines.length - height)): boolean => {
-			this.#fullRedrawCount += 1;
-			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
-			const nextViewportTop = targetViewportTop;
-			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
-			const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
-				{ top: prevViewportTop, bottom: prevViewportTop + height },
-			]);
-			let buffer = `\x1b[?2026h${deletePlan.output}`;
-			if (currentScreenRow > 0) {
-				buffer += `\x1b[${currentScreenRow}A`;
-			}
-			buffer += "\r";
-			for (let screenRow = 0; screenRow < height; screenRow++) {
-				if (screenRow > 0) buffer += avoidScrollback ? "\r\x1b[1B" : "\r\n";
-				const lineIndex = nextViewportTop + screenRow;
-				const line = lineIndex >= newLines.length ? "" : newLines[lineIndex];
-				const isImage = TERMINAL.isImageLine(line);
-				if (avoidScrollback && isImage) buffer += "\x1b7";
-				if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
-					let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
-					truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
-					buffer += fixedWidthRows ? this.#padLineToWidth(truncatedLine, width) : truncatedLine;
-				} else {
-					buffer += fixedWidthRows ? this.#padLineToWidth(line, width) : line;
-				}
-				if (avoidScrollback && isImage) buffer += "\x1b8";
-			}
-			if (avoidScrollback) buffer += "\r";
-
-			const finalPhysicalRow = nextViewportTop + Math.max(0, height - 1);
-			let cursorSeq = "\x1b[?25l";
-			let cursorToRow = finalPhysicalRow;
-			if (cursorPos && cursorPos.row >= nextViewportTop && cursorPos.row < nextViewportTop + height) {
-				const cursor = this.#cursorControlSequence(cursorPos, newLines.length, finalPhysicalRow);
-				cursorSeq = cursor.seq;
-				cursorToRow = cursor.toRow;
-			}
-			buffer += cursorSeq;
-			buffer += "\x1b[?2026l";
-			let contentWritten = false;
-			this.#writeRenderBufferAndReanchorImeCursor(
-				buffer,
+		viewportRepaint = (
+			reason: string,
+			targetViewportTopOrAllowPastLiveBottom: number | boolean = Math.max(0, newLines.length - height),
+			allowPastLiveBottom = false,
+		): boolean => {
+			const targetViewportTop =
+				typeof targetViewportTopOrAllowPastLiveBottom === "number"
+					? targetViewportTopOrAllowPastLiveBottom
+					: Math.max(0, newLines.length - height);
+			const paintPastLiveBottom =
+				typeof targetViewportTopOrAllowPastLiveBottom === "boolean"
+					? targetViewportTopOrAllowPastLiveBottom
+					: allowPastLiveBottom;
+			return this.#repaintViewportFromLines(
+				newLines,
+				width,
+				height,
+				targetViewportTop,
 				cursorPos,
-				newLines.length,
-				"page-entry-or-repaint",
-				false,
-				rawLines,
-				undefined,
+				reason,
+				paintPastLiveBottom,
 				() => {
-					contentWritten = true;
-					this.#hardwareCursorRow = cursorToRow;
-					this.#cursorRow = Math.max(0, newLines.length - 1);
-					this.#maxLinesRendered = newLines.length;
-					this.#viewportTopRow = nextViewportTop;
 					this.#previousLines = newLines;
 					this.#previousWidth = width;
 					this.#previousHeight = height;
-					this.#kittyPlacementSpans = this.#kittyCommittedPlacementsAfterPaint(
-						previousKittyPlacementSpans,
-						nextKittyPlacementSpans,
-						deletePlan,
-						[{ top: nextViewportTop, bottom: nextViewportTop + height }],
-					);
 					this.#manualTranscriptLineCount = nextTranscriptLineCount;
 					this.#manualSuffixLineCount = nextSuffixLineCount;
 					this.#refreshPaintedLiveViewportObservation(height);
+					this.#latestRenderedLines = newLines.slice();
+					if (this.#virtualViewport) this.#latestRaw = rawLines.slice();
 				},
+				false,
+				previousKittyPlacementSpans,
+				nextKittyPlacementSpans,
+				{ transcriptLineCount: nextTranscriptLineCount, suffixLineCount: nextSuffixLineCount },
+				"page-entry-or-repaint",
+				true,
 			);
-			if (!contentWritten) return false;
-
-			if (this.#debugRedraw) {
-				const msg = `[${new Date().toISOString()}] viewportRepaint: (new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
-				this.#appendDebugRedrawLog(msg);
-			}
-			// A viewport repaint is transient: it paints only the visible window and
-			// must not acknowledge the logical transcript as durably emitted.
-			this.#cursorRow = Math.max(0, newLines.length - 1);
-			this.#maxLinesRendered = newLines.length;
-			this.#viewportTopRow = nextViewportTop;
-			this.#previousWidth = width;
-			this.#previousHeight = height;
-			return true;
 		};
 		if (transcriptIdentityReplaced && !initialRender) {
-			viewportRepaint("transcript identity replaced", true, true);
+			fullRender(true, "transcript identity replaced", true);
 			return;
 		}
 		// Tab width changes invalidate normalization without changing terminal
@@ -3930,11 +4175,8 @@ export class TUI extends Container {
 		// whose old-frame boundary is proven by the same conservative reflow matcher
 		// used for terminal-width changes.
 		if (tabWidthInvalidation && !initialRender) {
-			const previousRenderedLength = this.#latestRenderedLines.length;
 			const previousFrameLines =
-				this.#virtualViewport && this.#latestRaw.length > 0
-					? this.#latestRaw.slice()
-					: this.#latestRenderedLines.slice();
+				this.#virtualViewport && previousRawFrame.length > 0 ? previousRawFrame : previousLogicalFrame;
 			const stableLogicalBoundary = findStableLogicalAppendBoundary(previousFrameLines, rawLines);
 			const safeRetainedLength =
 				stableLogicalBoundary >= 0
@@ -3946,12 +4188,19 @@ export class TUI extends Container {
 				newLines.length > 0 &&
 				safeRetainedLength >= 0 &&
 				safeRetainedLength < newLines.length;
-			viewportRepaint("tab width changed", true, true);
-			if (!canCoalesceTabAppend) return;
+			if (canCoalesceTabAppend) {
+				const appendedFrame = newLines;
+				newLines = newLines.slice(0, safeRetainedLength);
+				viewportRepaint("tab width changed", true, true);
+				newLines = appendedFrame;
+			} else {
+				viewportRepaint("tab width changed", true, true);
+				return;
+			}
 
 			this.#latestRenderedLines = newLines.slice(0, safeRetainedLength);
 			if (this.#virtualViewport) this.#latestRaw = rawLines.slice(0, safeRetainedLength);
-			prevViewportTop = Math.max(0, newLines.length - height);
+			prevViewportTop = this.#viewportTopRow;
 			viewportTop = prevViewportTop;
 			hardwareCursorRow = this.#hardwareCursorRow;
 			coalescedWidthAppend = true;
@@ -3969,25 +4218,33 @@ export class TUI extends Container {
 			// raw row fits at both widths. Otherwise find the conservative physical
 			// reflow boundary before appending the mutation suffix.
 			let rawPrefixProven = false;
-			if (this.#virtualViewport && rawLines.length > this.#latestRaw.length) {
+			if (this.#virtualViewport && rawLines.length > previousRawFrame.length) {
 				const previousWidth = this.#previousWidth;
 				if (previousWidth > 0) {
 					rawPrefixProven = true;
 					const durableWidth = Math.min(previousWidth, width);
-					for (let i = 0; i < this.#latestRaw.length; i++) {
-						if (rawLines[i] !== this.#latestRaw[i] || visibleWidth(rawLines[i]) > durableWidth) {
+					for (let i = 0; i < previousRawFrame.length; i++) {
+						if (rawLines[i] !== previousRawFrame[i] || visibleWidth(rawLines[i]) > durableWidth) {
 							rawPrefixProven = false;
 							break;
 						}
 					}
-					if (rawPrefixProven) retainedLength = this.#latestRaw.length;
+					if (rawPrefixProven) retainedLength = previousRawFrame.length;
 				}
+			}
+			if (rawPrefixProven) {
+				// Raw rows can expand into a different number of physical rows at
+				// the new width (components may also expose width-sensitive rows).
+				// Derive the retained boundary from rendered frames so reflow
+				// continuations are not committed as durable output.
+				retainedLength = findSafeReflowSuffixStart(previousLogicalFrame, newLines);
+				if (retainedLength < 0) rawPrefixProven = false;
 			}
 			if (!rawPrefixProven) {
 				// A raw row that exceeded the old/new width may have been truncated in
 				// the previous frame. Match the rendered frame so a resize cannot
 				// mistake that truncation for a stable durable boundary.
-				const previousFrameLines = this.#latestRenderedLines.slice();
+				const previousFrameLines = previousLogicalFrame;
 				const stableLogicalBoundary = findStableLogicalAppendBoundary(previousFrameLines, rawLines);
 				retainedLength =
 					stableLogicalBoundary >= 0
@@ -3996,15 +4253,18 @@ export class TUI extends Container {
 			}
 		}
 		const distinctPostContractionRows = hasDistinctPostContractionRows(
-			this.#latestRenderedLines,
+			previousLogicalFrame,
 			newLines,
 			this.#durableRenderedLines,
+			width,
+			rawLines,
+			durableSourceRanges,
 		);
 		const durableAppend = newLines.length > this.#durableLineCount || distinctPostContractionRows;
 		// A stale durable frontier can sit behind a transient reflow frame. Coalesced
 		// resize/mutation output is an append only when the desired frame also grew
 		// beyond that frame; otherwise CRLF would commit reflow rows a second time.
-		const logicalAppend = newLines.length > this.#latestRenderedLines.length;
+		const logicalAppend = newLines.length > previousRenderedLength;
 		if (
 			widthChanged &&
 			!initialRender &&
@@ -4033,16 +4293,31 @@ export class TUI extends Container {
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (new=${newLines.length}, height=${height})\n`;
 			this.#appendDebugRedrawLog(msg);
 		};
+		const useViewportRepaintPath = shouldUseViewportRepaintForHost(Bun.env, process.platform, {
+			includeProcessTerminal: this.terminal.isProcessTerminal === true,
+		});
+		const widthReflowRequired =
+			this.#previousWidth > 0 &&
+			rawLines.some(
+				line => !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width),
+			);
 
 		// First render - just output everything without clearing (assumes clean screen)
-		if (this.#previousLines.length === 0 && !widthChanged && !heightChanged) {
+		if (initialRender) {
 			logRedraw("first render");
 			fullRender(false, "first render");
 			return;
 		}
 
-		// Width changes always need a full re-render because wrapping changes.
-		if (widthChanged) {
+		// Width changes always need a full re-render because wrapping changes, unless
+		// a proven coalesced append is continuing through the durable append path.
+		if (widthChanged && !coalescedWidthAppend) {
+			if (!widthReflowRequired) {
+				this.#widthSettleRepairPending = false;
+				logRedraw(`terminal width changed without reflow (${this.#previousWidth} -> ${width})`);
+				viewportRepaint(`terminal width changed without reflow (${this.#previousWidth} -> ${width})`);
+				return;
+			}
 			if (this.#widthSettleRepairPending) {
 				logRedraw(`width settled (${this.#previousWidth} -> ${width})`);
 				// The one debounced post-resize repair: a full clear+replay so stale
@@ -4053,7 +4328,7 @@ export class TUI extends Container {
 				// never once per SIGWINCH.
 				this.#widthSettleRepairPending = false;
 				fullRender(true, "width settled", true);
-			} else if (useViewportRepaintPath(this.terminal)) {
+			} else if (useViewportRepaintPath) {
 				logRedraw(`terminal width changed (${this.#previousWidth} -> ${width})`);
 				// In viewport-repaint sessions a per-event full replay can either pile
 				// the transcript back onto scrollback (tmux/screen) or visibly jump to
@@ -4072,7 +4347,7 @@ export class TUI extends Container {
 		// but Termux changes height when the software keyboard shows or hides.
 		// In that environment, a full redraw causes the entire history to replay on every toggle.
 		if (heightChanged) {
-			if (useViewportRepaintPath(this.terminal)) {
+			if (useViewportRepaintPath) {
 				viewportRepaint(`terminal height changed (${this.#previousHeight} -> ${height})`);
 				return;
 			}
@@ -4086,11 +4361,7 @@ export class TUI extends Container {
 		// Configurable via setClearOnShrink() or GJC_CLEAR_ON_SHRINK=0 env var
 		if (this.#clearOnShrink && newLines.length < this.#previousLines.length && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
-			if (
-				useViewportRepaintPath(this.terminal) ||
-				((this.#previousLines.length > height || newLines.length > height) &&
-					allowsHostNeutralOverflowRepaint(this.terminal))
-			) {
+			if (useViewportRepaintPath) {
 				viewportRepaint(`clearOnShrink (prev=${this.#previousLines.length}, new=${newLines.length})`);
 			} else {
 				fullRender(true, "clearOnShrink");
@@ -4101,12 +4372,12 @@ export class TUI extends Container {
 		// Find first and last changed lines
 		let firstChanged = -1;
 		let lastChanged = -1;
-		const maxLines = Math.max(newLines.length, this.#latestRenderedLines.length);
+		const maxLines = Math.max(newLines.length, this.#previousLines.length);
 		if (renderMetrics.enabled) renderMetrics.recordLineCount("diffed", maxLines - diffStart);
 		// When the off-screen prefix was reused (virtual viewport), it is verified
 		// unchanged (raw value equality), so the diff can safely start at the window boundary.
 		for (let i = diffStart; i < maxLines; i++) {
-			const oldLine = i < this.#latestRenderedLines.length ? this.#latestRenderedLines[i] : "";
+			const oldLine = i < this.#previousLines.length ? this.#previousLines[i] : "";
 			const newLine = i < newLines.length ? newLines[i] : "";
 
 			if (oldLine !== newLine) {
@@ -4121,16 +4392,32 @@ export class TUI extends Container {
 		if (
 			!initialRender &&
 			!coalescedWidthAppend &&
-			newLines.length > this.#latestRenderedLines.length &&
+			newLines.length > this.#previousLines.length &&
 			newLines.length <= this.#durableLineCount &&
 			!distinctPostContractionRows
 		) {
 			viewportRepaint("content regrowth within durable history", true, true);
 			return;
 		}
-		const appendedLines = newLines.length > this.#latestRenderedLines.length || durableAppend;
+		const appendedLines = newLines.length > this.#previousLines.length || durableAppend;
 		if (appendedLines) {
-			if (firstChanged === -1 || (durableAppend && firstChanged === this.#latestRenderedLines.length)) {
+			if (
+				this.#nativeScrollbackAdmissionPending &&
+				this.#durableLineCount <= firstChanged &&
+				previousLogicalFrame.length < newLines.length &&
+				firstChanged >= previousLogicalFrame.length
+			) {
+				// Following a manual viewport repaints the live frame in place, so its
+				// newest rows are not yet in native scrollback. Advance by a newline
+				// before emitting the new frontier; the terminal admits the existing
+				// bottom row without replaying its bytes.
+				firstChanged = previousLogicalFrame.length;
+			} else if (coalescedWidthAppend && retainedLength >= 0) {
+				// The terminal reflows the retained prefix during a resize. Emit only
+				// the proven durable suffix; replaying the reflowed prefix would append
+				// historical rows to native scrollback a second time.
+				firstChanged = retainedLength;
+			} else if (firstChanged === -1 || (durableAppend && firstChanged === previousLogicalFrame.length)) {
 				// A resize repaint updates #latestRenderedLines without committing the
 				// reflowed viewport rows to scrollback. Never rewind the suffix start
 				// below that repaint boundary: doing so re-emits reflow rows on the
@@ -4138,8 +4425,8 @@ export class TUI extends Container {
 				// durable boundary, hence the maximum.
 				firstChanged =
 					durableAppend && !coalescedWidthAppend && !distinctPostContractionRows
-						? Math.max(this.#durableLineCount, this.#latestRenderedLines.length)
-						: this.#latestRenderedLines.length;
+						? Math.max(this.#durableLineCount, previousLogicalFrame.length)
+						: previousLogicalFrame.length;
 			}
 			lastChanged = newLines.length - 1;
 		}
@@ -4147,7 +4434,7 @@ export class TUI extends Container {
 			appendedLines &&
 			firstChanged > 0 &&
 			(firstChanged === this.#previousLines.length ||
-				firstChanged === this.#latestRenderedLines.length ||
+				firstChanged === previousLogicalFrame.length ||
 				firstChanged === this.#durableLineCount);
 		if (firstChanged >= 0) {
 			const changedTop = firstChanged;
@@ -4168,13 +4455,25 @@ export class TUI extends Container {
 
 		// No changes - but still need to update hardware cursor position if it moved
 		if (firstChanged === -1) {
+			// A source can advance its durable revision without changing its rendered
+			// lines (for example, a final preview that settles empty). The snapshot is
+			// already physically present, so acknowledge its unambiguous coverage.
+			for (const coverage of this.#getDurableSourceCoverage(
+				width,
+				newLines,
+				0,
+				newLines.length,
+				durableSourceRanges,
+			)) {
+				coverage.acknowledge();
+			}
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
 			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
-		if (newLines.length < this.#latestRenderedLines.length && nextLiveViewportTop !== prevViewportTop) {
+		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
 		}
@@ -4193,7 +4492,13 @@ export class TUI extends Container {
 			);
 			return;
 		}
-		if (appendedLines && this.#scrollbackResumeViewportTop !== undefined && nextLiveViewportTop > prevViewportTop) {
+		if (distinctPostContractionRows) this.#scrollbackResumeViewportTop = undefined;
+		if (
+			appendedLines &&
+			this.#scrollbackResumeViewportTop !== undefined &&
+			nextLiveViewportTop > prevViewportTop &&
+			!distinctPostContractionRows
+		) {
 			const resumeViewportTop = this.#scrollbackResumeViewportTop;
 			if (nextLiveViewportTop <= resumeViewportTop) {
 				viewportRepaint(
@@ -4226,7 +4531,7 @@ export class TUI extends Container {
 		}
 		// All changes are in deleted lines (nothing to render, just clear)
 		if (firstChanged >= newLines.length) {
-			if (Math.max(this.#previousLines.length, this.#latestRenderedLines.length) > newLines.length) {
+			if (this.#previousLines.length > newLines.length) {
 				const deletePlan = this.#kittyPlacementDeletePlan(previousKittyPlacementSpans, nextKittyPlacementSpans, [
 					{ top: firstChanged, bottom: lastChanged + 1 },
 				]);
@@ -4238,7 +4543,7 @@ export class TUI extends Container {
 				else if (lineDiff < 0) buffer += `\x1b[${-lineDiff}A`;
 				buffer += "\r";
 				// Clear extra lines without scrolling
-				const extraLines = this.#latestRenderedLines.length - newLines.length;
+				const extraLines = this.#previousLines.length - newLines.length;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
 					viewportRepaint(`extraLines > height (${extraLines} > ${height})`);
@@ -4318,7 +4623,7 @@ export class TUI extends Container {
 		if (firstChanged < prevViewportTop && appendedLines) {
 			let suffixStart = -1;
 			for (let i = Math.max(diffStart, prevViewportTop); i < maxLines; i++) {
-				const oldLine = i < this.#latestRenderedLines.length ? this.#latestRenderedLines[i] : "";
+				const oldLine = i < this.#previousLines.length ? this.#previousLines[i] : "";
 				const newLine = i < newLines.length ? newLines[i] : "";
 				if (oldLine !== newLine) {
 					suffixStart = i;
@@ -4329,7 +4634,7 @@ export class TUI extends Container {
 				firstChanged = suffixStart;
 				appendStart =
 					firstChanged > 0 &&
-					(firstChanged === this.#latestRenderedLines.length || firstChanged === this.#durableLineCount);
+					(firstChanged === previousLogicalFrame.length || firstChanged === this.#durableLineCount);
 			}
 		}
 		// A transient width-reflow repaint can leave the latest logical frame
@@ -4348,6 +4653,119 @@ export class TUI extends Container {
 			return;
 		}
 		if (firstChanged < prevViewportTop && !durableAppend) {
+			// A final snapshot whose source rows are entirely offscreen cannot be
+			// covered by the viewport repaint below. Append only that owned snapshot
+			// before rebasing the latest frame; unrelated viewport rows stay transient.
+			const offscreenFinalCandidates: Array<{
+				readonly source: TuiDurableHistorySource;
+				readonly event: TuiDurableHistoryEvent;
+				readonly start: number;
+				readonly end: number;
+			}> = [];
+			if (!widthChanged && !heightChanged && newLines.length === this.#latestRenderedLines.length) {
+				for (const {
+					source,
+					start: sourceStart,
+					end: sourceEnd,
+					renderedLines: sourceLines,
+					renderedStart = sourceStart,
+					width: sourceWidth,
+				} of durableSourceRanges) {
+					if (!source.acknowledgeDurableHistoryEvent) continue;
+					let events: readonly TuiDurableHistoryEvent[];
+					try {
+						events = source.getDurableHistoryEvents
+							? source.getDurableHistoryEvents(sourceWidth)
+							: source.getDurableHistoryEvent
+								? [source.getDurableHistoryEvent(sourceWidth)].filter(
+										(event): event is TuiDurableHistoryEvent => event !== undefined,
+									)
+								: [];
+					} catch {
+						continue;
+					}
+					for (const event of events) {
+						if (!event.final || !event.identity || event.snapshot.length === 0) continue;
+						const snapshot = event.snapshot.map(stripTerminalEraseControls);
+						for (let start = sourceStart; start + snapshot.length <= sourceEnd; start += 1) {
+							const end = start + snapshot.length;
+							if (end > prevViewportTop) continue;
+							const comparisonLines = sourceLines ?? rawLines;
+							const comparisonStart = sourceLines === undefined ? start : start - renderedStart;
+							if (
+								comparisonStart < 0 ||
+								comparisonStart + snapshot.length > comparisonLines.length ||
+								!snapshot.every((line, offset) => comparisonLines[comparisonStart + offset] === line)
+							)
+								continue;
+							if (
+								!Array.from({ length: snapshot.length }, (_value, offset) => start + offset).some(
+									index =>
+										index < this.#durableRenderedLines.length &&
+										this.#durableRenderedLines[index] !== undefined &&
+										this.#durableRenderedLines[index] !== newLines[index],
+								)
+							)
+								continue;
+							if (
+								!offscreenFinalCandidates.some(
+									candidate =>
+										candidate.source === source &&
+										candidate.event.identity === event.identity &&
+										candidate.event.revision === event.revision,
+								)
+							) {
+								offscreenFinalCandidates.push({ source, event, start, end });
+							}
+							break;
+						}
+					}
+				}
+			}
+			const candidates = offscreenFinalCandidates
+				.toSorted((left, right) => left.start - right.start)
+				.filter((candidate, index, all) => index === 0 || all[index - 1]!.end <= candidate.start);
+			if (candidates.length === offscreenFinalCandidates.length && candidates.length > 0) {
+				const appendedLines = candidates.flatMap(candidate => newLines.slice(candidate.start, candidate.end));
+				const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
+				const moveToBottom = height - 1 - currentScreenRow;
+				let buffer = "\x1b[?2026h";
+				if (moveToBottom > 0) buffer += `\x1b[${moveToBottom}B`;
+				buffer += "\r\n";
+				for (let index = 0; index < appendedLines.length; index += 1) {
+					if (index > 0) buffer += "\r\n";
+					buffer += this.#padLineToWidth(appendedLines[index]!, width);
+				}
+				buffer += "\x1b[?25l\x1b[?2026l";
+				const durableSourceCoverage = candidates.flatMap(candidate =>
+					this.#getDurableSourceCoverage(width, rawLines, candidate.start, candidate.end, durableSourceRanges),
+				);
+				if (
+					durableSourceCoverage.length === candidates.length &&
+					candidates.every(candidate =>
+						durableSourceCoverage.some(
+							coverage =>
+								coverage.identity === candidate.event.identity &&
+								coverage.revision === candidate.event.revision,
+						),
+					) &&
+					this.#writeRenderBufferAndReanchorImeCursor(
+						buffer,
+						cursorPos,
+						newLines.length,
+						"primary",
+						true,
+						appendedLines,
+						durableSourceCoverage,
+					)
+				) {
+					for (const candidate of candidates) {
+						this.#recordDurableLines(newLines, candidate.start, candidate.end - 1);
+					}
+					viewportRepaint("offscreen final durable snapshots");
+					return;
+				}
+			}
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 			viewportRepaint(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 			return;
@@ -4360,21 +4778,49 @@ export class TUI extends Container {
 		]);
 		let buffer = `\x1b[?2026h${deletePlan.output}`; // Begin synchronized output
 		const prevViewportBottom = prevViewportTop + height - 1;
+		const nativeScrollbackAdmission =
+			appendedLines &&
+			this.#nativeScrollbackAdmissionPending &&
+			this.#durableLineCount <= firstChanged &&
+			previousLogicalFrame.length < newLines.length &&
+			firstChanged >= previousLogicalFrame.length &&
+			appendStart;
+		if (nativeScrollbackAdmission) {
+			// A live repaint can leave the hardware cursor one row beyond the
+			// logical frontier when the bottom row wrapped at terminal width.
+			// Let the geometry branch perform the native scroll from that row;
+			// moving back first would only advance a blank row.
+			appendStart = false;
+		}
 		const moveTargetRow = coalescedTabAppend
 			? this.#latestRenderedLines.length - 1
 			: coalescedWidthAppend
 				? newLines.length - 1
-				: appendStart
-					? firstChanged - 1
-					: firstChanged;
+				: nativeScrollbackAdmission
+					? firstChanged
+					: appendStart
+						? firstChanged - 1
+						: firstChanged;
 		if (moveTargetRow > prevViewportBottom) {
-			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
-			const moveToBottom = height - 1 - currentScreenRow;
-			if (moveToBottom > 0) {
-				buffer += `\x1b[${moveToBottom}B`;
+			if (nativeScrollbackAdmission) {
+				// The logical cursor row can be one row ahead of the physical xterm
+				// cursor after a live viewport repaint (a full-width row leaves a
+				// pending wrap). CUD is bounded by the terminal's scroll margin, so
+				// moving by one viewport height reliably reaches the physical bottom
+				// without replaying any transcript bytes.
+				buffer += `\x1b[${Math.max(1, height)}B`;
+			} else {
+				const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
+				const moveToBottom = height - 1 - currentScreenRow;
+				if (moveToBottom > 0) {
+					buffer += `\x1b[${moveToBottom}B`;
+				}
 			}
 			const scroll = moveTargetRow - prevViewportBottom;
-			buffer += "\r\n".repeat(scroll);
+			// Native admission follows a repaint at the live bottom. Use IND rather
+			// than LF so the terminal performs one unambiguous scroll without
+			// reinterpreting a pending wrapped row.
+			buffer += (nativeScrollbackAdmission ? "\r\x1bD" : "\r\n").repeat(scroll);
 			prevViewportTop += scroll;
 			viewportTop += scroll;
 			hardwareCursorRow = moveTargetRow;
@@ -4395,6 +4841,7 @@ export class TUI extends Container {
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
+			buffer += "\x1b[2K";
 			const line = newLines[i];
 			let truncatedLine = line;
 			const isImage = TERMINAL.isImageLine(line);
@@ -4429,15 +4876,15 @@ export class TUI extends Container {
 		let finalCursorRow = renderEnd;
 
 		// If we had more lines before, clear them and move cursor back
-		if (this.#latestRenderedLines.length > newLines.length) {
+		if (this.#previousLines.length > newLines.length) {
 			// Move to end of new content first if we stopped before it
 			if (renderEnd < newLines.length - 1) {
 				const moveDown = newLines.length - 1 - renderEnd;
 				buffer += `\x1b[${moveDown}B`;
 				finalCursorRow = newLines.length - 1;
 			}
-			const extraLines = this.#latestRenderedLines.length - newLines.length;
-			for (let i = newLines.length; i < this.#latestRenderedLines.length; i++) {
+			const extraLines = this.#previousLines.length - newLines.length;
+			for (let i = newLines.length; i < this.#previousLines.length; i++) {
 				buffer += `\r\n${" ".repeat(width)}`;
 			}
 			// Move cursor back to end of new content
@@ -4481,7 +4928,13 @@ export class TUI extends Container {
 		// Write entire buffer at once. Once those bytes are accepted, the painted
 		// frame and geometry are authoritative even when the optional IME cursor
 		// write subsequently detaches the terminal.
-		const durableSourceCoverage = this.#getDurableSourceCoverage(width, rawLines, firstChanged, renderEnd + 1);
+		const durableSourceCoverage = this.#getDurableSourceCoverage(
+			width,
+			rawLines,
+			firstChanged,
+			renderEnd + 1,
+			durableSourceRanges,
+		);
 		if (
 			!this.#writeRenderBufferAndReanchorImeCursor(
 				buffer,
@@ -4517,6 +4970,7 @@ export class TUI extends Container {
 		if (this.#virtualViewport) this.#latestRaw = rawLines;
 		this.#durableLineCount = Math.max(this.#durableLineCount, newLines.length);
 		this.#recordDurableLines(newLines, firstChanged, renderEnd);
+		this.#nativeScrollbackAdmissionPending = false;
 		this.#transcriptIdentityReplaced = false;
 	}
 
@@ -4592,40 +5046,34 @@ export class TUI extends Container {
 		this.#transactionObserver = observer;
 	}
 	#getDurableSourceCoverage(
-		width: number,
+		_width: number,
 		lines: readonly string[],
 		emittedStart: number,
 		emittedEnd: number,
+		sourceRanges: readonly DurableSourceRange[],
 	): readonly TuiTransactionSourceCoverage[] {
 		if (emittedStart < 0 || emittedEnd <= emittedStart) return [];
-		const sources: TuiDurableHistorySource[] = [];
-		const visited = new Set<object>();
-		const visit = (value: unknown): void => {
-			if (typeof value !== "object" || value === null) return;
-			const object = value as TuiDurableHistorySource;
-			if (visited.has(object)) return;
-			visited.add(object);
-			if (object.getDurableHistoryEvents || object.getDurableHistoryEvent) sources.push(object);
-			if (Array.isArray(object.children)) {
-				for (const child of object.children) visit(child);
-			}
-		};
-		for (const child of this.children) visit(child);
-
 		const candidates: Array<{
 			source: TuiDurableHistorySource;
 			event: TuiDurableHistoryEvent;
 			start: number;
 			end: number;
 		}> = [];
-		for (const source of sources) {
+		for (const {
+			source,
+			start: sourceStart,
+			end: sourceEnd,
+			width: sourceWidth,
+			renderedLines: sourceLines,
+			renderedStart = sourceStart,
+		} of sourceRanges) {
 			if (!source.acknowledgeDurableHistoryEvent) continue;
 			let events: readonly TuiDurableHistoryEvent[];
 			try {
 				events = source.getDurableHistoryEvents
-					? source.getDurableHistoryEvents(width)
+					? source.getDurableHistoryEvents(sourceWidth)
 					: source.getDurableHistoryEvent
-						? [source.getDurableHistoryEvent(width)].filter(
+						? [source.getDurableHistoryEvent(sourceWidth)].filter(
 								(event): event is TuiDurableHistoryEvent => event !== undefined,
 							)
 						: [];
@@ -4642,15 +5090,18 @@ export class TUI extends Container {
 					continue;
 				}
 				const snapshot = event.snapshot.map(stripTerminalEraseControls);
-				for (let start = emittedStart; start + snapshot.length <= emittedEnd; start++) {
-					let matches = true;
-					for (let offset = 0; offset < snapshot.length; offset++) {
-						if (lines[start + offset] !== snapshot[offset]) {
-							matches = false;
-							break;
-						}
+				const candidateStart = Math.max(emittedStart, sourceStart);
+				const candidateEnd = Math.min(emittedEnd, sourceEnd);
+				const comparisonLines = sourceLines ?? lines;
+				for (let start = candidateStart; start + snapshot.length <= candidateEnd; start++) {
+					const comparisonStart = sourceLines === undefined ? start : start - renderedStart;
+					if (
+						comparisonStart < 0 ||
+						comparisonStart + snapshot.length > comparisonLines.length ||
+						!snapshot.every((line, offset) => comparisonLines[comparisonStart + offset] === line)
+					) {
+						continue;
 					}
-					if (!matches) continue;
 					candidates.push({
 						source,
 						event,
@@ -4662,16 +5113,21 @@ export class TUI extends Container {
 			}
 		}
 
-		const candidateCounts = new Map<string, number>();
-		for (const candidate of candidates) {
-			const key = `${candidate.start}:${candidate.end}`;
-			candidateCounts.set(key, (candidateCounts.get(key) ?? 0) + 1);
+		const ambiguousCandidates = new Set<(typeof candidates)[number]>();
+		for (let leftIndex = 0; leftIndex < candidates.length; leftIndex += 1) {
+			const left = candidates[leftIndex];
+			for (let rightIndex = leftIndex + 1; rightIndex < candidates.length; rightIndex += 1) {
+				const right = candidates[rightIndex];
+				if (left.start < right.end && right.start < left.end) {
+					ambiguousCandidates.add(left);
+					ambiguousCandidates.add(right);
+				}
+			}
 		}
 
 		const coverage: TuiTransactionSourceCoverage[] = [];
 		for (const candidate of candidates) {
-			const key = `${candidate.start}:${candidate.end}`;
-			if (candidateCounts.get(key) !== 1) continue;
+			if (ambiguousCandidates.has(candidate)) continue;
 			const { source, event } = candidate;
 			coverage.push({
 				identity: event.identity,

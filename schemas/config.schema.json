@@ -686,6 +686,11 @@
 			"description": "Show terminal cursor for IME support",
 			"default": true
 		},
+		"clearOnShrink": {
+			"type": "boolean",
+			"description": "Clear and redraw when rendered content shrinks",
+			"default": false
+		},
 		"defaultThinkingLevel": {
 			"type": "string",
 			"enum": [

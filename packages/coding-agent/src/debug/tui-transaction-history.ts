@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import type { TuiTransactionObservation } from "@gajae-code/tui";
 
 const DEFAULT_CAPACITY = 256;
@@ -54,7 +54,7 @@ export class TuiTransactionHistory {
 			operation: observation.operation,
 			outcome: observation.outcome,
 			byteLength: Buffer.byteLength(observation.bytes, "utf8"),
-			sha256: createHash("sha256").update(observation.bytes, "utf8").digest("hex"),
+			sha256: crypto.createHash("sha256").update(observation.bytes, "utf8").digest("hex"),
 		});
 		this.#totalSharedObservations += 1;
 		this.#records.push(record);

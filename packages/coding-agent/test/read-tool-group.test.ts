@@ -286,6 +286,39 @@ describe("ReadToolGroupComponent", () => {
 		component.acknowledgeDurableHistoryEvent(initialIdentity, updated[0]!.revision);
 		expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
 	});
+	it("bounds acknowledged grouped revisions while preserving the latest visible snapshot", () => {
+		const component = new ReadToolGroupComponent({ showContentPreview: true });
+		component.updateArgs({ path: "/tmp/one.ts" }, "read-1");
+		component.updateArgs({ path: "/tmp/two.ts" }, "read-2");
+
+		const first = component.getDurableHistoryEvent(100);
+		expect(first).toBeDefined();
+		const identity = first!.identity;
+		const firstRevision = first!.revision;
+		component.acknowledgeDurableHistoryEvent(identity, firstRevision);
+		const coverageDeleteSpy = vi.spyOn(Map.prototype, "delete");
+		coverageDeleteSpy.mockClear();
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
+
+		for (let revision = 0; revision < 128; revision += 1) {
+			const toolCallId = revision % 2 === 0 ? "read-1" : "read-2";
+			const path = revision % 2 === 0 ? "/tmp/one.ts" : "/tmp/two.ts";
+			component.updateResult({ content: [{ type: "text", text: `revision ${revision}` }] }, false, toolCallId);
+
+			const event = component.getDurableHistoryEvent(100);
+			expect(event?.identity).toBe(identity);
+			expect(event?.revision).toBeGreaterThan(firstRevision);
+			coverageDeleteSpy.mockClear();
+			component.acknowledgeDurableHistoryEvent(identity, event!.revision);
+			expect(coverageDeleteSpy).toHaveBeenCalledWith(event!.revision);
+			expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
+			expect(Bun.stripANSI(component.render(100).join("\n"))).toContain(path);
+		}
+
+		component.acknowledgeDurableHistoryEvent(identity, firstRevision);
+		expect(component.getDurableHistoryEvents(100)).toHaveLength(0);
+		expect(Bun.stripANSI(component.render(100).join("\n"))).toContain("revision 127");
+	});
 });
 
 describe("readArgsTargetInternalUrl", () => {

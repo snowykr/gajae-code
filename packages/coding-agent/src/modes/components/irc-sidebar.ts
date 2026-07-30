@@ -261,6 +261,30 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 		private readonly ledger: IrcObservationLedger,
 		private readonly componentTheme: IrcSidebarThemeSource,
 	) {}
+	get children(): readonly Component[] {
+		return [this.leftPane];
+	}
+	getTuiRenderedChildMappings(
+		width: number,
+		renderedLines: readonly string[],
+	): readonly { component: Component; width: number; start: number; end: number }[] | undefined {
+		if (!this.#visible) return undefined;
+
+		const { leftWidth, rightWidth } = computeIrcSplitWidths(width);
+		if (rightWidth === 0) return undefined;
+
+		let leftLineCount: number;
+		try {
+			leftLineCount = withTerminalGraphicsFallback(
+				() => renderComponentWithViewportAnchors(this.leftPane, leftWidth),
+				{ allowCursorNeutralImages: true },
+			).lines.length;
+		} catch {
+			return undefined;
+		}
+		const start = Math.max(0, renderedLines.length - leftLineCount);
+		return [{ component: this.leftPane, width: leftWidth, start, end: renderedLines.length }];
+	}
 	get visible(): boolean {
 		return this.#visible;
 	}

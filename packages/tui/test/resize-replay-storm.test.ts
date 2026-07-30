@@ -62,6 +62,22 @@ describe("multiplexer resize replay storm regression", () => {
 				}),
 			).toBe(true);
 		});
+		it("restores legacy full replay when explicitly enabled under a multiplexer", () => {
+			expect(
+				shouldUseViewportRepaintForHost(
+					{ TMUX: "/tmp/fake-tmux,4242,0", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
+					"darwin",
+					{ includeProcessTerminal: true },
+				),
+			).toBe(false);
+			expect(
+				shouldUseViewportRepaintForHost(
+					{ TERM: "screen-256color", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "yes" },
+					"darwin",
+					{ includeProcessTerminal: true },
+				),
+			).toBe(false);
+		});
 	});
 	describe("in a multiplexer (TMUX set)", () => {
 		let origTmux: string | undefined;

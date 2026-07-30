@@ -433,8 +433,8 @@ export class ToolExecutionComponent extends Container {
 		this.#editDiffAbort = controller;
 		this.#pendingPreviewWork += 1;
 
+		const isStreaming = !this.#argsComplete;
 		try {
-			const isStreaming = !this.#argsComplete;
 			const previews = await strategy.computeDiffPreview(effectiveArgs, {
 				cwd: this.#cwd,
 				signal: controller.signal,
@@ -459,6 +459,7 @@ export class ToolExecutionComponent extends Container {
 			this.#pendingPreviewWork -= 1;
 			if (!controller.signal.aborted && this.#editDiffAbort === controller) {
 				this.#bumpDurableRevision();
+				if (!isStreaming) this.#ui.requestRender();
 			}
 		}
 	}
@@ -485,6 +486,7 @@ export class ToolExecutionComponent extends Container {
 		this.#updateSpinnerAnimation();
 		// Convert non-PNG images to PNG for Kitty protocol (async)
 		this.#maybeConvertImagesForKitty();
+		this.#updateDisplay();
 		this.#markVisibleMutationIfChanged();
 	}
 
@@ -498,7 +500,6 @@ export class ToolExecutionComponent extends Container {
 		const detailImages = this.#result.details?.images || [];
 		return [...contentImages, ...detailImages];
 	}
-
 
 	#invalidateStaleKittyConversions(): void {
 		const images = this.#getAllImageBlocks();
@@ -541,6 +542,7 @@ export class ToolExecutionComponent extends Container {
 
 			// Convert async - catch errors from processing
 			const index = i;
+			let converted = false;
 			new Bun.Image(Buffer.from(source.data, "base64"))
 				.png()
 				.toBase64()
@@ -548,6 +550,7 @@ export class ToolExecutionComponent extends Container {
 					if (this.#disposed || this.#imageConversionsInFlight.get(index) !== source) return;
 					this.#convertedImages.set(index, { source, data, mimeType: "image/png" });
 					this.#updateDisplay();
+					converted = true;
 					this.#ui.requestRender();
 					this.#markVisibleMutationIfChanged(true);
 				})
@@ -555,17 +558,19 @@ export class ToolExecutionComponent extends Container {
 					// Ignore conversion failures - display will use original image format
 				})
 				.finally(() => {
-					if (this.#imageConversionsInFlight.get(index) === source) {
+					const current = this.#imageConversionsInFlight.get(index) === source;
+					if (current) {
 						this.#imageConversionsInFlight.delete(index);
 					}
 					this.#pendingImageWork -= 1;
 					this.#bumpDurableRevision();
+					if (!converted) this.#ui.requestRender();
 				});
 		}
 	}
 
 	#sameImageSource(source: ImageConversionSource, image: { data?: string; mimeType?: string }): boolean {
-		return source.image === image && source.data === image.data && source.mimeType === image.mimeType;
+		return source.data === image.data && source.mimeType === image.mimeType;
 	}
 
 	#getImageConversionSource(index: number, image: ImageConversionSource["image"]): ImageConversionSource {
@@ -689,7 +694,6 @@ export class ToolExecutionComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
-		this.#bumpDurableRevision();
 		this.#updateDisplay();
 	}
 

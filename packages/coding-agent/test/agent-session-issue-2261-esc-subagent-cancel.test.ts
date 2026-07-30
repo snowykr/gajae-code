@@ -166,6 +166,85 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		genericGate.resolve("finished after retained session");
 		await ownerManager.getJob(genericJobId)?.promise;
 	});
+	it("does not commit or reset the predecessor when successor persistence rejects in owner-lease mode", async () => {
+		const ownerManager = installOwnerManager();
+		const previous = session.sessionFile;
+		const ensurePersistence = vi
+			.spyOn(sessionManager, "ensurePreparedNewSessionOnDisk")
+			.mockRejectedValueOnce(new Error("successor persistence failed"));
+		const commit = vi.spyOn(sessionManager, "commitPreparedNewSession");
+		const reset = vi.spyOn(session.agent, "reset");
+		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
+
+		await expect(session.newSession()).rejects.toThrow("successor persistence failed");
+
+		expect(ensurePersistence).toHaveBeenCalledTimes(1);
+		expect(commit).not.toHaveBeenCalled();
+		expect(reset).not.toHaveBeenCalled();
+		expect(session.sessionFile).toBe(previous);
+		expect(finishShutdown).toHaveBeenCalledWith(expect.any(Object), "release");
+	});
+	it("retains predecessor identity and restores agent-event delivery when ordinary successor persistence rejects", async () => {
+		const previousId = session.sessionId;
+		const previousFile = session.sessionFile;
+		const events: string[] = [];
+		session.subscribe(event => events.push(event.type));
+		vi.spyOn(sessionManager, "ensurePreparedNewSessionOnDisk").mockRejectedValueOnce(
+			new Error("successor persistence failed"),
+		);
+
+		await expect(session.newSession()).rejects.toThrow("successor persistence failed");
+
+		expect(session.sessionId).toBe(previousId);
+		expect(session.sessionFile).toBe(previousFile);
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		await Promise.resolve();
+		expect(events).toContain("turn_start");
+	});
+	it("keeps the committed successor fully initialized when its post-commit flush rejects", async () => {
+		const previousId = session.sessionId;
+		const previousFile = session.sessionFile;
+		const events: string[] = [];
+		session.subscribe(event => events.push(event.type));
+		vi.spyOn(sessionManager, "flush")
+			.mockImplementationOnce(async () => {})
+			.mockRejectedValueOnce(new Error("successor flush failed"));
+
+		await expect(session.newSession()).rejects.toThrow("successor flush failed");
+
+		expect(session.sessionId).not.toBe(previousId);
+		expect(session.sessionFile).not.toBe(previousFile);
+		expect(session.sessionManager.getSessionId()).toBe(session.sessionId);
+		expect(session.agent.sessionId).toBe(session.sessionId);
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		await Promise.resolve();
+		expect(events).toContain("turn_start");
+	});
+	it("propagates an owner successor flush failure only after successor initialization", async () => {
+		const ownerManager = installOwnerManager();
+		const finishShutdown = vi.spyOn(ownerManager, "finishOwnerSubagentShutdown");
+		const previousId = session.sessionId;
+		const previousFile = session.sessionFile;
+		let flushCalls = 0;
+		const flush = vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			flushCalls++;
+			if (flushCalls === 1) return;
+			expect(session.sessionId).not.toBe(previousId);
+			expect(session.sessionFile).not.toBe(previousFile);
+			expect(session.agent.sessionId).toBe(session.sessionId);
+			throw new Error("owner successor flush failed");
+		});
+
+		await expect(session.newSession()).rejects.toThrow("owner successor flush failed");
+
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(session.sessionId).not.toBe(previousId);
+		expect(session.sessionFile).not.toBe(previousFile);
+		expect(session.agent.sessionId).toBe(session.sessionId);
+		expect(finishShutdown).toHaveBeenCalledWith(expect.any(Object), "commit");
+	});
 
 	it("waits for in-flight owner delivery before flush and generic owner cancellation", async () => {
 		const ownerManager = installOwnerManager();
@@ -183,7 +262,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		});
 
 		await expect(session.newSession()).resolves.toBe(true);
-		expect(order).toEqual(["delivery", "flush", "cancel"]);
+		expect(order).toEqual(["delivery", "flush", "cancel", "flush"]);
 	});
 
 	it("creates the /drop identity before deleting the old session and treats deletion failure as non-fatal", async () => {
@@ -204,6 +283,23 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		await expect(session.newSession({ drop: true })).resolves.toBe(true);
 		expect(order).toEqual(["new", "drop"]);
 		expect(session.sessionFile).not.toBe(previous);
+	});
+	it("propagates a /drop successor flush failure only after successor initialization", async () => {
+		const previousId = session.sessionId;
+		const previousFile = session.sessionFile;
+		const flush = vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			expect(session.sessionId).not.toBe(previousId);
+			expect(session.sessionFile).not.toBe(previousFile);
+			expect(session.agent.sessionId).toBe(session.sessionId);
+			throw new Error("drop successor flush failed");
+		});
+
+		await expect(session.newSession({ drop: true })).rejects.toThrow("drop successor flush failed");
+
+		expect(flush).toHaveBeenCalledTimes(1);
+		expect(session.sessionId).not.toBe(previousId);
+		expect(session.sessionFile).not.toBe(previousFile);
+		expect(session.agent.sessionId).toBe(session.sessionId);
 	});
 	it("commits the lease when identity changes before a later initialization error", async () => {
 		const ownerManager = installOwnerManager();

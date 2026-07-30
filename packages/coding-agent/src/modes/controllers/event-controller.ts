@@ -13,8 +13,8 @@ import {
 } from "../../modes/components/read-tool-group";
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import {
-	ToolExecutionComponent,
 	type DurableHistoryEvent,
+	ToolExecutionComponent,
 	type ToolExecutionHandle,
 } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";

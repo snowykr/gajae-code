@@ -49,16 +49,14 @@ function restoreTty(): void {
 	restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
 }
 
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
-
 /** Feed `text` to stdin in `chunk`-sized reads separated by `gap` ms. */
 async function feed(text: string, chunk: number, gap: number): Promise<void> {
 	for (let i = 0; i < text.length; i += chunk) {
 		process.stdin.emit("data", Buffer.from(text.slice(i, i + chunk)));
-		if (gap > 0) await sleep(gap);
+		if (gap > 0) await Bun.sleep(gap);
 	}
 	// Past every hold/flush bound so nothing is still buffered.
-	await sleep(700);
+	await Bun.sleep(700);
 }
 
 describe("ProcessTerminal probe-reply leaks", () => {
@@ -90,6 +88,42 @@ describe("ProcessTerminal probe-reply leaks", () => {
 
 	it("drops a whole-sequence reply flood", async () => {
 		await feed(REPLY_PAIR.repeat(4), REPLY_PAIR.length, 0);
+		expectNoLeak();
+	});
+	it("drops an interrupted armed probe prefix before a complete armed response", async () => {
+		process.stdin.emit("data", Buffer.from("\x1b]11;rgb:0000/"));
+		process.stdin.emit("data", Buffer.from(DA1_REPLY));
+		await Bun.sleep(60);
+		expect(received).toEqual([]);
+	});
+	it("holds a Mode 2031 prefix split before 997; until the response completes", async () => {
+		process.stdin.emit("data", Buffer.from("\x1b[?99"));
+		await Bun.sleep(550);
+		expect(received).toEqual([]);
+
+		process.stdin.emit("data", Buffer.from("7;1n"));
+		await Bun.sleep(60);
+		expect(received).toEqual([]);
+	});
+	it("swallows a delayed complete reply after its request completed", async () => {
+		// The first reply consumes the startup OSC 11 request. A duplicate that
+		// arrives after that one-shot registry entry is gone is still terminal
+		// protocol traffic, not user input.
+		process.stdin.emit("data", Buffer.from(OSC11_REPLY));
+		await Bun.sleep(20);
+		received = [];
+
+		await feed(OSC11_REPLY, OSC11_REPLY.length, 0);
+		expectNoLeak();
+	});
+
+	it("swallows a delayed complete reply after its request expired", async () => {
+		// Let the startup OSC 11 request expire without a response, then deliver
+		// the complete reply that was delayed in the terminal or multiplexer.
+		await Bun.sleep(1100);
+		received = [];
+
+		await feed(OSC11_REPLY, OSC11_REPLY.length, 0);
 		expectNoLeak();
 	});
 
@@ -168,7 +202,7 @@ describe("Tui probe-reply leaks", () => {
 	 */
 	async function settleStartupProbes(): Promise<void> {
 		process.stdin.emit("data", Buffer.from("\x1b[?1;2c\x1b[?2;0;800;480S"));
-		await sleep(60);
+		await Bun.sleep(60);
 		received = [];
 	}
 
@@ -183,7 +217,7 @@ describe("Tui probe-reply leaks", () => {
 		// and the sixel probe's own `CSI c`. The first is swallowed as the sentinel, the
 		// second must reach the probe listener.
 		process.stdin.emit("data", Buffer.from("\x1b[?1;2c\x1b[?1;2c\x1b[?2;0;800;480S"));
-		await sleep(60);
+		await Bun.sleep(60);
 
 		expect(seen).toContain("\x1b[?1;2c");
 		expect(seen).toContain("\x1b[?2;0;800;480S");

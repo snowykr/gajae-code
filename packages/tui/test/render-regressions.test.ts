@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	type Component,
+	Container,
 	encodeKittyPlacementDelete,
 	extractKittyPlacementReferences,
 	getCellDimensions,
@@ -16,6 +17,8 @@ import {
 import type { Terminal, TerminalAppearance } from "@gajae-code/tui/terminal";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
+import { IrcSplitViewComponent } from "../../coding-agent/src/modes/components/irc-sidebar";
+import { IrcObservationLedger } from "../../coding-agent/src/modes/irc-observation-ledger";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class MutableLinesComponent implements Component {
@@ -51,6 +54,59 @@ class RawMutableLinesComponent implements Component {
 
 	render(): string[] {
 		return this.#lines;
+	}
+}
+class SemanticMutableLinesComponent implements Component {
+	#lines: string[];
+	#anchorIds: Array<string | null>;
+
+	constructor(lines: string[], anchorIds: Array<string | null>) {
+		this.#lines = [...lines];
+		this.#anchorIds = [...anchorIds];
+	}
+
+	setLines(lines: string[], anchorIds: Array<string | null>): void {
+		this.#lines = [...lines];
+		this.#anchorIds = [...anchorIds];
+	}
+
+	invalidate(): void {}
+
+	render(): string[] {
+		return [...this.#lines];
+	}
+
+	renderWithViewportAnchors(): {
+		lines: string[];
+		anchors: Array<{
+			id: string;
+			graphemeStart: number;
+			graphemeEnd: number;
+			cellStart: number;
+			cellEnd: number;
+		} | null>;
+	} {
+		let graphemeOffset = 0;
+		let cellOffset = 0;
+		const anchors = this.#lines.map((line, index) => {
+			const id = this.#anchorIds[index];
+			const graphemeCount = [...Bun.stripANSI(line)].length;
+			const cellCount = Math.max(1, Bun.stringWidth(line));
+			const anchor =
+				id === null || id === undefined
+					? null
+					: {
+							id,
+							graphemeStart: graphemeOffset,
+							graphemeEnd: graphemeOffset + graphemeCount,
+							cellStart: cellOffset,
+							cellEnd: cellOffset + cellCount,
+						};
+			graphemeOffset += graphemeCount + 1;
+			cellOffset += cellCount;
+			return anchor;
+		});
+		return { lines: [...this.#lines], anchors };
 	}
 }
 
@@ -225,17 +281,21 @@ class MutationAppendReflowComponent implements Component {
 }
 
 class TabReflowAppendComponent implements Component {
-	#appended = false;
+	#appendedRows: string[] = [];
 
 	append(): void {
-		this.#appended = true;
+		this.appendRows("new-tab-row");
+	}
+
+	appendRows(...rowsToAppend: string[]): void {
+		this.#appendedRows.push(...rowsToAppend);
 	}
 
 	invalidate(): void {}
 
 	render(_width: number): string[] {
 		const reflowed = getDefaultTabWidth() >= 8 ? ["tab-prefix\told-", "content"] : ["tab-prefix\told-content"];
-		return this.#appended ? [...reflowed, "new-tab-row"] : reflowed;
+		return [...reflowed, ...this.#appendedRows];
 	}
 }
 
@@ -310,15 +370,19 @@ class DurableSnapshotComponent implements Component {
 	) {
 		this.#lines = [...initialLines];
 	}
+	setLines(lines: readonly string[]): void {
+		this.#lines = [...lines];
+	}
 
-	queueFinal(snapshot: string, append: boolean): void {
+	queueFinal(snapshot: string | readonly string[], append: boolean): void {
+		const snapshotLines = typeof snapshot === "string" ? [snapshot] : [...snapshot];
 		this.#pending = {
 			identity: this.identity,
 			revision: (this.#pending?.revision ?? 0) + 1,
 			final: true,
-			snapshot: [snapshot],
+			snapshot: snapshotLines,
 		};
-		if (append) this.#lines.push(snapshot);
+		if (append) this.#lines.push(...snapshotLines);
 	}
 
 	invalidate(): void {}
@@ -1354,6 +1418,38 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("retains the pre-render logical frame when a semantic viewport anchor disappears", async () => {
+			const term = new VirtualTerminal(30, 4);
+			const component = new SemanticMutableLinesComponent(
+				["old-0", "old-1", "old-target", "old-3", "old-4", "old-5"],
+				["old-0", "old-1", "target", "old-3", "old-4", "old-5"],
+			);
+			const tui = new TUI(term);
+			tui.addChild(component);
+			tui.setViewportAnchorComponent(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(tui.revealViewportAnchor("target", "center")).toBe(true);
+				await settle(term);
+				const retainedViewport = visible(term);
+
+				component.setLines(
+					["new-0", "new-1", "new-2", "new-3", "new-4", "new-5"],
+					["new-0", "new-1", "new-2", "new-3", "new-4", "new-5"],
+				);
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term)).toEqual(retainedViewport);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term)).toEqual(retainedViewport);
+			} finally {
+				tui.stop();
+			}
+		});
 		it("resizing width truncates visible lines without ghost wrap rows", async () => {
 			const term = new VirtualTerminal(30, 6);
 			const tui = new TUI(term);
@@ -1561,6 +1657,34 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+		it("records a successful full render as the next resize raw baseline", async () => {
+			const term = new VirtualTerminal(24, 10);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				tui.requestRender(true, "test.full-render-baseline");
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 10);
+				component.append();
+				tui.requestRender();
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("ordinary-new-row");
+				expect(countMatches(term.getScrollBuffer(), /ordinary-new-row/g)).toBe(1);
+				for (let i = 0; i < 8; i++) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\bhistoric-${i}\\b`))).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
 		it("appends only the new row after a width reflow grows the rendered frame", async () => {
 			const term = new VirtualTerminal(24, 10);
 			const tui = new TUI(term);
@@ -1655,7 +1779,7 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
-		it("does not treat repeated old status text in a coalesced append as reflow evidence", async () => {
+		it("does not treat repeated old status text as reflow evidence and commits coalesced tool output once", async () => {
 			const term = new VirtualTerminal(24, 3);
 			const tui = new TUI(term);
 			const component = new CoalescedMutationAppendComponent();
@@ -1688,6 +1812,7 @@ describe("TUI terminal-state regressions", () => {
 
 				expect(visible(term)).toEqual(beforeNoop);
 				expect(term.getWriteLog().join("")).not.toContain("\r\n");
+				expect(countMatches(term.getScrollBuffer(), /tool-row/g)).toBe(1);
 			} finally {
 				tui.stop();
 			}
@@ -1947,6 +2072,71 @@ describe("TUI terminal-state regressions", () => {
 				expect(term.getWriteLog().join("")).not.toContain("\r\n");
 			} finally {
 				tui.stop();
+			}
+		});
+		it("commits coalesced resize appends beyond the viewport exactly once", async () => {
+			const term = new VirtualTerminal(24, 3);
+			const tui = new TUI(term);
+			const component = new WidthSensitiveComponent();
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				term.resize(16, 3);
+				component.appendRows("resize-row-a", "resize-row-b", "resize-row-c", "resize-row-d");
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				for (const row of ["resize-row-a", "resize-row-b", "resize-row-c", "resize-row-d"]) {
+					expect(term.getWriteLog().join("")).toContain(row);
+					expect(countMatches(scrollback, new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+
+				tui.requestRender();
+				await settle(term);
+				for (const row of ["resize-row-a", "resize-row-b", "resize-row-c", "resize-row-d"]) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("commits coalesced tab-width appends beyond the viewport exactly once", async () => {
+			const originalTabWidth = getDefaultTabWidth();
+			const term = new VirtualTerminal(24, 2);
+			const tui = new TUI(term);
+			const component = new TabReflowAppendComponent();
+
+			try {
+				setDefaultTabWidth(2);
+				tui.addChild(component);
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				setDefaultTabWidth(8);
+				component.appendRows("tab-row-a", "tab-row-b", "tab-row-c", "tab-row-d");
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				for (const row of ["tab-row-a", "tab-row-b", "tab-row-c", "tab-row-d"]) {
+					expect(term.getWriteLog().join("")).toContain(row);
+					expect(countMatches(scrollback, new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+
+				tui.requestRender();
+				await settle(term);
+				for (const row of ["tab-row-a", "tab-row-b", "tab-row-c", "tab-row-d"]) {
+					expect(countMatches(term.getScrollBuffer(), new RegExp(`\\b${row}\\b`))).toBe(1);
+				}
+			} finally {
+				tui.stop();
+				setDefaultTabWidth(originalTabWidth);
 			}
 		});
 		it("aggressive resize storm does not duplicate viewport content", async () => {
@@ -2552,6 +2742,41 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+		it("rebases the durable frontier after a successful contraction replay before regrowth", async () => {
+			const term = new VirtualTerminal(32, 3);
+			const tui = new TUI(term);
+			tui.setClearOnShrink(true);
+			const initial = rows("history-", 8);
+			const component = new MutableLinesComponent(initial);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const committed = ["changed-0", ...initial.slice(1)];
+				component.setLines(committed);
+				tui.requestRender(false, "test.establish-durable-frontier");
+				await settle(term);
+
+				component.setLines(committed.slice(0, 3));
+				tui.requestRender(false, "test.full-render-contraction");
+				await settle(term);
+				term.clearWriteLog();
+
+				component.setLines(committed.slice(0, 5));
+				tui.requestRender(false, "test.regrow-after-full-render-contraction");
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("\r\n");
+				const scrollback = term.getScrollBuffer();
+				expect(countMatches(scrollback, /\bhistory-3\b/g)).toBe(1);
+				expect(countMatches(scrollback, /\bhistory-4\b/g)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
 		it("durably appends distinct rows that replace the contracted suffix below the old high-water mark", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);
@@ -2582,7 +2807,270 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
-		it("rejects ambiguous durable coverage across identical source snapshots", async () => {
+		it("durably appends an identified repeated suffix after contraction", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const originalRows = rows("durable-", 8);
+			const component = new DurableSnapshotComponent("repeated-suffix", originalRows);
+			tui.addChild(component);
+			const observations: Array<{
+				durable: boolean;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(originalRows.slice(0, 5));
+				tui.requestRender(false, "test.contract-repeated");
+				await settle(term);
+				term.clearWriteLog();
+
+				component.queueFinal(originalRows.slice(5, 7), true);
+				tui.requestRender(false, "test.identified-repeated-regrowth");
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("\r\n");
+				expect(writes).toContain("durable-5");
+				expect(writes).toContain("durable-6");
+				expect(
+					observations
+						.findLast(observation => observation.durable)
+						?.durableSourceCoverage?.map(event => event.identity),
+				).toEqual(["repeated-suffix"]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("durably appends a retained header with a repeated completion row after contraction", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const originalRows = ["tool-header", "tool-body-0", "tool-body-1", "tool-body-2", "tool-complete"];
+			const component = new DurableSnapshotComponent("retained-header-completion", originalRows);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(originalRows.slice(0, 4));
+				tui.requestRender(false, "test.contract-retained-header");
+				await settle(term);
+				term.clearWriteLog();
+
+				component.setLines(originalRows);
+				component.queueFinal(originalRows, false);
+				tui.requestRender(false, "test.retained-header-completion-regrowth");
+				await settle(term);
+
+				const regrowthWrites = term.getWriteLog().join("");
+				expect(regrowthWrites).toContain("\r\n");
+				expect(regrowthWrites.match(/tool-complete/g)).toHaveLength(1);
+				expect(regrowthWrites).toContain("tool-complete");
+
+				term.clearWriteLog();
+				tui.requestRender(false, "test.retained-header-completion-repeat");
+				await settle(term);
+
+				expect(term.getWriteLog().join("")).not.toContain("tool-complete");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("durably appends an identified repeated suffix for a nested durable source", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const originalRows = rows("nested-durable-", 8);
+			const source = new DurableSnapshotComponent("nested-repeated-suffix", originalRows);
+			const container = new Container();
+			container.addChild(source);
+			tui.addChild(container);
+			const observations: Array<{
+				durable: boolean;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				source.setLines(originalRows.slice(0, 5));
+				tui.requestRender(false, "test.nested-contract-repeated");
+				await settle(term);
+				term.clearWriteLog();
+
+				source.queueFinal(originalRows.slice(5, 7), true);
+				tui.requestRender(false, "test.nested-identified-repeated-regrowth");
+				await settle(term);
+
+				const writes = term.getWriteLog().join("");
+				expect(writes).toContain("\r\n");
+				expect(writes).toContain("nested-durable-5");
+				expect(writes).toContain("nested-durable-6");
+				expect(
+					observations
+						.findLast(observation => observation.durable)
+						?.durableSourceCoverage?.map(event => event.identity),
+				).toEqual(["nested-repeated-suffix"]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("covers nested durable sources through an effective IRC sidebar width", async () => {
+			const term = new VirtualTerminal(80, 5);
+			const tui = new TUI(term);
+			const originalRows = rows("irc-nested-", 8);
+			const source = new DurableSnapshotComponent("irc-nested-source", originalRows);
+			const leftPane = new Container();
+			leftPane.addChild(source);
+			const split = new IrcSplitViewComponent(leftPane, new IrcObservationLedger(), {
+				fg: (_color, text) => text,
+				bold: text => text,
+				boxSharp: { vertical: "│" },
+			});
+			split.setVisible(true);
+			expect(split.effectiveSidebarVisible(80)).toBe(true);
+			tui.addChild(split);
+			const observations: Array<{
+				durable: boolean;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				source.setLines(originalRows.slice(0, 5));
+				tui.requestRender(false, "test.irc-sidebar-nested-contraction");
+				await settle(term);
+				term.clearWriteLog();
+
+				source.queueFinal(originalRows.slice(5, 7), true);
+				tui.requestRender(false, "test.irc-sidebar-nested-regrowth");
+				await settle(term);
+
+				expect(
+					observations
+						.findLast(observation => observation.durable)
+						?.durableSourceCoverage?.map(event => event.identity),
+				).toEqual(["irc-nested-source"]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("covers duplicate nested durable snapshots in sibling order", async () => {
+			const term = new VirtualTerminal(32, 5);
+			const tui = new TUI(term);
+			const first = new DurableSnapshotComponent("first-duplicate", []);
+			const second = new DurableSnapshotComponent("second-duplicate", []);
+			const container = new Container();
+			container.addChild(first);
+			container.addChild(second);
+			tui.addChild(container);
+			const observations: Array<{
+				durable: boolean;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				first.queueFinal("duplicate-tool-result", true);
+				second.queueFinal("duplicate-tool-result", true);
+				tui.requestRender(false, "test.duplicate-nested-siblings");
+				await settle(term);
+
+				expect(
+					observations
+						.findLast(observation => observation.durable)
+						?.durableSourceCoverage?.map(event => event.identity),
+				).toEqual(["first-duplicate", "second-duplicate"]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("emits an offscreen final snapshot before later tail growth", async () => {
+			const term = new VirtualTerminal(32, 4);
+			const tui = new TUI(term);
+			const source = new DurableSnapshotComponent("offscreen-final", ["old-final", "old-final-1", "old-final-2"]);
+			const tail = new MutableLinesComponent(rows("tail-", 8));
+			tui.addChild(source);
+			tui.addChild(tail);
+			const durableCoverage: string[] = [];
+			tui.setTransactionObserver(observation => {
+				if (!observation.durable) return;
+				for (const event of observation.durableSourceCoverage ?? []) {
+					durableCoverage.push(event.identity);
+					event.acknowledge();
+				}
+			});
+
+			try {
+				tui.start();
+				await settle(term);
+				term.clearWriteLog();
+
+				source.queueFinal(["FINAL_OFFSCREEN", "FINAL_OFFSCREEN_1", "FINAL_OFFSCREEN_2"], false);
+				source.setLines(["FINAL_OFFSCREEN", "FINAL_OFFSCREEN_1", "FINAL_OFFSCREEN_2"]);
+				tui.requestRender(false, "test.offscreen-final");
+				await settle(term);
+
+				expect(term.getWriteLog().join("")).toContain("FINAL_OFFSCREEN");
+				expect(durableCoverage).toEqual(["offscreen-final"]);
+				expect(source.acknowledgements).toHaveLength(1);
+
+				term.clearWriteLog();
+				tail.setLines([...rows("tail-", 8), "tail-growth"]);
+				tui.requestRender(false, "test.offscreen-final.tail");
+				await settle(term);
+
+				expect(term.getWriteLog().join("")).not.toContain("FINAL_OFFSCREEN");
+				expect(countMatches(term.getScrollBuffer(), /^tail-growth\s*$/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("rejects identical offscreen extension rows as durable source coverage", async () => {
+			const term = new VirtualTerminal(32, 4);
+			const tui = new TUI(term);
+			const offscreenSource = new DurableSnapshotComponent("offscreen-source", rows("offscreen-", 8));
+			const extension = new MutableLinesComponent(["extension-base"]);
+			tui.addChild(offscreenSource);
+			tui.addChild(extension);
+			const observations: Array<{
+				durable: boolean;
+				outcome: string;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				offscreenSource.queueFinal("identical-extension", false);
+				extension.setLines(["identical-extension"]);
+				tui.requestRender(false, "test.identical-offscreen-extension");
+				await settle(term);
+
+				const appended = observations.at(-1);
+				expect(appended?.durable).toBe(true);
+				expect(appended?.outcome).toBe("accepted");
+				expect(appended?.durableSourceCoverage).toEqual([]);
+				expect(offscreenSource.acknowledgements).toHaveLength(0);
+				expect(offscreenSource.getDurableHistoryEvent(32)?.identity).toBe("offscreen-source");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("acknowledges only the emitted source when an offscreen source has an identical snapshot", async () => {
 			const term = new VirtualTerminal(32, 4);
 			const tui = new TUI(term);
 			const offscreenSource = new DurableSnapshotComponent("offscreen-source", rows("offscreen-", 8));
@@ -2608,10 +3096,47 @@ describe("TUI terminal-state regressions", () => {
 				const appended = observations.at(-1);
 				expect(appended?.durable).toBe(true);
 				expect(appended?.outcome).toBe("accepted");
-				expect(appended?.durableSourceCoverage).toEqual([]);
+				expect(appended?.durableSourceCoverage?.map(event => event.identity)).toEqual(["emitted-source"]);
 				expect(emittedSource.acknowledgements).toHaveLength(0);
 				expect(offscreenSource.acknowledgements).toHaveLength(0);
 				expect(offscreenSource.getDurableHistoryEvent(32)?.identity).toBe("offscreen-source");
+			} finally {
+				tui.stop();
+			}
+		});
+		it("acknowledges only the emitted source when an offscreen source snapshot is a strict prefix", async () => {
+			const term = new VirtualTerminal(32, 4);
+			const tui = new TUI(term);
+			const offscreenSource = new DurableSnapshotComponent("offscreen-source", rows("offscreen-", 8));
+			const emittedSource = new DurableSnapshotComponent("emitted-source", ["emitted-base"]);
+			tui.addChild(offscreenSource);
+			tui.addChild(emittedSource);
+			const observations: Array<{
+				durable: boolean;
+				outcome: string;
+				durableSourceCoverage?: readonly { identity: string }[];
+			}> = [];
+			tui.setTransactionObserver(observation => observations.push(observation));
+			const prefix = ["overlap-0", "overlap-1"];
+			const appendedSnapshot = [...prefix, "overlap-2"];
+
+			try {
+				tui.start();
+				await settle(term);
+
+				offscreenSource.queueFinal(prefix, false);
+				emittedSource.queueFinal(appendedSnapshot, true);
+				tui.requestRender(false, "test.overlapping-durable-source");
+				await settle(term);
+
+				const appended = observations.at(-1);
+				expect(appended?.durable).toBe(true);
+				expect(appended?.outcome).toBe("accepted");
+				expect(appended?.durableSourceCoverage?.map(event => event.identity)).toEqual(["emitted-source"]);
+				expect(emittedSource.acknowledgements).toHaveLength(0);
+				expect(offscreenSource.acknowledgements).toHaveLength(0);
+				expect(offscreenSource.getDurableHistoryEvent(32)?.snapshot).toEqual(prefix);
+				expect(emittedSource.getDurableHistoryEvent(32)?.snapshot).toEqual(appendedSnapshot);
 			} finally {
 				tui.stop();
 			}

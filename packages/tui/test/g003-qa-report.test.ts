@@ -23,6 +23,7 @@ type ScenarioContext = { tui: TUI; term: VirtualTerminal; component: MutableLine
 
 const cases: CaseResult[] = [];
 let previousFlag: string | undefined;
+let previousProcessFlag: string | undefined;
 let previousTmux: string | undefined;
 let previousSty: string | undefined;
 let previousZellij: string | undefined;
@@ -72,6 +73,12 @@ function makeRows(count: number, prefix = "line"): string[] {
 	return Array.from({ length: count }, (_value, index) => `${prefix}-${index}`);
 }
 
+function setVirtualViewportFlag(enabled: boolean): void {
+	const value = enabled ? "1" : "0";
+	Bun.env[FLAG] = value;
+	process.env[FLAG] = value;
+}
+
 async function settle(term: VirtualTerminal): Promise<void> {
 	await new Promise<void>(resolve => process.nextTick(resolve));
 	await Bun.sleep(1);
@@ -99,7 +106,7 @@ async function runScenario(
 	width = 40,
 	height = ROWS,
 ): Promise<Capture[]> {
-	Bun.env[FLAG] = flagOn ? "1" : "0";
+	setVirtualViewportFlag(flagOn);
 	delete Bun.env.TMUX;
 	delete Bun.env.STY;
 	delete Bun.env.ZELLIJ;
@@ -154,6 +161,7 @@ async function parityCase(
 describe("G003 virtual viewport adversarial parity QA", () => {
 	beforeEach(() => {
 		previousFlag = Bun.env[FLAG];
+		previousProcessFlag = process.env[FLAG];
 		previousTmux = Bun.env.TMUX;
 		previousSty = Bun.env.STY;
 		previousZellij = Bun.env.ZELLIJ;
@@ -170,6 +178,8 @@ describe("G003 virtual viewport adversarial parity QA", () => {
 		vi.restoreAllMocks();
 		if (previousFlag === undefined) delete Bun.env[FLAG];
 		else Bun.env[FLAG] = previousFlag;
+		if (previousProcessFlag === undefined) delete process.env[FLAG];
+		else process.env[FLAG] = previousProcessFlag;
 		if (previousTmux === undefined) delete Bun.env.TMUX;
 		else Bun.env.TMUX = previousTmux;
 		if (previousSty === undefined) delete Bun.env.STY;
@@ -306,7 +316,7 @@ describe("G003 virtual viewport adversarial parity QA", () => {
 
 	it("BOUNDED-WORK", async () => {
 		try {
-			Bun.env[FLAG] = "1";
+			setVirtualViewportFlag(true);
 			renderMetrics.reset();
 			renderMetrics.enable();
 			const term = new VirtualTerminal(40, ROWS);

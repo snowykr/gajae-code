@@ -248,13 +248,34 @@ jobs:
           esac
 
           api_prefix="repos/$GITHUB_REPOSITORY_NAME/pulls/$PR_NUMBER"
-          api_head="$(gh api "$api_prefix" --jq '.head.sha')"
-          api_base="$(gh api "$api_prefix" --jq '.base.sha')"
-          api_head_repo="$(gh api "$api_prefix" --jq '.head.repo.full_name')"
-          api_base_repo="$(gh api "$api_prefix" --jq '.base.repo.full_name')"
-          api_head_repo_id="$(gh api "$api_prefix" --jq '.head.repo.id')"
-          api_base_repo_id="$(gh api "$api_prefix" --jq '.base.repo.id')"
-          api_pr_node="$(gh api "$api_prefix" --jq '.node_id')"
+          api_json=""
+          for attempt in 1 2 3; do
+            if api_json="$(gh api "$api_prefix")" &&
+              jq -e '
+                type == "object" and
+                (.head? | type == "object") and
+                (.base? | type == "object") and
+                (.head.sha? | type == "string") and
+                (.base.sha? | type == "string") and
+                (.head.repo.full_name? | type == "string") and
+                (.base.repo.full_name? | type == "string") and
+                (.head.repo.id? | type == "number") and
+                (.base.repo.id? | type == "number") and
+                (.node_id? | type == "string")
+              ' >/dev/null <<< "$api_json"; then
+              break
+            fi
+            api_json=""
+            sleep "$attempt"
+          done
+          test -n "$api_json" || { echo "Unable to fetch canonical PR after retries"; exit 1; }
+          api_head="$(jq -r '.head.sha' <<< "$api_json")"
+          api_base="$(jq -r '.base.sha' <<< "$api_json")"
+          api_head_repo="$(jq -r '.head.repo.full_name' <<< "$api_json")"
+          api_base_repo="$(jq -r '.base.repo.full_name' <<< "$api_json")"
+          api_head_repo_id="$(jq -r '.head.repo.id' <<< "$api_json")"
+          api_base_repo_id="$(jq -r '.base.repo.id' <<< "$api_json")"
+          api_pr_node="$(jq -r '.node_id' <<< "$api_json")"
           [[ "$api_pr_node" =~ ^[A-Za-z0-9_:-]+$ ]] || { echo "Canonical PR node ID is invalid"; exit 1; }
           [[ "$api_head_repo_id" =~ ^[1-9][0-9]*$ ]] || { echo "Canonical PR head repository ID is invalid"; exit 1; }
           [[ "$api_base_repo_id" =~ ^[1-9][0-9]*$ ]] || { echo "Canonical PR base repository ID is invalid"; exit 1; }
@@ -428,6 +449,8 @@ jobs:
         env:
           DESCRIPTOR_ARTIFACT_URL: ${{ steps.upload_descriptor.outputs.artifact-url }}
           DESCRIPTOR_ARTIFACT_ID: ${{ steps.upload_descriptor.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ needs.capture.outputs.artifact_url }}
+          ARTIFACT_DIGEST: ${{ needs.capture.outputs.artifact_digest }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail

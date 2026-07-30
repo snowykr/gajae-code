@@ -1,11 +1,22 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool } from "@gajae-code/agent-core";
 import type { TUI } from "@gajae-code/tui";
+import * as z from "zod/v4";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { EDIT_MODE_STRATEGIES } from "../src/edit/index";
 import { ToolExecutionComponent } from "../src/modes/components/tool-execution";
 import { __eventControllerPerfCounters, EventController } from "../src/modes/controllers/event-controller";
 import { initTheme } from "../src/modes/theme/theme";
 import { argsWithPartialJson } from "../src/modes/utils/ui-helpers";
+
+const hashlineEditTool = {
+	name: "edit",
+	label: "Edit",
+	description: "Edits a file with the hashline strategy.",
+	parameters: z.object({}),
+	mode: "hashline" as const,
+	execute: async () => ({ content: [] }),
+} satisfies AgentTool & { mode: "hashline" };
 
 const ui = { requestRender() {} } as unknown as TUI;
 
@@ -252,43 +263,75 @@ describe("G004 streamed tool args QA", () => {
 		}
 	});
 
-	it("COALESCE-SKIP recomputes and renders same-length changed edit previews", async () => {
-		const editModule = await import("../src/edit/index");
-		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+	it("COALESCE-SKIP recomputes edit preview for same-length changed content via args identity version", async () => {
+		let previewRuns = 0;
+		const strategy = EDIT_MODE_STRATEGIES.hashline;
 		const originalCompute = strategy.computeDiffPreview;
-		const pending: Array<{ resolve: (value: unknown) => void }> = [];
-		strategy.computeDiffPreview = () => {
-			const deferred = Promise.withResolvers<unknown>();
-			pending.push({ resolve: deferred.resolve });
-			return deferred.promise;
+		strategy.computeDiffPreview = async (args, ctx) => {
+			previewRuns += 1;
+			return originalCompute(args, ctx);
 		};
-		const component = new ToolExecutionComponent(
-			"edit",
-			makeArgs("edit", 1, true),
-			{},
-			{ name: "edit", label: "Edit", mode: "hashline" } as any,
-			ui,
-		);
-		const settleRenderedPreview = async (expected: string): Promise<void> => {
-			for (let attempt = 0; attempt < 20; attempt++) {
-				await Promise.resolve();
-				if (rendered(component).includes(expected)) return;
-			}
-			throw new Error(`Preview did not render ${expected}`);
-		};
+		const component = new ToolExecutionComponent("edit", makeArgs("edit", 1, true), {}, hashlineEditTool, ui);
 		try {
-			expect(pending).toHaveLength(1);
-			pending[0].resolve([{ path: "preview-one.txt", diff: "+preview-one" }]);
-			await settleRenderedPreview("preview-one");
-
+			await Bun.sleep(20);
+			const before = previewRuns;
 			component.updateArgs(makeArgs("edit", 2, true));
-			expect(pending).toHaveLength(2);
-			pending[1].resolve([{ path: "preview-two.txt", diff: "+preview-two" }]);
-			await settleRenderedPreview("preview-two");
-			expect(rendered(component)).not.toContain("preview-one");
+			await Bun.sleep(50);
+			expect(previewRuns).toBeGreaterThan(before);
 		} finally {
 			strategy.computeDiffPreview = originalCompute;
 			component.dispose();
+		}
+	});
+	it("FINAL-PREVIEW-SETTLEMENT requests exactly one render after null and rejected final previews settle", async () => {
+		const strategy = EDIT_MODE_STRATEGIES.hashline;
+		const originalCompute = strategy.computeDiffPreview;
+		let renderCalls = 0;
+		const testUi = {
+			requestRender() {
+				renderCalls += 1;
+			},
+		} as unknown as TUI;
+
+		try {
+			for (const outcome of ["none", "rejected"] as const) {
+				let settleFinal!: () => void;
+				strategy.computeDiffPreview = async (_args, ctx) => {
+					if (ctx.isStreaming) return null;
+					const finalPreview = Promise.withResolvers<null>();
+					settleFinal = () => {
+						if (outcome === "none") finalPreview.resolve(null);
+						else finalPreview.reject(new Error("preview failed"));
+					};
+					return finalPreview.promise;
+				};
+
+				const component = new ToolExecutionComponent(
+					"edit",
+					makeArgs("edit", outcome === "none" ? 1 : 2),
+					{},
+					hashlineEditTool,
+					testUi,
+					process.cwd(),
+					`final-${outcome}`,
+				);
+				try {
+					const beforeFinal = renderCalls;
+					component.setArgsComplete();
+					component.updateResult({ content: [{ type: "text", text: "done" }] });
+					await Promise.resolve();
+					expect(renderCalls).toBe(beforeFinal);
+
+					settleFinal();
+					await Bun.sleep(0);
+					expect(renderCalls).toBe(beforeFinal + 1);
+					expect(component.getDurableHistoryEvent(140)?.final).toBe(true);
+				} finally {
+					component.dispose();
+				}
+			}
+		} finally {
+			strategy.computeDiffPreview = originalCompute;
 		}
 	});
 

@@ -1188,7 +1188,7 @@ describe("sticky viewport production evidence verifier", () => {
 		remintAnchor: boolean,
 	): Promise<string> {
 		const ansiPath = path.join(root, key, "terminal-ansi.txt");
-		const ansiRows = (await fs.readFile(ansiPath, "utf8")).split("\n");
+		const ansiRows = (await Bun.file(ansiPath).text()).split("\n");
 		const before = ansiRows[row]!;
 		ansiRows[row] = mutate(before);
 		if (ansiRows[row] === before) throw new Error(`row ${row} of ${key} was not mutated`);
@@ -1223,7 +1223,7 @@ describe("sticky viewport production evidence verifier", () => {
 		const root = await capture();
 		const key = "manual-new-output/80x24/unicode-color";
 		const anchorRow = (await readMetadata(root, key)).state.semantic_anchor!.frame_start_row;
-		const rows = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n");
+		const rows = (await Bun.file(path.join(root, key, "terminal.txt")).text()).split("\n");
 		// A row carrying the same token as the anchor row but which the anchor does
 		// not cover, so the mutation is provably outside the anchor's reach. The
 		// replacement is the same cell width, so no geometry check can notice.
@@ -1258,7 +1258,7 @@ describe("sticky viewport production evidence verifier", () => {
 			roots.push(clone);
 			await fs.cp(root, clone, { recursive: true });
 			expect((await readMetadata(clone, key)).state.semantic_anchor).toBeNull();
-			const rows = (await fs.readFile(path.join(clone, key, "terminal.txt"), "utf8")).split("\n");
+			const rows = (await Bun.file(path.join(clone, key, "terminal.txt")).text()).split("\n");
 			const targetRow = rows.findIndex(text => text.includes("reserved suffix row 1 "));
 			expect(targetRow).toBeGreaterThanOrEqual(0);
 			// Same width, and it touches none of the ordered suffix markers, so only the
@@ -1283,7 +1283,7 @@ describe("sticky viewport production evidence verifier", () => {
 		const root = await capture();
 		const key = "manual-new-output/80x24/unicode-color";
 		const anchorRow = (await readMetadata(root, key)).state.semantic_anchor!.frame_start_row;
-		const rows = (await fs.readFile(path.join(root, key, "terminal.txt"), "utf8")).split("\n");
+		const rows = (await Bun.file(path.join(root, key, "terminal.txt")).text()).split("\n");
 		expect(rows[anchorRow]).toContain("selectable");
 		// `remintAnchor: false`: every artifact and provenance digest is coordinately
 		// rehashed, but the anchor id and row digest still describe the old paint.

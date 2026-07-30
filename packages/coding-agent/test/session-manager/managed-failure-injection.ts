@@ -14,16 +14,30 @@ import { vi } from "bun:test";
 import * as fs from "node:fs";
 import * as native from "@gajae-code/natives";
 
-export function publishFailure(code: string, reason: "io_failure" | "identity_violation") {
+export type ManagedPublishFailure = {
+	ok: false;
+	code: string;
+	mutationState: "not_committed";
+	durabilityState: "not_attempted";
+	reason: "io_failure" | "identity_violation";
+	primitive: "renameat2_noreplace";
+	phase: "preflight";
+	diagnostic: {
+		schemaVersion: 1;
+		collectionState: "complete";
+	};
+};
+
+export function publishFailure(code: string, reason: "io_failure" | "identity_violation"): ManagedPublishFailure {
 	return {
-		ok: false as const,
+		ok: false,
 		code,
-		mutationState: "not_committed" as const,
-		durabilityState: "not_attempted" as const,
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
 		reason,
-		primitive: "renameat2_noreplace" as const,
-		phase: "preflight" as const,
-		diagnostic: { schemaVersion: 1 as const, collectionState: "complete" as const },
+		primitive: "renameat2_noreplace",
+		phase: "preflight",
+		diagnostic: { schemaVersion: 1, collectionState: "complete" },
 	};
 }
 
@@ -50,7 +64,7 @@ function handle(hits: { n: number }, restore: () => void): ManagedInjectionHandl
 
 /** Inject tree rename failures (fork artifact publish / rename boundary). */
 export function injectManagedTreeRename(
-	impl: (source: string, destination: string) => ReturnType<typeof publishFailure> | "passthrough",
+	impl: (source: string, destination: string) => ManagedPublishFailure | "passthrough",
 ): ManagedInjectionHandle {
 	const hits = { n: 0 };
 	if (process.platform === "linux") {
@@ -168,7 +182,7 @@ export function injectManagedTreeFsync(options: {
 
 /** Inject managed file rename failures (transcript publication). */
 export function injectManagedFileRename(
-	impl: (source: string, destination: string) => ReturnType<typeof publishFailure> | "passthrough",
+	impl: (source: string, destination: string) => ManagedPublishFailure | "passthrough",
 ): ManagedInjectionHandle {
 	const hits = { n: 0 };
 	if (process.platform === "linux") {

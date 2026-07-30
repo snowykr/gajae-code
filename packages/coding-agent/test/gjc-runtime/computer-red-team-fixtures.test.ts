@@ -388,7 +388,7 @@ describe("computer red-team fixture matrix", () => {
 		const toolsIndexPath = "packages/coding-agent/src/tools/index.ts";
 		await fs.mkdir(path.dirname(path.join(root, toolsIndexPath)), { recursive: true });
 		const prefix = new TextEncoder().encode("export const BUILTIN_TOOLS = { ordinary: true };\n");
-		await fs.writeFile(path.join(root, toolsIndexPath), new Uint8Array([...prefix, 0xff, 0x0a]));
+		await Bun.write(path.join(root, toolsIndexPath), new Uint8Array([...prefix, 0xff, 0x0a]));
 		await runGit(root, ["add", toolsIndexPath]);
 		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
 			row => row.id !== "blast-radius",

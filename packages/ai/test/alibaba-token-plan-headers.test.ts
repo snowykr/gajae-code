@@ -82,14 +82,16 @@ describe("mergeDashScopeTokenPlanHeaders precedence", () => {
 		expect(merged["X-DashScope-AuthType"]).toBe("openai");
 	});
 
-	it("overrides case-insensitively in wire capture (Headers lowercases keys)", () => {
-		// The OpenAI SDK merges headers into a Headers instance, so a caller using a
-		// different case (e.g. "user-agent") still wins because object-spread here is
-		// case-sensitive — verify the merge record keeps the caller key as-given.
-		const merged = mergeDashScopeTokenPlanHeaders({ "user-agent": "lowercase/1.0" });
-		// Caller key wins verbatim (case-sensitive spread); canonical "User-Agent" stays.
+	it("overrides identity headers case-insensitively", () => {
+		const merged = mergeDashScopeTokenPlanHeaders({
+			"user-agent": "lowercase/1.0",
+			"x-dashscope-authtype": "oauth",
+		});
+		// Caller casing is preserved, while canonical variants are replaced.
 		expect(merged["user-agent"]).toBe("lowercase/1.0");
-		expect(merged["User-Agent"]).toBe(qwenCodeUserAgent());
+		expect(merged["User-Agent"]).toBeUndefined();
+		expect(merged["x-dashscope-authtype"]).toBe("oauth");
+		expect(merged["X-DashScope-AuthType"]).toBeUndefined();
 	});
 });
 
@@ -210,6 +212,22 @@ describe("alibaba-token-plan wire headers (openai-completions)", () => {
 		expect(h["x-dashscope-cachecontrol"]).toBe("enable");
 		expect(h["x-dashscope-useragent"]).toBe(CANONICAL["x-dashscope-useragent"]);
 		expect(h["x-dashscope-authtype"]).toBe("openai");
+	});
+	it("honors lowercase caller overrides without duplicate logical headers", async () => {
+		const captured: CapturedRequest[] = [];
+		await streamOpenAICompletions(alibabaCompletionsModel(), baseContext(), {
+			apiKey: "test-key",
+			headers: {
+				"user-agent": "lowercase-cli/2.0",
+				"x-dashscope-authtype": "oauth",
+			},
+			fetch: createCapturingFetchCompletions(captured),
+		}).result();
+
+		expect(captured).toHaveLength(1);
+		const h = captured[0].headers;
+		expect(h["user-agent"]).toBe("lowercase-cli/2.0");
+		expect(h["x-dashscope-authtype"]).toBe("oauth");
 	});
 
 	it("sends Authorization as Bearer scheme and keeps identity headers independent of auth", async () => {

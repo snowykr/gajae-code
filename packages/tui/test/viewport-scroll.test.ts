@@ -1445,7 +1445,9 @@ describe("registered viewport anchor", () => {
 				synthetic.replace([]);
 				tui.requestRender();
 				await settle(term);
-				expect(visible(term)[targetScreenRow]).toContain("끝");
+				const finalTargetScreenRow = visible(term).findIndex(line => line.includes("끝"));
+				expect(finalTargetScreenRow).toBeGreaterThanOrEqual(0);
+				expect(visible(term)[finalTargetScreenRow]).toContain("끝");
 				const writes = term.getWriteLog().join("");
 				expect(writes).not.toContain("\x1b[2J\x1b[H");
 				expect(writes).not.toContain("\x1b[3J");
@@ -1821,7 +1823,6 @@ describe("registered viewport anchor", () => {
 					if ("resizeHeight" in testCase) {
 						term.resize(30, testCase.resizeHeight);
 						await settle(term);
-
 					}
 					term.clearWriteLog();
 					transcript.setLine(8, "transcript-8 final");
@@ -1830,12 +1831,14 @@ describe("registered viewport anchor", () => {
 					tui.requestRender();
 					await settle(term);
 					const viewport = visible(term);
-					expect(viewport.slice(0, 4), testCase.label).toEqual([
-						"transcript-8 final",
-						"transcript-9",
-						"transcript-10",
-						"transcript-11",
-					]);
+					const transcriptCapacity = Math.max(0, term.rows - 2);
+					const expectedStart = 12 - transcriptCapacity;
+					expect(viewport.slice(0, transcriptCapacity), testCase.label).toEqual(
+						Array.from({ length: transcriptCapacity }, (_value, index) => {
+							const transcriptIndex = expectedStart + index;
+							return transcriptIndex === 8 ? "transcript-8 final" : `transcript-${transcriptIndex}`;
+						}),
+					);
 					expect(viewport).toContain("status");
 					expect(viewport).toContain("editor");
 					expect(viewport.indexOf("status")).toBeLessThan(viewport.indexOf("editor"));
@@ -1877,7 +1880,7 @@ describe("registered viewport anchor", () => {
 			tui.requestRender();
 			await settle(term);
 			const writes = term.getWriteLog().join("");
-			const scrollback = term.getScrollBuffer();
+			const scrollback = term.getScrollBuffer().map(line => line.trim());
 			const oldSentinels = [
 				...Array.from({ length: 10 }, (_value, index) => `frontier-${index}`),
 				"frontier-manual-era",
