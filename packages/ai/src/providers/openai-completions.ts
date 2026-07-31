@@ -119,6 +119,69 @@ export function resolveOpenAICompletionsBaseUrlForTest(
 ): string {
 	return resolveOpenAIProviderBaseUrl(baseUrl, authCredentialType);
 }
+function appendUrlPath(baseUrl: string | undefined, path: string): string | undefined {
+	if (!baseUrl) return undefined;
+	const normalizedPath = path.replace(/^\/+/g, "");
+	try {
+		const parsed = new URL(baseUrl);
+		parsed.pathname = `${parsed.pathname.replace(/\/+$/g, "")}/${normalizedPath}`;
+		return parsed.toString();
+	} catch {
+		return `${baseUrl.replace(/\/+$/g, "")}/${normalizedPath}`;
+	}
+}
+
+type OpenAICompletionsQuery = string;
+
+function splitBaseUrlQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	query?: OpenAICompletionsQuery;
+} {
+	if (!baseUrl) return { baseUrl };
+	try {
+		const parsed = new URL(baseUrl);
+		if (!parsed.search) return { baseUrl };
+		const queryStart = baseUrl.indexOf("?");
+		const fragmentStart = baseUrl.indexOf("#", queryStart);
+		const query = baseUrl.slice(queryStart + 1, fragmentStart === -1 ? undefined : fragmentStart);
+		if (!query) return { baseUrl };
+		parsed.search = "";
+		return {
+			baseUrl: parsed.toString(),
+			query,
+		};
+	} catch {
+		return { baseUrl };
+	}
+}
+
+function hasQueryParameter(query: OpenAICompletionsQuery | undefined, name: string): boolean {
+	return query?.split("&").some(entry => entry.split("=", 1)[0] === name) ?? false;
+}
+
+function appendRawQuery(url: string, query: OpenAICompletionsQuery | undefined): string {
+	if (!query) return url;
+	const fragmentStart = url.indexOf("#");
+	const beforeFragment = fragmentStart === -1 ? url : url.slice(0, fragmentStart);
+	const fragment = fragmentStart === -1 ? "" : url.slice(fragmentStart);
+	return `${beforeFragment}${beforeFragment.includes("?") ? "&" : "?"}${query}${fragment}`;
+}
+
+function buildRequestUrl(
+	baseUrl: string | undefined,
+	path: string,
+	query?: OpenAICompletionsQuery,
+): string | undefined {
+	const url = appendUrlPath(baseUrl, path);
+	return url ? appendRawQuery(url, query) : undefined;
+}
+
+function appendQueryToRequest(input: string | URL | Request, query?: OpenAICompletionsQuery): string | URL | Request {
+	if (!query) return input;
+	const url = appendRawQuery(input instanceof Request ? input.url : String(input), query);
+	if (input instanceof Request) return new Request(url, input as unknown as RequestInit);
+	return url;
+}
 
 /**
  * Normalize tool call ID for Mistral.
@@ -466,6 +529,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				client,
 				copilotPremiumRequests,
 				baseUrl,
+				requestBaseUrl,
+				requestQuery,
 				requestHeaders,
 				getCapturedErrorResponse: captureErrorResponse,
 				clearCapturedErrorResponse,
@@ -511,7 +576,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					api: output.api,
 					model: model.id,
 					method: "POST",
-					url: `${baseUrl}/chat/completions`,
+					url: buildRequestUrl(requestBaseUrl, "chat/completions", requestQuery),
 					headers: requestHeaders,
 					body: params,
 				};
@@ -1029,6 +1094,8 @@ async function createClient(
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
 	baseUrl: string | undefined;
+	requestBaseUrl: string | undefined;
+	requestQuery: OpenAICompletionsQuery | undefined;
 	requestHeaders: Record<string, string>;
 	getCapturedErrorResponse: () => CapturedHttpErrorResponse | undefined;
 	clearCapturedErrorResponse: () => void;
@@ -1105,17 +1172,24 @@ async function createClient(
 	// The generic openai-completions path adds neither, producing silent 404s.
 	let azureDefaultQuery: Record<string, string> | undefined;
 	if (baseUrl?.includes(".openai.azure.com")) {
-		const apiVersion = $env.AZURE_OPENAI_API_VERSION || "2024-10-21";
 		if (!baseUrl.includes("/deployments/")) {
-			baseUrl = `${baseUrl}/deployments/${model.id}`;
+			baseUrl = appendUrlPath(baseUrl, `deployments/${model.id}`) ?? baseUrl;
 		}
-		azureDefaultQuery = { "api-version": apiVersion };
 	}
+	const { baseUrl: clientBaseUrl, query: endpointQuery } = splitBaseUrlQuery(baseUrl);
+	if (baseUrl?.includes(".openai.azure.com") && !hasQueryParameter(endpointQuery, "api-version")) {
+		azureDefaultQuery = { "api-version": $env.AZURE_OPENAI_API_VERSION || "2024-10-21" };
+	}
+	const azureQueryEntries = Object.entries(azureDefaultQuery ?? {});
+	const azureQuery = azureQueryEntries.length > 0 ? new URLSearchParams(azureDefaultQuery).toString() : undefined;
+	const endpointRequestQuery = endpointQuery;
+	const requestQuery =
+		[endpointRequestQuery, azureQuery].filter((query): query is string => query !== undefined).join("&") || undefined;
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
 	const baseFetch = fetchOverride ?? fetch;
 	const wrappedFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			const response = await baseFetch(input, init);
+			const response = await baseFetch(appendQueryToRequest(input, endpointRequestQuery), init);
 			if (response.ok) {
 				capturedErrorResponse = undefined;
 				return response;
@@ -1171,7 +1245,7 @@ async function createClient(
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
@@ -1181,6 +1255,8 @@ async function createClient(
 		}),
 		copilotPremiumRequests,
 		baseUrl,
+		requestBaseUrl: clientBaseUrl,
+		requestQuery,
 		requestHeaders: headers,
 		getCapturedErrorResponse: () => capturedErrorResponse,
 		clearCapturedErrorResponse: () => {

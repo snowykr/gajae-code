@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- OpenAI-compatible discovery and OpenAI Completions/Responses transports now preserve query-bearing endpoint routing, including repeated query parameters. Model resolution records whether a provider discovery result was fetched so consumers can distinguish current discovery evidence from cached data.
 
 ## [0.12.7] - 2026-07-31
 
