@@ -6,6 +6,8 @@
 
 - Proxy streams now fail closed when a `toolcall_end` event references missing or non-tool-call content instead of silently dropping the protocol violation and accepting a later terminal event.
 
+## [0.12.5] - 2026-07-30
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30

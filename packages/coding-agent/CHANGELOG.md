@@ -27,6 +27,10 @@
 - Windows memory-pressure sampling now caches the resolved native probe, avoiding repeated native-loader setup work while retaining its unsupported-platform fallback.
 - MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. Both explicit and default MCP startup waits honor that ceiling, so an ACP launch that reaches the readiness cutoff before MCP startup fails fast as pending startup instead of silently crossing its deadline.
 
+## [0.12.5] - 2026-07-30
+
+## [0.12.5] - 2026-07-30
+
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30

@@ -10,6 +10,8 @@
 - Reproducible Alibaba Token Plan header-parity A/B latency benchmark (`packages/ai/scripts/alibaba-token-plan-latency-ab.ts`): a fixed-seed interleaved A/B comparison of legacy vs Qwen-identical headers against a deterministic local HTTP server, reporting n/success/error/timeout and TTFT/total latency median/p90/p95/mean/stddev. No live credentials are required; a public-safe blocked-live-data receipt is included (`packages/ai/test/fixtures/alibaba-token-plan-latency-blocked-receipt.md`) (#3557).
 
 
+## [0.12.5] - 2026-07-30
+
 ## [0.12.4] - 2026-07-30
 
 ### Fixed

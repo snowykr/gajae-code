@@ -77,6 +77,12 @@ export {
 	validateRecoveryAdmission,
 	validateRecoveryPath,
 } from "./ultragoal-owner-loss-recovery";
+import {
+	captureReviewSourceSnapshot,
+	normalizeReviewSourceCohorts,
+	type ReviewSourceCohort,
+} from "./ultragoal-review-source";
+
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
 	| "pending"
@@ -127,6 +133,7 @@ export interface UltragoalPlan {
 	goals: UltragoalGoal[];
 	/** Authoritative repository identity for multi-repo fail-closed spawn (#2901). */
 	repositoryBinding?: RepositoryBinding;
+	reviewCohorts?: ReviewSourceCohort[];
 	createdAt: string;
 	updatedAt: string;
 	[key: string]: unknown;
@@ -984,6 +991,7 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 	if (record.repositoryBinding !== undefined) {
 		repositoryBinding = parseRepositoryBinding(record.repositoryBinding);
 	}
+	const reviewCohorts = normalizeReviewSourceCohorts(record.reviewCohorts);
 	return {
 		version: 1,
 		brief,
@@ -994,6 +1002,7 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 		createdAt,
 		updatedAt,
 		...(repositoryBinding ? { repositoryBinding } : {}),
+		reviewCohorts,
 		...(typeof record.state_revision === "number" && Number.isFinite(record.state_revision)
 			? { state_revision: record.state_revision }
 			: {}),
@@ -2514,7 +2523,12 @@ const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
  * generations are delta-only. Cohort state rides the existing `iteration` gate key so
  * no new top-level quality-gate key is introduced.
  */
-function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
+async function validateReviewCohort(
+	cwd: string,
+	gate: JsonObject,
+	iteration: JsonObject,
+	plan?: UltragoalPlan,
+): Promise<void> {
 	const cohort = qualityGateObject(iteration.reviewCohort);
 	if (!cohort) throw new Error("qualityGate iteration.reviewCohort is required at the review boundary");
 	const generation = cohort.reviewGeneration;
@@ -2522,6 +2536,39 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 		throw new Error("iteration.reviewCohort.reviewGeneration must be an integer >= 1");
 	const sourceHash = nonEmptyString(cohort.sourceHash);
 	if (!sourceHash) throw new Error("iteration.reviewCohort.sourceHash is required");
+	const cohortId = nonEmptyString(cohort.cohortId);
+	const lanesForAuthority = qualityGateObject(cohort.lanes);
+	const deliveryBearing = COHORT_LANE_KEYS.some(lane =>
+		nonEmptyString(qualityGateObject(lanesForAuthority?.[lane])?.deliveryId),
+	);
+	const authoritativeReview = Boolean(cohortId || deliveryBearing || plan?.reviewCohorts?.length);
+	if (authoritativeReview && !cohortId) {
+		throw new Error(
+			"iteration.reviewCohort.cohortId is required; reviewer-declared source hashes are not gate authority",
+		);
+	}
+	const authoritative = cohortId ? plan?.reviewCohorts?.find(record => record.cohortId === cohortId) : undefined;
+	if (cohortId && !authoritative) {
+		throw new Error("iteration.reviewCohort.cohortId must resolve to a runtime-owned persisted review cohort");
+	}
+	if (authoritative?.status !== undefined && authoritative.status !== "active") {
+		throw new Error(
+			"iteration.reviewCohort references a superseded review cohort; rerun reviews on the active source snapshot",
+		);
+	}
+	if (authoritative && (authoritative.generation !== generation || authoritative.snapshotId !== sourceHash)) {
+		throw new Error(
+			"iteration.reviewCohort generation/sourceHash must match the runtime-owned persisted review cohort",
+		);
+	}
+	if (authoritative && plan?.repositoryBinding) {
+		const current = await captureReviewSourceSnapshot(cwd, plan.repositoryBinding);
+		if (current.snapshotId !== authoritative.snapshotId) {
+			throw new Error(
+				"iteration.reviewCohort source advanced after review delivery; rerun the cohort on the current source snapshot",
+			);
+		}
+	}
 	if (cohort.joined !== true)
 		throw new Error("iteration.reviewCohort.joined must be true: all lane findings must join before checkpoint");
 	const lanes = qualityGateObject(cohort.lanes);
@@ -2534,6 +2581,21 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 			throw new Error(`iteration.reviewCohort.lanes.${lane} must be one lane per generation, not a list`);
 		const record = qualityGateObject(lanes[lane]);
 		if (!record) throw new Error(`iteration.reviewCohort.lanes.${lane} is required`);
+		if (authoritative) {
+			const deliveryId = nonEmptyString(record.deliveryId);
+			if (!deliveryId) throw new Error(`iteration.reviewCohort.lanes.${lane}.deliveryId is required`);
+			const delivery = authoritative.deliveries.find(item => item.deliveryId === deliveryId && item.lane === lane);
+			if (!delivery) {
+				throw new Error(
+					`iteration.reviewCohort.lanes.${lane}.deliveryId must resolve to its runtime-owned lane delivery`,
+				);
+			}
+			if (delivery.disposition !== "current" || delivery.snapshotId !== sourceHash) {
+				throw new Error(
+					`iteration.reviewCohort.lanes.${lane} is ${delivery.disposition}; stale or invalid review delivery cannot satisfy the current gate. Rerun the ${lane} lane on cohort ${cohortId}`,
+				);
+			}
+		}
 		const laneHash = nonEmptyString(record.sourceHash);
 		if (!laneHash) throw new Error(`iteration.reviewCohort.lanes.${lane}.sourceHash is required`);
 		if (laneHash !== sourceHash)
@@ -2571,6 +2633,18 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 	// per-lane or per-generation vote.
 	const critic = qualityGateObject(gate.criticReview);
 	if (critic) {
+		if (authoritative) {
+			const criticDeliveryId = nonEmptyString(critic.deliveryId);
+			if (!criticDeliveryId) throw new Error("criticReview.deliveryId is required for the terminal review gate");
+			const criticDelivery = authoritative.deliveries.find(
+				item => item.deliveryId === criticDeliveryId && item.lane === "critic",
+			);
+			if (criticDelivery?.disposition !== "current" || criticDelivery.snapshotId !== sourceHash) {
+				throw new Error(
+					"criticReview.deliveryId must resolve to a current terminal critic delivery on the joined cohort",
+				);
+			}
+		}
 		const criticHash = nonEmptyString(critic.sourceHash);
 		if (criticHash && criticHash !== sourceHash)
 			throw new Error(
@@ -2768,7 +2842,9 @@ async function validateCompletionQualityGate(
 	found.check("iteration.blockers", "non_empty_blockers", () =>
 		requireEmptyBlockers(iteration.blockers, "iteration.blockers"),
 	);
-	found.check("iteration.reviewCohort", "review_cohort_invalid", () => validateReviewCohort(gate, iteration));
+	await found.checkAsync("iteration.reviewCohort", "review_cohort_invalid", () =>
+		validateReviewCohort(cwd, gate, iteration, options.plan),
+	);
 	if (batchMode && options.goal && options.plan && options.ledger) {
 		found.check("validationBatchClose", "batch_close_invalid", () =>
 			validateBatchCloseQualityGate(gate, options.plan!, batchMode, options.ledger!, options.changeSet),
@@ -3966,9 +4042,19 @@ export async function recordUltragoalReviewBlockers(input: {
 	title: string;
 	objective: string;
 	evidence: string;
-}): Promise<UltragoalPlan> {
+}): Promise<{ plan: UltragoalPlan; blockerGoalId: string }> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("record-review-blockers --objective is required");
+	// Read the durable plan before checkpointing so duplicate submissions are pure
+	// idempotent returns and the recursion cap fails closed without partial writes.
+	const prePlan = await readUltragoalPlan(input.cwd);
+	if (!prePlan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	const existing = findOpenReviewBlockerGoal(prePlan, objective, input.goalId);
+	if (existing) return { plan: prePlan, blockerGoalId: existing.id };
+	const unresolvedDescents = countUnresolvedReviewBlockerDescents(prePlan, input.goalId);
+	if (unresolvedDescents >= MAX_REVIEW_BLOCKER_DESCENTS) {
+		throw new UltragoalReviewBlockerRecursionCapError(input.goalId, unresolvedDescents);
+	}
 	const plan = await checkpointUltragoalGoal({
 		cwd: input.cwd,
 		goalId: input.goalId,
@@ -3978,7 +4064,7 @@ export async function recordUltragoalReviewBlockers(input: {
 	const persistedPlan = await readUltragoalPlan(input.cwd);
 	if (persistedPlan?.state_revision !== undefined) plan.state_revision = persistedPlan.state_revision;
 	const now = new Date().toISOString();
-	const nextId = `G${String(plan.goals.length + 1).padStart(3, "0")}`;
+	const nextId = nextUltragoalGoalId(plan);
 	plan.goals.push({
 		id: nextId,
 		title: input.title.trim() || "Resolve final code-review blockers",
@@ -3991,7 +4077,7 @@ export async function recordUltragoalReviewBlockers(input: {
 	plan.updatedAt = now;
 	await writePlan(input.cwd, plan);
 	await appendLedger(input.cwd, { event: "review_blockers_recorded", goalId: input.goalId, blockerGoalId: nextId });
-	return plan;
+	return { plan, blockerGoalId: nextId };
 }
 
 export type UltragoalBlockerClassification = "human_blocked" | "resolvable";
@@ -4371,14 +4457,57 @@ function executorQaBlockers(executorQa: JsonObject): UltragoalReviewFinding[] {
 
 const RESOLVED_REVIEW_BLOCKER_STATUSES = new Set<UltragoalGoalStatus>(["complete", "superseded"]);
 
-function findOpenReviewBlockerGoal(plan: UltragoalPlan, message: string): UltragoalGoal | undefined {
+function findOpenReviewBlockerGoal(
+	plan: UltragoalPlan,
+	message: string,
+	blockedGoalId?: string,
+): UltragoalGoal | undefined {
 	const objective = message.trim();
 	return plan.goals.find(
 		goal =>
 			goal.steering?.kind === "review_blocker" &&
 			goal.objective.trim() === objective &&
+			(blockedGoalId === undefined || goal.steering.blockedGoalId === blockedGoalId) &&
 			!RESOLVED_REVIEW_BLOCKER_STATUSES.has(goal.status),
 	);
+}
+
+/**
+ * Maximum unresolved review_blocker descents chained off a single blocked goal.
+ * Descents 1..3 may exist; an attempt to create the 4th triggers a terminal
+ * handoff so unresolved technical findings are not silently discarded.
+ */
+const MAX_REVIEW_BLOCKER_DESCENTS = 3;
+
+export class UltragoalReviewBlockerRecursionCapError extends Error {
+	readonly code = "review_blocker_recursion_cap" as const;
+	readonly blockedGoalId: string;
+	readonly unresolvedDescents: number;
+	readonly cap: number;
+
+	constructor(blockedGoalId: string, unresolvedDescents: number, cap = MAX_REVIEW_BLOCKER_DESCENTS) {
+		super(
+			`review_blocker_recursion_cap: goal ${blockedGoalId} already has ${unresolvedDescents} unresolved review_blocker descents (cap=${cap}). ` +
+				"Record a human pause/escalation or resolve existing blockers before recording more. " +
+				"Unresolved technical findings are never auto-completed.",
+		);
+		this.name = "UltragoalReviewBlockerRecursionCapError";
+		this.blockedGoalId = blockedGoalId;
+		this.unresolvedDescents = unresolvedDescents;
+		this.cap = cap;
+	}
+}
+
+function countUnresolvedReviewBlockerDescents(plan: UltragoalPlan, goalId: string): number {
+	return plan.goals.reduce((count, goal) => {
+		if (
+			goal.steering?.kind === "review_blocker" &&
+			goal.steering.blockedGoalId === goalId &&
+			!RESOLVED_REVIEW_BLOCKER_STATUSES.has(goal.status)
+		)
+			return count + 1;
+		return count;
+	}, 0);
 }
 
 async function recordReviewFindingGoals(cwd: string, findings: readonly UltragoalReviewFinding[]): Promise<string[]> {
@@ -5133,20 +5262,19 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 				};
 			}
 			case "record-review-blockers": {
-				const plan = await recordUltragoalReviewBlockers({
+				const { blockerGoalId } = await recordUltragoalReviewBlockers({
 					cwd,
 					goalId: flagValue(args, "--goal-id") ?? "",
 					title: flagValue(args, "--title") ?? "Resolve final code-review blockers",
 					objective: flagValue(args, "--objective") ?? "",
 					evidence: flagValue(args, "--evidence") ?? "",
 				});
-				const goal = plan.goals.at(-1);
 				return {
 					status: 0,
 					stdout: json
 						? renderCliWriteReceipt({
 								ok: true,
-								goal_id: goal?.id,
+								goal_id: blockerGoalId,
 								goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
 							})
 						: "Recorded review blockers.\n",

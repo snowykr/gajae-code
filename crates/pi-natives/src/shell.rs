@@ -20,6 +20,15 @@ use pi_shell::{
 
 use crate::task;
 const SHELL_CALLBACK_QUEUE_CAPACITY: usize = 1024;
+type ShellChunkCallback = ThreadsafeFunction<
+	String,
+	Unknown<'static>,
+	String,
+	napi::Status,
+	true,
+	false,
+	SHELL_CALLBACK_QUEUE_CAPACITY,
+>;
 const SHELL_LOSS_MARKER_PREFIX: &str = "\n[Shell output truncated: ";
 
 /// N-API opt-in handle for the minimizer.
@@ -205,7 +214,7 @@ impl Shell {
 		env: &'env Env,
 		options: ShellRunOptions<'env>,
 		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
-		on_chunk: Option<ThreadsafeFunction<String>>,
+		on_chunk: Option<ShellChunkCallback>,
 	) -> Result<PromiseRaw<'env, ShellRunResult>> {
 		let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 		let inner = Arc::clone(&self.inner);
@@ -249,7 +258,7 @@ pub fn execute_shell<'env>(
 	env: &'env Env,
 	options: ShellExecuteOptions<'env>,
 	#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
-	on_chunk: Option<ThreadsafeFunction<String>>,
+	on_chunk: Option<ShellChunkCallback>,
 ) -> Result<PromiseRaw<'env, ShellRunResult>> {
 	let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 	let exec_options = CoreShellExecuteOptions {
@@ -279,7 +288,7 @@ fn shell_loss_marker(dropped_chunks: usize, dropped_bytes: usize) -> String {
 }
 
 fn bridge_chunks(
-	on_chunk: Option<ThreadsafeFunction<String>>,
+	on_chunk: Option<ShellChunkCallback>,
 ) -> (Option<mpsc::UnboundedSender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
 	let Some(on_chunk) = on_chunk else {
 		return (None, None);
@@ -321,7 +330,7 @@ fn bridge_chunks(
 			}
 		});
 		while let Some(chunk) = bounded_rx.recv().await {
-			if on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking) != napi::Status::Ok {
+			if on_chunk.call(Ok(chunk), ThreadsafeFunctionCallMode::Blocking) != napi::Status::Ok {
 				forwarder.abort();
 				break;
 			}
