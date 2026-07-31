@@ -164,4 +164,69 @@ describe("OpenAI-compatible request transforms", () => {
 		});
 		expect("reasoning_effort" in body).toBe(false);
 	});
+	it("preserves endpoint query parameters for responses and chat completions", async () => {
+		const capturedUrls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			capturedUrls.push(String(input));
+			return capturedUrls.length === 1 ? responsesSseResponse() : completionsSseResponse();
+		});
+		global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
+
+		const responsesModel: Model<"openai-responses"> = {
+			...(getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">),
+			provider: "proxy",
+			baseUrl: "https://gateway.example/v1?scope=read&scope=write",
+		};
+		for await (const event of streamOpenAIResponses(responsesModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		const completionsModel: Model<"openai-completions"> = {
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
+			provider: "proxy",
+			baseUrl: "https://gateway.example/v1?scope=read&scope=write",
+		};
+		for await (const event of streamOpenAICompletions(completionsModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedUrls).toEqual([
+			"https://gateway.example/v1/responses?scope=read&scope=write",
+			"https://gateway.example/v1/chat/completions?scope=read&scope=write",
+		]);
+	});
+	it("uses a configured Azure api-version without synthesizing a duplicate", async () => {
+		const base = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const capturedUrls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			capturedUrls.push(input instanceof Request ? input.url : String(input));
+			return completionsSseResponse();
+		});
+		global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
+
+		const configuredModel: Model<"openai-completions"> = {
+			...base,
+			provider: "proxy",
+			baseUrl: "https://resource.openai.azure.com/openai/v1?api-version=2025-01-01&trace=enabled",
+		};
+		for await (const event of streamOpenAICompletions(configuredModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		const defaultModel: Model<"openai-completions"> = {
+			...base,
+			provider: "proxy",
+			baseUrl: "https://resource.openai.azure.com/openai/v1?trace=enabled",
+		};
+		for await (const event of streamOpenAICompletions(defaultModel, context, { apiKey: "test-key" })) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedUrls).toEqual([
+			"https://resource.openai.azure.com/openai/v1/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01&trace=enabled",
+			"https://resource.openai.azure.com/openai/v1/deployments/gpt-4o-mini/chat/completions?api-version=2024-10-21&trace=enabled",
+		]);
+		expect(new URL(capturedUrls[0]).searchParams.getAll("api-version")).toEqual(["2025-01-01"]);
+		expect(new URL(capturedUrls[1]).searchParams.getAll("api-version")).toEqual(["2024-10-21"]);
+	});
 });

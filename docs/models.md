@@ -36,7 +36,12 @@ equivalence:
     - <provider-id>/<model-id>
 ```
 
-`provider-id` is the canonical provider key used across selection and auth lookup.
+`provider-id` is the stored provider key used in authentication and SDK responses.
+Existing `models.yml` files and extension registrations may use legacy mixed-case,
+spaced, punctuated, or longer keys; GJC preserves stored IDs byte-for-byte and
+does not rewrite them. Q10/Q29 joins use those exact stored IDs. Model selectors
+trim and case-fold provider/model text for lookup; ambiguous case-insensitive matches
+do not guess.
 
 `equivalence` is optional and configures canonical model grouping on top of concrete provider models:
 
@@ -229,13 +234,13 @@ Cancellation discards provisional output and emits exactly one cancelled `agent_
 
 Built-in profiles are grouped by provider mix and tier:
 
-- `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
+- `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort
 - `opencodego` — single OpenCode Go preset (Kimi default, DeepSeek executor/architect, Qwen planner, MiMo critic)
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Combos: `opus-codex`, `codex-opencodego`, and `fable-opus-codex`
 
-The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Terra low/Luna low/Luna high/Terra xhigh/Terra high to default/executor/planner/critic/architect; Medium assigns Sol low/Terra low/Terra high/Sol xhigh/Sol high; Pro assigns Sol medium/Terra medium/Sol high/Sol max/Sol xhigh; and LunaMaxxing assigns Luna medium/Luna max/Luna max/Luna xhigh/Luna max. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` for planner. The descriptive repeated local exact-edit evidence informs only selected executor-style TypeScript tasks; it does not evaluate or prove default, planner, architect, or critic performance. See [GPT-5.6 Codex preset benchmark](./gpt-5.6-codex-preset-benchmark.md). Effort suffixes are clamped to each model's supported thinking range at preview and activation time. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
+The `eco`, `medium`, and `pro` Codex profile mappings are current product judgments: Eco assigns Terra low/Luna low/Luna high/Terra xhigh/Terra high to default/executor/planner/critic/architect; Medium assigns Sol low/Terra low/Terra high/Sol xhigh/Sol high; and Pro assigns Sol medium/Terra medium/Sol high/Sol max/Sol xhigh. `opus-codex` retains the Medium Codex executor, critic, and architect roles but uses `anthropic/claude-sonnet-5` for planner; `codex-opencodego` retains the Medium Codex default and architect roles; and `fable-opus-codex` uses the Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` for planner. The descriptive repeated local exact-edit evidence informs only selected executor-style TypeScript tasks; it does not evaluate or prove default, planner, architect, or critic performance. See [GPT-5.6 Codex preset benchmark](./gpt-5.6-codex-preset-benchmark.md). Effort suffixes are clamped to each model's supported thinking range at preview and activation time. Single-provider tiers pin each provider's current flagship (`zai/glm-5.2`, `kimi-code/kimi-k2.7-code`, `xiaomi/mimo-v2.5-pro`, `xai/grok-4.3`, `cursor/composer-1.5`, `minimax-code/minimax-m3`). User-defined profiles override built-ins by exact profile name.
 
 
 Use `gjc --mpreset <name>` to activate a profile for the current session only. Activation hard-blocks when any provider listed in `required_providers` lacks credentials. Add `--default` to persist the selected profile as `modelProfile.default` in `config.yml`, so it applies at startup:

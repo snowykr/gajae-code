@@ -2911,14 +2911,13 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 through generation 39 process authority hardening", () => {
+	test("keeps wire protocol 3 through generation 37 retiring the native authority binding", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
 		// Generations 34 and 35 add media conversion and topic adoption; generation
-		// 36 bound managed-session replacement to exact native filesystem authority,
-		// generation 37 retired that binding, generation 38 bound exact cleanup to
-		// parent/link-count authority, and generation 39 hardens exact Bash process
-		// ownership without changing the wire protocol.
-		expect(DAEMON_GENERATION).toBe(39);
+		// 36 bound managed-session replacement to exact native filesystem authority
+		// and generation 37 retires that binding (revert of #3489) without changing
+		// the wire protocol.
+		expect(DAEMON_GENERATION).toBe(37);
 	});
 	test.each([
 		"1",

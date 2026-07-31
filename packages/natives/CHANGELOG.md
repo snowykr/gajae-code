@@ -2,8 +2,6 @@
 
 ## [Unreleased]
 
-## [0.12.5] - 2026-07-30
-
 ## [0.12.4] - 2026-07-30
 
 ## [0.12.3] - 2026-07-30
@@ -11,10 +9,6 @@
 ## [0.12.2] - 2026-07-30
 
 ## [0.12.1] - 2026-07-29
-
-### Fixed
-
-- Shell callback delivery now bounds both the core-to-native relay and the 1,024-entry N-API queue with backpressure; the core 8 MiB callback budget retains a UTF-8-safe 64 KiB terminal tail, emits at most one typed aggregate loss marker, reports dropped chunk/byte counts across normal and cancelled runs, and marks merged/raw reader, callback-bridge, or counter uncertainty explicitly.
 
 ## [0.12.0] - 2026-07-28
 ### Fixed

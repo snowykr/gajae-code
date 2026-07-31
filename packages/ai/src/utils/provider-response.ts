@@ -1,4 +1,4 @@
-import type { Api, AttemptScopeRef, Model, ProviderResponseMetadata, StreamOptions } from "../types";
+import type { Api, Model, ProviderResponseMetadata, StreamOptions } from "../types";
 
 export function normalizeProviderResponse(
 	response: Response,
@@ -19,12 +19,12 @@ export function normalizeProviderResponse(
 }
 
 export async function notifyProviderResponse(
-	options: { onResponse?: StreamOptions["onResponse"]; attemptScope?: AttemptScopeRef } | undefined,
+	options: Pick<StreamOptions, "onResponse"> | undefined,
 	response: Response,
 	model?: Model<Api>,
 	requestId?: string | null,
 	metadata?: Record<string, unknown>,
 ): Promise<void> {
 	if (!options?.onResponse) return;
-	await options.onResponse(normalizeProviderResponse(response, requestId, metadata), model, options.attemptScope);
+	await options.onResponse(normalizeProviderResponse(response, requestId, metadata), model);
 }

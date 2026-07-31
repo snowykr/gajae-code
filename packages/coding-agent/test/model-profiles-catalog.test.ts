@@ -53,17 +53,6 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
-		name: "lunamaxxing",
-		requiredProviders: ["openai-codex"],
-		mapping: {
-			default: "openai-codex/gpt-5.6-luna:medium",
-			executor: "openai-codex/gpt-5.6-luna:max",
-			planner: "openai-codex/gpt-5.6-luna:max",
-			critic: "openai-codex/gpt-5.6-luna:xhigh",
-			architect: "openai-codex/gpt-5.6-luna:max",
-		},
-	},
-	{
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
@@ -450,7 +439,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 34-profile matrix cell-for-cell", () => {
+	test("contains exact 33-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);

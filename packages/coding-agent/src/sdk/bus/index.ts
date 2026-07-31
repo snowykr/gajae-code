@@ -32,7 +32,6 @@ import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -61,12 +60,13 @@ import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "..
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
-import { ReverseLeaseError, SessionSdkHost, shouldHostSdk } from "../host";
+import { SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -1967,7 +1967,7 @@ function installedOperations(ctx: ExtensionContext, kind: "control" | "query"): 
 	return new Set(candidates.map(operation => operation.sdkId));
 }
 
-function sdkQuerySurface(
+export function sdkQuerySurface(
 	ctx: ExtensionContext,
 	id: string,
 	api: ExtensionAPI,
@@ -2057,8 +2057,8 @@ function sdkQuerySurface(
 			await Promise.all(
 				[...providers].map(async provider => {
 					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
+						// Availability is advisory; inspect configured credential state without refreshing OAuth or altering session credentials.
+						if (ctx.modelRegistry.hasConfiguredProviderAuth(provider)) authenticatedProviders.add(provider);
 					} catch {
 						// A provider whose credential state cannot be read is not currently configurable.
 					}
@@ -2068,6 +2068,13 @@ function sdkQuerySurface(
 				...item,
 				available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
 			}));
+		},
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders(ctx.model);
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
 		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
@@ -2213,6 +2220,21 @@ function sdkControlSurface(
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
+		const selector = id.trim();
+		const exactMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}` === selector);
+		if (exactMatches.length === 1) return exactMatches[0];
+		if (exactMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
+
+		const normalized = selector.toLowerCase();
+		const caseInsensitiveMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+		if (caseInsensitiveMatches.length === 1) return caseInsensitiveMatches[0];
+		if (caseInsensitiveMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
 		const [provider, ...modelId] = id.split("/");
 		const model =
 			modelId.length > 0
@@ -3258,8 +3280,6 @@ export function createNotificationsExtension(
 				awaitStartup: boolean;
 		  }
 		| undefined;
-	const MAX_SYNTHETIC_SEAM_ADMISSIONS = 64;
-	let syntheticSeamAdmissions = 0;
 	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(
@@ -3569,64 +3589,8 @@ export function createNotificationsExtension(
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
 		let disposeUiAnswerSource: (() => void) | undefined;
-		let fsClientBridge: ClientBridge | undefined;
-		let terminalClientBridge: ClientBridge | undefined;
-		let terminalPublicationFailedLeaseId: string | undefined;
-		const MAX_PENDING_TERMINAL_CREATIONS = 32;
-		let pendingTerminalCreations = 0;
-		let terminalCreationTail = Promise.resolve();
-		const withTerminalCreationAdmission = async <T>(operation: () => Promise<T>): Promise<T> => {
-			if (pendingTerminalCreations >= MAX_PENDING_TERMINAL_CREATIONS)
-				throw new Error("terminal creation admission limit reached");
-			pendingTerminalCreations++;
-			const previous = terminalCreationTail;
-			const release = Promise.withResolvers<void>();
-			terminalCreationTail = previous.then(() => release.promise);
-			try {
-				await previous;
-				return await operation();
-			} finally {
-				pendingTerminalCreations--;
-				release.resolve();
-			}
-		};
-		const providerLeaseIdentities = new Map<
-			string,
-			{ connectionId: string; connectionGeneration: number; fence: string }
-		>();
-		const refreshSdkClientBridge = () => {
-			if (!fsClientBridge && !terminalClientBridge) {
-				ctx.setSdkClientBridge?.(undefined);
-				return;
-			}
-			const bridge: ClientBridge = {
-				capabilities: {
-					readTextFile: fsClientBridge?.capabilities.readTextFile,
-					writeTextFile: fsClientBridge?.capabilities.writeTextFile,
-					terminal: terminalClientBridge?.capabilities.terminal,
-				},
-				deferAgentInitiatedTurns: true,
-			};
-			if (fsClientBridge?.readTextFile) bridge.readTextFile = fsClientBridge.readTextFile;
-			if (fsClientBridge?.writeTextFile) bridge.writeTextFile = fsClientBridge.writeTextFile;
-			if (terminalClientBridge?.quarantineProviderLease)
-				bridge.quarantineProviderLease = terminalClientBridge.quarantineProviderLease;
-			if (terminalClientBridge?.createTerminal) bridge.createTerminal = terminalClientBridge.createTerminal;
-			ctx.setSdkClientBridge?.(bridge);
-		};
-		const installProviderDefinitions = (
-			capability: string,
-			definitions: unknown,
-			leaseId: string,
-			connectionId: string,
-			connectionGeneration: number,
-		) => {
+		const installProviderDefinitions = (capability: string, definitions: unknown) => {
 			validateProviderDefinitions(capability, definitions);
-			providerLeaseIdentities.set(leaseId, {
-				connectionId,
-				connectionGeneration,
-				fence: `${connectionId}:${connectionGeneration}:${leaseId}`,
-			});
 			if (capability === "permission") {
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
 					const result = await host!.reverse.request(
@@ -3664,179 +3628,6 @@ export function createNotificationsExtension(
 				);
 				return;
 			}
-			if (capability === "terminal") {
-				const terminalLeaseId = leaseId;
-				if (!terminalLeaseId) throw new Error("terminal provider lease is unavailable");
-				const terminalProviderIdentity = providerLeaseIdentities.get(terminalLeaseId);
-				if (!terminalProviderIdentity) throw new Error("terminal provider generation is unavailable");
-				if (terminalPublicationFailedLeaseId !== terminalLeaseId) terminalPublicationFailedLeaseId = undefined;
-				const requestTerminal = (
-					method: string,
-					payload: Record<string, unknown>,
-					signal?: AbortSignal,
-					cleanup = false,
-				) =>
-					host!.reverse.request(
-						"terminal",
-						method,
-						payload,
-						signal,
-						terminalLeaseId,
-						cleanup,
-						terminalProviderIdentity.connectionId,
-					);
-				const settleTerminalCleanup = async (
-					method: "terminal.kill" | "terminal.release",
-					terminalId: string,
-				): Promise<boolean> =>
-					await Promise.race([
-						Promise.resolve()
-							.then(() => requestTerminal(method, { terminalId }, AbortSignal.timeout(500), true))
-							.then(
-								() => true,
-								() => false,
-							),
-						Bun.sleep(500).then(() => false),
-					]);
-				terminalClientBridge = {
-					capabilities: { terminal: true },
-					deferAgentInitiatedTurns: true,
-					async quarantineProviderLease(identity, _reason) {
-						if (typeof identity === "string") throw new Error("terminal provider generation is required");
-						if (
-							identity.leaseId !== terminalLeaseId ||
-							identity.connectionId !== terminalProviderIdentity.connectionId ||
-							identity.connectionGeneration !== terminalProviderIdentity.connectionGeneration ||
-							identity.fence !== terminalProviderIdentity.fence
-						)
-							throw new Error("terminal provider lease mismatch");
-						terminalPublicationFailedLeaseId = terminalLeaseId;
-						host!.quarantineProviderLease(identity, "terminal cleanup ownership uncertain");
-					},
-					async createTerminal(params) {
-						return withTerminalCreationAdmission(async () => {
-							if (terminalPublicationFailedLeaseId === terminalLeaseId)
-								throw new Error("terminal provider quarantined after publication failure");
-							if (params.signal?.aborted) throw new Error("terminal creation aborted");
-							const creationAbort = new AbortController();
-							const creationSignal = params.signal
-								? AbortSignal.any([params.signal, creationAbort.signal])
-								: creationAbort.signal;
-							let created: unknown;
-							let creationTimedOut = false;
-							try {
-								created = await Promise.race([
-									requestTerminal(
-										"terminal.create",
-										{
-											command: params.command,
-											...(params.args ? { args: params.args } : {}),
-											...(params.env ? { env: params.env } : {}),
-											...(params.cwd ? { cwd: params.cwd } : {}),
-											...(typeof params.outputByteLimit === "number"
-												? { outputByteLimit: params.outputByteLimit }
-												: {}),
-										},
-										creationSignal,
-									),
-									Bun.sleep(500).then(() => {
-										creationTimedOut = true;
-										creationAbort.abort();
-										throw new Error("terminal creation did not settle within 500ms");
-									}),
-								]);
-							} catch (error) {
-								if (
-									creationSignal.aborted ||
-									(error instanceof ReverseLeaseError && error.code === "payload_too_large")
-								)
-									terminalPublicationFailedLeaseId = terminalLeaseId;
-								if (creationTimedOut) throw new Error("terminal creation did not settle within 500ms");
-								throw error;
-							} finally {
-								creationAbort.abort();
-							}
-							const terminalId =
-								created &&
-								typeof created === "object" &&
-								typeof (created as { terminalId?: unknown }).terminalId === "string"
-									? (created as { terminalId: string }).terminalId
-									: undefined;
-							if (!terminalId) {
-								terminalPublicationFailedLeaseId = terminalLeaseId;
-								throw new Error("terminal provider returned an invalid create response");
-							}
-							const publicationAbort = new AbortController();
-							const publicationSignal = params.signal
-								? AbortSignal.any([params.signal, publicationAbort.signal])
-								: publicationAbort.signal;
-							try {
-								await Promise.race([
-									requestTerminal(
-										"terminal.publish",
-										{ toolCallId: params.toolCallId, terminalId },
-										publicationSignal,
-									),
-									Bun.sleep(500).then(() => {
-										publicationAbort.abort();
-										throw new Error("terminal publication did not settle within 500ms");
-									}),
-								]);
-							} catch (error) {
-								const killed = await settleTerminalCleanup("terminal.kill", terminalId);
-								const released = await settleTerminalCleanup("terminal.release", terminalId);
-								if (!params.signal?.aborted || !killed || !released)
-									terminalPublicationFailedLeaseId = terminalLeaseId;
-								throw error;
-							} finally {
-								publicationAbort.abort();
-							}
-							return {
-								terminalId,
-								providerLeaseId: terminalLeaseId,
-								providerConnectionId: terminalProviderIdentity.connectionId,
-								providerConnectionGeneration: terminalProviderIdentity.connectionGeneration,
-								providerFence: terminalProviderIdentity.fence,
-								async currentOutput() {
-									const output = await requestTerminal("terminal.output", { terminalId });
-									if (
-										!output ||
-										typeof output !== "object" ||
-										typeof (output as { output?: unknown }).output !== "string" ||
-										typeof (output as { truncated?: unknown }).truncated !== "boolean"
-									) {
-										throw new Error("terminal provider returned an invalid output response");
-									}
-									const response = output as { output: string; truncated: boolean; exitStatus?: unknown };
-									return {
-										output: response.output,
-										truncated: response.truncated,
-										exitStatus:
-											response.exitStatus && typeof response.exitStatus === "object"
-												? (response.exitStatus as { exitCode?: number | null; signal?: string | null })
-												: null,
-									};
-								},
-								async waitForExit() {
-									const status = await requestTerminal("terminal.waitForExit", { terminalId });
-									if (!status || typeof status !== "object")
-										throw new Error("terminal provider returned an invalid exit response");
-									const response = status as { exitCode?: number | null; signal?: string | null };
-									return { exitCode: response.exitCode ?? null, signal: response.signal ?? null };
-								},
-								async kill() {
-									await requestTerminal("terminal.kill", { terminalId }, undefined, true);
-								},
-								async release() {
-									await requestTerminal("terminal.release", { terminalId }, undefined, true);
-								},
-							};
-						});
-					},
-				};
-				refreshSdkClientBridge();
-				return;
-			}
 			if (capability !== "fs") return;
 			// Only advertise the methods the client actually declared; a read-only client
 			// must keep using the local write path instead of failing against the bridge.
@@ -3868,17 +3659,11 @@ export function createNotificationsExtension(
 			};
 			if (!canRead) delete bridge.readTextFile;
 			if (!canWrite) delete bridge.writeTextFile;
-			fsClientBridge = bridge;
-			refreshSdkClientBridge();
+			ctx.setSdkClientBridge?.(bridge);
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
-			if (capability === "fs") fsClientBridge = undefined;
-			if (capability === "terminal") {
-				terminalClientBridge = undefined;
-				terminalPublicationFailedLeaseId = undefined;
-			}
-			if (capability === "fs" || capability === "terminal") refreshSdkClientBridge();
+			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 			if (capability === "ui") {
 				disposeUiAnswerSource?.();
 				disposeUiAnswerSource = undefined;
@@ -3886,12 +3671,6 @@ export function createNotificationsExtension(
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();
-		const MAX_PENDING_PROVIDER_RECLAIMS = 64;
-		const pendingProviderReclaims = new Map<
-			string,
-			Array<{ connectionId: string; connectionGeneration: number; frame: Record<string, unknown> }>
-		>();
-		let pendingProviderReclaimCount = 0;
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -4445,8 +4224,7 @@ export function createNotificationsExtension(
 		};
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
-			const cancellation = frame.type === "reverse_cancel";
-			if (!cancellation && (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime)) {
+			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
 				abandonPromptResponse(connectionId, frame);
 				return;
 			}
@@ -4465,15 +4243,13 @@ export function createNotificationsExtension(
 					abandonPromptResponse(connectionId, frame);
 					throw error;
 				}
-				syntheticSeamAdmissions = Math.max(0, syntheticSeamAdmissions - 1);
-				host?.handleDisconnect(connectionId);
 				return;
 			}
 			try {
 				server.sendTo(connectionId, json);
 			} catch (error) {
+				logger.warn(`sdk: directed response delivery failed for ${connectionId}: ${String(error)}`);
 				abandonPromptResponse(connectionId, frame);
-				logger.warn(`sdk: directed response delivery rejected for ${connectionId}: ${String(error)}`);
 				throw error;
 			}
 		};
@@ -4486,13 +4262,6 @@ export function createNotificationsExtension(
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
-			onProviderLeaseRegistered: (lease, connectionGeneration) => {
-				providerLeaseIdentities.set(lease.leaseId, {
-					connectionId: lease.connectionId,
-					connectionGeneration,
-					fence: `${lease.connectionId}:${connectionGeneration}:${lease.leaseId}`,
-				});
-			},
 			onFrame: handler => {
 				inboundSdkFrame = handler;
 				return () => {
@@ -4500,11 +4269,6 @@ export function createNotificationsExtension(
 				};
 			},
 			onRequest: options.onSdkRequest,
-			onFrameOverflow: connectionId => {
-				fencedConnections.add(connectionId);
-				controlSurface.cancelPendingPreflightsForConnection(connectionId);
-				host?.handleDisconnect(connectionId);
-			},
 			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
 				const pending = deferredIdentityRotation;
@@ -4796,47 +4560,6 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
 			} catch {}
 		};
-		const queueExpectedProviderReclaim = (connectionId: string, frame: Record<string, unknown>): boolean => {
-			if (frame.type !== "register_provider") return false;
-			const capability = typeof frame.capability === "string" ? frame.capability : undefined;
-			const expectedLeaseId = typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : undefined;
-			if (!capability || !expectedLeaseId) return false;
-			const lease = host?.reverse.getLease(capability);
-			if (!lease || lease.connectionId === connectionId || lease.leaseId !== expectedLeaseId) return false;
-			if (pendingProviderReclaimCount >= MAX_PENDING_PROVIDER_RECLAIMS) return false;
-			const queued = pendingProviderReclaims.get(lease.connectionId) ?? [];
-			if (typeof frame.id === "string" && queued.some(entry => entry.frame.id === frame.id)) return true;
-			const currentGeneration = host?.connectionGeneration(connectionId) ?? 0;
-			if (currentGeneration <= 0) return false;
-			queued.push({ connectionId, connectionGeneration: currentGeneration, frame });
-			pendingProviderReclaims.set(lease.connectionId, queued);
-			pendingProviderReclaimCount++;
-			return true;
-		};
-		const purgeProviderReclaimsForClaimant = (connectionId: string): void => {
-			for (const [incumbentId, queued] of pendingProviderReclaims) {
-				const retained = queued.filter(entry => entry.connectionId !== connectionId);
-				pendingProviderReclaimCount = Math.max(0, pendingProviderReclaimCount - (queued.length - retained.length));
-				if (retained.length === 0) pendingProviderReclaims.delete(incumbentId);
-				else pendingProviderReclaims.set(incumbentId, retained);
-			}
-		};
-		const drainProviderReclaims = (closedConnectionId: string): void => {
-			const queued = pendingProviderReclaims.get(closedConnectionId);
-			if (!queued) return;
-			pendingProviderReclaims.delete(closedConnectionId);
-			pendingProviderReclaimCount = Math.max(0, pendingProviderReclaimCount - queued.length);
-			for (const entry of queued) {
-				if (
-					initializedRuntime.inboundFenced ||
-					initializedRuntime.stopping ||
-					runtimes.get(id) !== initializedRuntime
-				)
-					continue;
-				if (!host?.isConnectionOpen(entry.connectionId, entry.connectionGeneration)) continue;
-				inboundSdkFrame?.(entry.connectionId, entry.frame);
-			}
-		};
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
@@ -4844,13 +4567,6 @@ export function createNotificationsExtension(
 					const frame = JSON.parse(inbound.json) as unknown;
 					if (!frame || typeof frame !== "object") return;
 					const typedFrame = frame as Record<string, unknown>;
-					if (!host.isConnectionOpen(inbound.connectionId)) {
-						if (host.connectionGeneration(inbound.connectionId) > 0) {
-							sendEndpointStale(inbound.connectionId, typedFrame);
-							return;
-						}
-						host.handleConnect(inbound.connectionId);
-					}
 					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
@@ -4859,7 +4575,6 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
-					if (queueExpectedProviderReclaim(inbound.connectionId, typedFrame)) return;
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
 						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
@@ -4887,16 +4602,11 @@ export function createNotificationsExtension(
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
 				controlSurface.cancelPendingPreflightsForConnection(connectionId);
-				try {
-					host.handleDisconnect(connectionId);
-				} finally {
-					drainProviderReclaims(connectionId);
-				}
+				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
 				// entry keeps the set bounded by live connections instead of growing forever.
 				fencedConnections.delete(connectionId);
-				purgeProviderReclaimsForClaimant(connectionId);
 				// Deliberate deviation from the plan's "claim prompt_failed on old-owner
 				// disconnect": that would break the shipped Q26 reconnect contract, where a
 				// client may drop its socket and reconcile the still-running prompt without
@@ -5177,9 +4887,7 @@ export function createNotificationsExtension(
 									!suspendedRuntime.stopping &&
 									!suspendedRuntime.policySuspended
 								)
-									if (syntheticSeamAdmissions >= MAX_SYNTHETIC_SEAM_ADMISSIONS) return;
-								syntheticSeamAdmissions++;
-								inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+									inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
 							});
 						}
 					}
@@ -5188,8 +4896,6 @@ export function createNotificationsExtension(
 				if (inbound.kind === "control_command") {
 					const frame = sdkInboundFrame(inbound.commandJson);
 					if (frame) {
-						if (syntheticSeamAdmissions >= MAX_SYNTHETIC_SEAM_ADMISSIONS) return;
-						syntheticSeamAdmissions++;
 						inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
 						return;
 					}

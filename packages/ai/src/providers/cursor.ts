@@ -2632,7 +2632,7 @@ function buildGrpcRequest(
 		conversationId: state.conversationId,
 	});
 
-	options?.onPayload?.(runRequest, model, options?.attemptScope);
+	options?.onPayload?.(runRequest);
 
 	// Tools are sent later via requestContext (exec handshake)
 

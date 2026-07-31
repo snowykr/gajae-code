@@ -46,7 +46,6 @@ import {
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
 import { normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
-import type { AttemptRunHandle, AttemptScope, AttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
 import {
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
 	CompactionCancelledError,
@@ -78,7 +77,6 @@ import {
 } from "@gajae-code/agent-core/compaction/pruning";
 import type {
 	AssistantMessage,
-	AttemptScopeRef,
 	Context,
 	DeveloperMessage,
 	Effort,
@@ -115,7 +113,6 @@ import {
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
-import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
 	BTW_MAX_QUESTION_UTF8_BYTES,
@@ -349,12 +346,7 @@ import {
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import type { CheckpointState } from "../tools/checkpoint";
-import {
-	createArtifactFailurePreview,
-	type OutputMeta,
-	outputMeta,
-	wrapToolWithMetaNotice,
-} from "../tools/output-meta";
+import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveReadPath, resolveToCwd } from "../tools/path-utils";
 import { registerResourceGcSession } from "../tools/resource-gc";
 import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
@@ -576,11 +568,7 @@ export interface AgentSessionConfig {
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
 	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
-	transformContext?: (
-		messages: AgentMessage[],
-		signal?: AbortSignal,
-		scope?: AttemptScopeRef,
-	) => AgentMessage[] | Promise<AgentMessage[]>;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider payload hook used by the active session request path */
 	onPayload?: SimpleStreamOptions["onPayload"];
 	/** Provider response hook used by the active session request path */
@@ -1060,102 +1048,6 @@ function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
 	const message = (error instanceof Error ? error.message : String(error)).replace(/\s+/gu, " ").trim();
 	const normalized = message || "unknown storage error";
 	return truncateHeadBytes(normalized, AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES).text;
-}
-
-const PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS = 500;
-const PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES = 2;
-
-type PreAdmissionArtifactSaveOutcome =
-	| { kind: "saved"; saved: Awaited<ReturnType<SessionManager["saveArtifactReceipt"]>> }
-	| { kind: "failed"; error: unknown };
-
-interface PreAdmissionArtifactSaveAdmission {
-	readonly pending: Set<Promise<PreAdmissionArtifactSaveOutcome>>;
-}
-
-/**
- * Pre-admission spills are owned by their concrete SessionManager. A stalled
- * save remains admitted until its promise settles, so timeout does not turn
- * each subsequent tool result into another retained full payload.
- */
-const preAdmissionArtifactSaveAdmissions = new WeakMap<SessionManager, PreAdmissionArtifactSaveAdmission>();
-
-function preAdmissionArtifactSaveAdmissionFor(sessionManager: SessionManager): PreAdmissionArtifactSaveAdmission {
-	let admission = preAdmissionArtifactSaveAdmissions.get(sessionManager);
-	if (!admission) {
-		admission = { pending: new Set() };
-		preAdmissionArtifactSaveAdmissions.set(sessionManager, admission);
-	}
-	return admission;
-}
-
-function beginPreAdmissionArtifactSave(
-	sessionManager: SessionManager,
-	content: string,
-	toolType: string,
-): { kind: "capacity" } | { kind: "started"; outcome: Promise<PreAdmissionArtifactSaveOutcome> } {
-	const admission = preAdmissionArtifactSaveAdmissionFor(sessionManager);
-	if (admission.pending.size >= PRE_ADMISSION_ARTIFACT_MAX_PENDING_SAVES) return { kind: "capacity" };
-
-	let outcome: Promise<PreAdmissionArtifactSaveOutcome>;
-	try {
-		outcome = sessionManager.saveArtifactReceipt(content, toolType).then(
-			saved => ({ kind: "saved" as const, saved }),
-			error => ({ kind: "failed" as const, error }),
-		);
-	} catch (error) {
-		return { kind: "started", outcome: Promise.resolve({ kind: "failed", error }) };
-	}
-	admission.pending.add(outcome);
-	void outcome.then(
-		() => admission.pending.delete(outcome),
-		() => admission.pending.delete(outcome),
-	);
-	return { kind: "started", outcome };
-}
-
-function replaceToolResultWithArtifactFailurePreview(
-	message: ToolResultMessage,
-	fullText: string,
-	maxInlineBytes: number | undefined,
-	diagnostic: string,
-): void {
-	const preview = createArtifactFailurePreview(fullText, maxInlineBytes, diagnostic);
-	const existingDetails =
-		message.details && typeof message.details === "object" ? (message.details as Record<string, unknown>) : {};
-	const existingMeta =
-		existingDetails.meta && typeof existingDetails.meta === "object" ? (existingDetails.meta as OutputMeta) : {};
-	const existingTruncation = existingMeta.truncation;
-	const totalLines = fullText.length > 0 ? fullText.split("\n").length : 0;
-	const outputLines = preview.text.length > 0 ? preview.text.split("\n").length : 0;
-	const outputBytes = Buffer.byteLength(preview.text, "utf-8");
-	const truncation: NonNullable<OutputMeta["truncation"]> = {
-		...(existingTruncation ?? {}),
-		direction: "tail",
-		truncatedBy: "bytes",
-		noticeOwner: undefined,
-		totalLines,
-		totalBytes: Buffer.byteLength(fullText, "utf-8"),
-		outputLines,
-		outputBytes,
-		maxBytes: maxInlineBytes,
-		shownRange: undefined,
-		headRange: undefined,
-		tailRange: undefined,
-		nextOffset: undefined,
-		artifactId: undefined,
-		artifactVerified: false,
-		sourceCaptureIncomplete: true,
-		artifactFailureDiagnostic: diagnostic,
-	};
-	message.details = {
-		...existingDetails,
-		meta: { ...existingMeta, truncation },
-	};
-	message.content = [
-		...message.content.filter((block): block is ImageContent => block.type === "image"),
-		{ type: "text", text: preview.text },
-	];
 }
 
 function summarizeAgentBashArtifactSave(
@@ -2065,12 +1957,6 @@ export class AgentSession {
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
-	#attemptAuthority!: AttemptScopeAuthority;
-	#attemptRecordStore!: AttemptRecordStore;
-	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
-	#acceptRunHandle(handle: AttemptRunHandle): void {
-		this.#activeLogicalRunId = handle.logicalRunId;
-	}
 
 	#turnIndex = 0;
 	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
@@ -2100,11 +1986,7 @@ export class AgentSession {
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
 	#workflowGateToolSession: ToolSession | undefined;
-	#transformContext: (
-		messages: AgentMessage[],
-		signal?: AbortSignal,
-		scope?: AttemptScopeRef,
-	) => AgentMessage[] | Promise<AgentMessage[]>;
+	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
@@ -2629,12 +2511,7 @@ export class AgentSession {
 			// this terminal boundary rather than be overwritten by it.
 			void this.#persistRuntimeStateInBackground(pending);
 			this.#emit(pending);
-			extensionDelivery = this.#queueExtensionEvent(
-				pending,
-				undefined,
-				true,
-				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
-			);
+			extensionDelivery = this.#queueExtensionEvent(pending, undefined, true);
 		};
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
@@ -2699,10 +2576,6 @@ export class AgentSession {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
-		this.#attemptAuthority = this.agent.getAttemptScopeAuthority();
-		this.#attemptRecordStore = new AttemptRecordStore(this.#attemptAuthority);
-		if (this.#extensionRunner && typeof this.#extensionRunner.setAttemptRecordStore === "function")
-			this.#extensionRunner.setAttemptRecordStore(this.#attemptRecordStore);
 		this.#skills = config.skills ?? [];
 		this.#skillWarnings = config.skillWarnings ?? [];
 		this.#customCommands = config.customCommands ?? [];
@@ -2715,10 +2588,7 @@ export class AgentSession {
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
-		const configuredOnPayload = config.onPayload;
-		this.#onPayload = configuredOnPayload
-			? (payload, model, scope) => configuredOnPayload(payload, model, scope)
-			: undefined;
+		this.#onPayload = config.onPayload;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
 		// outer await on `#onResponse` (provider-response.ts) tolerates a sync void return,
@@ -2726,20 +2596,20 @@ export class AgentSession {
 		// shows up as ~3.5% self time in streaming profiles.
 		const configuredOnResponse = config.onResponse;
 		this.#onResponse = configuredOnResponse
-			? async (response, model, scope) => {
+			? async (response, model) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
-					await configuredOnResponse(response, model, scope);
+					await configuredOnResponse(response, model);
 				}
-			: (response, model, _scope) => {
+			: (response, model) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
 				};
 		const configuredOnSseEvent = config.onSseEvent;
 		this.#onSseEvent = configuredOnSseEvent
-			? (event, model, scope) => {
+			? (event, model) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
-					configuredOnSseEvent(event, model, scope);
+					configuredOnSseEvent(event, model);
 				}
-			: (event, model, _scope) => {
+			: (event, model) => {
 					this.rawSseDebugBuffer.recordEvent(event, model);
 				};
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
@@ -3571,7 +3441,6 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		turnGeneration?: number,
 		workerIntegrationSettled = false,
-		scope?: AttemptScopeRef,
 	): Promise<void> {
 		// Streaming events observed after turn_end belong to no live extension turn.
 		// Events already queued before that boundary must drain in FIFO order, unless
@@ -3587,7 +3456,7 @@ export class AgentSession {
 			turnGeneration === undefined || turnGeneration === this.#extensionTurnGeneration;
 		const emit = async () => {
 			if (!belongsToCurrentTurn()) return;
-			await this.#emitExtensionEvent(event, belongsToCurrentTurn, workerIntegrationSettled, scope);
+			await this.#emitExtensionEvent(event, belongsToCurrentTurn, workerIntegrationSettled);
 		};
 		const queued = this.#queuedExtensionEvents.then(emit, emit);
 		this.#queuedExtensionEvents = queued.catch(() => {});
@@ -3696,7 +3565,6 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
-		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
@@ -3721,7 +3589,7 @@ export class AgentSession {
 			this.#emit(event);
 			if (this.#hasStreamingExtensionHandlers()) {
 				__agentSessionPerfCounters.messageUpdateExtensionQueues += 1;
-				void this.#queueExtensionEvent(event, this.#extensionTurnGeneration, false, attemptScope);
+				void this.#queueExtensionEvent(event, this.#extensionTurnGeneration);
 			}
 			return;
 		}
@@ -3778,101 +3646,39 @@ export class AgentSession {
 		const textParts = message.content.flatMap(block => (block.type === "text" ? [block.text] : []));
 		if (textParts.length === 0) return;
 		const fullText = textParts.join("\n");
-		const configuredInlineKiB = this.settings.get("tools.maxInlineResultBytes");
-		const maxInlineBytes =
-			configuredInlineKiB > 0 ? Math.max(1024, Math.floor(configuredInlineKiB * 1024)) : undefined;
-		const totalBytes = Buffer.byteLength(fullText, "utf-8");
-		const exceedsInlineCap = maxInlineBytes !== undefined && totalBytes > maxInlineBytes;
 		const contextWindow = this.model?.contextWindow;
 		const thresholdTokens = Math.min(
 			8_000,
 			contextWindow && contextWindow > 0 ? Math.floor(contextWindow * 0.05) : 8_000,
 		);
-		// The inline byte cap is an independent admission bound and must be checked
-		// before token heuristics can opt this result out of spilling.
-		if (!exceedsInlineCap && (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens))
-			return;
+		if (thresholdTokens <= 0 || estimateTextTokensHeuristic(fullText) <= thresholdTokens) return;
 
-		const saveAdmission = beginPreAdmissionArtifactSave(this.sessionManager, fullText, "tool-result");
-		if (saveAdmission.kind === "capacity") {
-			replaceToolResultWithArtifactFailurePreview(
-				message,
-				fullText,
-				maxInlineBytes,
-				"artifact save capacity exhausted; the previous save is still settling",
-			);
-			return;
-		}
 		try {
-			const saveOutcome = await Promise.race([
-				saveAdmission.outcome,
-				Bun.sleep(PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS).then(() => ({ kind: "timeout" as const })),
-			]);
-			if (saveOutcome.kind !== "saved" || !saveOutcome.saved) {
-				const diagnostic =
-					saveOutcome.kind === "timeout"
-						? `did not settle within ${PRE_ADMISSION_ARTIFACT_SAVE_WAIT_MS}ms`
-						: saveOutcome.kind === "failed"
-							? boundAgentBashArtifactSaveDiagnostic(saveOutcome.error)
-							: "artifact storage is unavailable";
-				replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
-				return;
-			}
-			const saved = saveOutcome.saved;
-			const existingDetails = message.details;
-			const detailRecord =
-				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
-			const existingMeta =
-				detailRecord.meta && typeof detailRecord.meta === "object" ? (detailRecord.meta as OutputMeta) : {};
-			const existingTruncation = existingMeta.truncation;
-			const priorLoss = existingTruncation !== undefined;
+			const artifactId = await this.sessionManager.saveArtifact(fullText, "tool-result");
+			if (!artifactId) return;
 			const digest = crypto.createHash("sha256").update(fullText).digest("hex");
-			const sourceCaptureIncomplete = priorLoss || !saved.complete || undefined;
-			const preview = createPreAdmissionArtifactSpillPreview(fullText, saved.id, digest, {
-				maxInlineBytes,
-				fullOutput: saved.complete && !priorLoss,
-			});
+			const preview = createPreAdmissionArtifactSpillPreview(fullText, artifactId, digest);
 			const spillMeta = outputMeta()
 				.truncationFromText(preview, {
 					direction: "middle",
 					totalLines: fullText.split("\n").length,
-					totalBytes,
-					artifactId: saved.id,
-					artifactVerified: true,
-					sourceCaptureIncomplete,
-					...(maxInlineBytes !== undefined ? { maxBytes: maxInlineBytes } : {}),
+					totalBytes: Buffer.byteLength(fullText, "utf-8"),
+					artifactId,
 				})
 				.get();
-			const spillTruncation = spillMeta?.truncation;
-			const artifactTruncatedBytes =
-				Math.max(existingTruncation?.artifactTruncatedBytes ?? 0, saved.omittedBytes ?? 0) || undefined;
-			const mergedTruncation = spillTruncation
-				? {
-						...existingTruncation,
-						...spillTruncation,
-						artifactId: saved.id,
-						artifactVerified: true,
-						artifactTruncatedBytes,
-						sourceTruncatedBytes: existingTruncation?.sourceTruncatedBytes,
-						sourceCaptureIncomplete,
-						columnDroppedBytes: existingTruncation?.columnDroppedBytes,
-						shownRange: sourceCaptureIncomplete ? undefined : spillTruncation.shownRange,
-						headRange: sourceCaptureIncomplete ? undefined : spillTruncation.headRange,
-						tailRange: sourceCaptureIncomplete ? undefined : spillTruncation.tailRange,
-						nextOffset: sourceCaptureIncomplete ? undefined : spillTruncation.nextOffset,
-					}
-				: existingTruncation;
-			message.details = {
-				...detailRecord,
-				meta: { ...existingMeta, ...spillMeta, truncation: mergedTruncation },
-			};
+			const existingDetails = message.details;
+			const detailRecord =
+				existingDetails && typeof existingDetails === "object" ? (existingDetails as Record<string, unknown>) : {};
+			const existingMeta =
+				detailRecord.meta && typeof detailRecord.meta === "object"
+					? (detailRecord.meta as Record<string, unknown>)
+					: {};
+			message.details = { ...detailRecord, meta: { ...existingMeta, ...spillMeta } };
 			message.content = [
 				...message.content.filter((block): block is ImageContent => block.type === "image"),
 				{ type: "text", text: preview },
 			];
 		} catch (error) {
-			const diagnostic = boundAgentBashArtifactSaveDiagnostic(error);
-			replaceToolResultWithArtifactFailurePreview(message, fullText, maxInlineBytes, diagnostic);
 			logger.warn("Failed to spill oversized tool result before context admission", {
 				toolName: message.toolName,
 				error: error instanceof Error ? error.message : String(error),
@@ -3897,11 +3703,6 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
-		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
-		if ((event.type === "agent_start" || event.type === "turn_start") && attemptScope) {
-			this.#attemptRecordStore.register(attemptScope);
-			this.#attemptRecordStore.establishClean(attemptScope);
-		}
 		if (this.#extensionRunner?.hasHandlers(event.type)) this.#markRetryReplayUnsafe();
 		if (
 			event.type === "tool_execution_start" ||
@@ -4742,8 +4543,7 @@ export class AgentSession {
 								// Reset only after continue() has claimed the queued turn. Skipped or stale
 								// continuations retain predecessor accounting, and resetAttemptBudget keeps
 								// the sticky fallback cursor unchanged.
-								onRunAccepted: (handle: AttemptRunHandle) => {
-									this.#acceptRunHandle(handle);
+								onRunAccepted: () => {
 									settleLease();
 									releasePredecessor();
 									if (startsQueuedSuccessor) {
@@ -5701,200 +5501,163 @@ export class AgentSession {
 		event: AgentSessionEvent,
 		continueWhile?: () => boolean,
 		workerIntegrationSettled = false,
-		scope?: AttemptScopeRef,
 	): Promise<void> {
 		if (event.type === "agent_end" && !workerIntegrationSettled) {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
-		const deliveryScope = scope ?? (event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope;
-		const isTerminalAgentEnd =
-			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
-		const finishAttempt = () => {
-			if (!isTerminalAgentEnd) return;
-			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
-			this.#activeLogicalRunId = undefined;
-		};
-		if (!this.#extensionRunner) {
-			finishAttempt();
-			return;
-		}
-
-		try {
-			if (event.type === "agent_start") {
-				this.#turnIndex = 0;
-				await this.#extensionRunner.emit({ type: "agent_start" }, undefined, deliveryScope);
-			} else if (event.type === "agent_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "agent_end",
-						messages: event.messages,
-						stopReason: event.stopReason,
-					},
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "turn_start") {
-				const hookEvent: TurnStartEvent = {
-					type: "turn_start",
-					turnIndex: this.#turnIndex,
-					timestamp: Date.now(),
-				};
-				await this.#extensionRunner.emit(hookEvent, undefined, deliveryScope);
-			} else if (event.type === "turn_end") {
-				const hookEvent: TurnEndEvent = {
-					type: "turn_end",
-					turnIndex: this.#turnIndex,
+		if (!this.#extensionRunner) return;
+		if (event.type === "agent_start") {
+			this.#turnIndex = 0;
+			await this.#extensionRunner.emit({ type: "agent_start" });
+		} else if (event.type === "agent_end") {
+			await this.#extensionRunner.emit({
+				type: "agent_end",
+				messages: event.messages,
+				stopReason: event.stopReason,
+			});
+		} else if (event.type === "turn_start") {
+			const hookEvent: TurnStartEvent = {
+				type: "turn_start",
+				turnIndex: this.#turnIndex,
+				timestamp: Date.now(),
+			};
+			await this.#extensionRunner.emit(hookEvent);
+		} else if (event.type === "turn_end") {
+			const hookEvent: TurnEndEvent = {
+				type: "turn_end",
+				turnIndex: this.#turnIndex,
+				message: event.message,
+				toolResults: event.toolResults,
+			};
+			await this.#extensionRunner.emit(hookEvent);
+			this.#turnIndex++;
+		} else if (event.type === "message_start") {
+			const extensionEvent: MessageStartEvent = {
+				type: "message_start",
+				message: event.message,
+			};
+			await this.#extensionRunner.emit(extensionEvent);
+		} else if (event.type === "message_update") {
+			const extensionEvent: MessageUpdateEvent = {
+				type: "message_update",
+				message: event.message,
+				assistantMessageEvent: event.assistantMessageEvent,
+			};
+			await this.#extensionRunner.emit(extensionEvent, continueWhile);
+			if (continueWhile && !continueWhile()) return;
+			if (event.assistantMessageEvent.type === "reasoning_summary_start") {
+				const reasoningEvent: ReasoningSummaryStartEvent = {
+					type: "reasoning_summary_start",
 					message: event.message,
-					toolResults: event.toolResults,
+					contentIndex: event.assistantMessageEvent.contentIndex,
 				};
-				await this.#extensionRunner.emit(hookEvent, undefined, deliveryScope);
-				this.#turnIndex++;
-			} else if (event.type === "message_start") {
-				const extensionEvent: MessageStartEvent = {
-					type: "message_start",
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_start")) this.#markRetryReplayUnsafe();
+				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
+			} else if (event.assistantMessageEvent.type === "reasoning_summary_delta") {
+				const reasoningEvent: ReasoningSummaryDeltaEvent = {
+					type: "reasoning_summary_delta",
 					message: event.message,
+					contentIndex: event.assistantMessageEvent.contentIndex,
+					delta: event.assistantMessageEvent.delta,
 				};
-				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
-			} else if (event.type === "message_update") {
-				const extensionEvent: MessageUpdateEvent = {
-					type: "message_update",
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_delta")) this.#markRetryReplayUnsafe();
+				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
+			} else if (event.assistantMessageEvent.type === "reasoning_summary_end") {
+				const reasoningEvent: ReasoningSummaryEndEvent = {
+					type: "reasoning_summary_end",
 					message: event.message,
-					assistantMessageEvent: event.assistantMessageEvent,
+					contentIndex: event.assistantMessageEvent.contentIndex,
+					content: event.assistantMessageEvent.content,
 				};
-				await this.#extensionRunner.emit(extensionEvent, continueWhile, deliveryScope);
-				if (continueWhile && !continueWhile()) return;
-				if (event.assistantMessageEvent.type === "reasoning_summary_start") {
-					const reasoningEvent: ReasoningSummaryStartEvent = {
-						type: "reasoning_summary_start",
-						message: event.message,
-						contentIndex: event.assistantMessageEvent.contentIndex,
-					};
-					if (this.#extensionRunner.hasHandlers("reasoning_summary_start")) this.#markRetryReplayUnsafe();
-					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
-				} else if (event.assistantMessageEvent.type === "reasoning_summary_delta") {
-					const reasoningEvent: ReasoningSummaryDeltaEvent = {
-						type: "reasoning_summary_delta",
-						message: event.message,
-						contentIndex: event.assistantMessageEvent.contentIndex,
-						delta: event.assistantMessageEvent.delta,
-					};
-					if (this.#extensionRunner.hasHandlers("reasoning_summary_delta")) this.#markRetryReplayUnsafe();
-					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
-				} else if (event.assistantMessageEvent.type === "reasoning_summary_end") {
-					const reasoningEvent: ReasoningSummaryEndEvent = {
-						type: "reasoning_summary_end",
-						message: event.message,
-						contentIndex: event.assistantMessageEvent.contentIndex,
-						content: event.assistantMessageEvent.content,
-					};
-					if (this.#extensionRunner.hasHandlers("reasoning_summary_end")) this.#markRetryReplayUnsafe();
-					await this.#extensionRunner.emit(reasoningEvent, continueWhile, deliveryScope);
-				}
-			} else if (event.type === "message_end") {
-				const extensionEvent: MessageEndEvent = {
-					type: "message_end",
-					message: event.message,
-				};
-				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
-			} else if (event.type === "tool_execution_start") {
-				const extensionEvent: ToolExecutionStartEvent = {
-					type: "tool_execution_start",
-					toolCallId: event.toolCallId,
-					toolName: event.toolName,
-					args: event.args,
-					intent: event.intent,
-				};
-				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
-			} else if (event.type === "tool_execution_update") {
-				const extensionEvent: ToolExecutionUpdateEvent = {
-					type: "tool_execution_update",
-					toolCallId: event.toolCallId,
-					toolName: event.toolName,
-					args: event.args,
-					partialResult: event.partialResult,
-				};
-				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
-			} else if (event.type === "tool_execution_end") {
-				const extensionEvent: ToolExecutionEndEvent = {
-					type: "tool_execution_end",
-					toolCallId: event.toolCallId,
-					toolName: event.toolName,
-					result: event.result,
-					isError: event.isError ?? false,
-				};
-				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
-			} else if (event.type === "auto_compaction_start") {
-				await this.#extensionRunner.emit(
-					{ type: "auto_compaction_start", reason: event.reason, action: event.action },
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "auto_compaction_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "auto_compaction_end",
-						action: event.action,
-						result: event.result,
-						aborted: event.aborted,
-						willRetry: event.willRetry,
-						errorMessage: event.errorMessage,
-						skipped: event.skipped,
-						continuationSkipReason: event.continuationSkipReason,
-					},
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "auto_retry_start") {
-				if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
-				await this.#extensionRunner.emit(
-					{
-						type: "auto_retry_start",
-						attempt: event.attempt,
-						maxAttempts: event.maxAttempts,
-						delayMs: event.delayMs,
-						errorMessage: event.errorMessage,
-						unbounded: event.unbounded,
-					},
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "auto_retry_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "auto_retry_end",
-						success: event.success,
-						attempt: event.attempt,
-						finalError: event.finalError,
-					},
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "ttsr_triggered") {
-				await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules }, undefined, deliveryScope);
-			} else if (event.type === "todo_reminder") {
-				await this.#extensionRunner.emit(
-					{
-						type: "todo_reminder",
-						todos: event.todos,
-						attempt: event.attempt,
-						maxAttempts: event.maxAttempts,
-					},
-					undefined,
-					deliveryScope,
-				);
-			} else if (event.type === "goal_updated") {
-				try {
-					await this.#extensionRunner.emit(
-						{ type: "goal_updated", goal: event.goal, state: event.state },
-						undefined,
-						deliveryScope,
-					);
-				} catch (error) {
-					logger.warn("Goal updated extension hook failed", { error: String(error) });
-				}
+				if (this.#extensionRunner.hasHandlers("reasoning_summary_end")) this.#markRetryReplayUnsafe();
+				await this.#extensionRunner.emit(reasoningEvent, continueWhile);
 			}
-		} finally {
-			finishAttempt();
+		} else if (event.type === "message_end") {
+			const extensionEvent: MessageEndEvent = {
+				type: "message_end",
+				message: event.message,
+			};
+			await this.#extensionRunner.emit(extensionEvent);
+		} else if (event.type === "tool_execution_start") {
+			const extensionEvent: ToolExecutionStartEvent = {
+				type: "tool_execution_start",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+				intent: event.intent,
+			};
+			await this.#extensionRunner.emit(extensionEvent);
+		} else if (event.type === "tool_execution_update") {
+			const extensionEvent: ToolExecutionUpdateEvent = {
+				type: "tool_execution_update",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+				partialResult: event.partialResult,
+			};
+			await this.#extensionRunner.emit(extensionEvent);
+		} else if (event.type === "tool_execution_end") {
+			const extensionEvent: ToolExecutionEndEvent = {
+				type: "tool_execution_end",
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				result: event.result,
+				isError: event.isError ?? false,
+			};
+			await this.#extensionRunner.emit(extensionEvent);
+		} else if (event.type === "auto_compaction_start") {
+			await this.#extensionRunner.emit({
+				type: "auto_compaction_start",
+				reason: event.reason,
+				action: event.action,
+			});
+		} else if (event.type === "auto_compaction_end") {
+			await this.#extensionRunner.emit({
+				type: "auto_compaction_end",
+				action: event.action,
+				result: event.result,
+				aborted: event.aborted,
+				willRetry: event.willRetry,
+				errorMessage: event.errorMessage,
+				skipped: event.skipped,
+				continuationSkipReason: event.continuationSkipReason,
+			});
+		} else if (event.type === "auto_retry_start") {
+			if (this.#extensionRunner.hasHandlers("auto_retry_start")) this.#markRetryReplayUnsafe();
+			await this.#extensionRunner.emit({
+				type: "auto_retry_start",
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+				delayMs: event.delayMs,
+				errorMessage: event.errorMessage,
+				unbounded: event.unbounded,
+			});
+		} else if (event.type === "auto_retry_end") {
+			await this.#extensionRunner.emit({
+				type: "auto_retry_end",
+				success: event.success,
+				attempt: event.attempt,
+				finalError: event.finalError,
+			});
+		} else if (event.type === "ttsr_triggered") {
+			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
+		} else if (event.type === "todo_reminder") {
+			await this.#extensionRunner.emit({
+				type: "todo_reminder",
+				todos: event.todos,
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+			});
+		} else if (event.type === "goal_updated") {
+			try {
+				await this.#extensionRunner.emit({
+					type: "goal_updated",
+					goal: event.goal,
+					state: event.state,
+				});
+			} catch (error) {
+				logger.warn("Goal updated extension hook failed", { error: String(error) });
+			}
 		}
 	}
 
@@ -6017,7 +5780,7 @@ export class AgentSession {
 			),
 			Bun.sleep(2_000).then(() => false),
 		]);
-		if (!disposeIdleSettled) this.agent.forceAbort("Session disposed", this.#activeLogicalRunId!);
+		if (!disposeIdleSettled) this.agent.forceAbort("Session disposed");
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
@@ -7401,8 +7164,7 @@ export class AgentSession {
 			this.#assertNoHandoffTransition();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
-				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
+				onRunAccepted: () => {
 					if (hindsightRecall) hindsightState?.markRecallSnippetInjected(hindsightRecall);
 				},
 			});
@@ -7429,32 +7191,20 @@ export class AgentSession {
 	}
 
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
-	async convertMessagesToLlm(
-		messages: AgentMessage[],
-		signal?: AbortSignal,
-		scope?: AttemptScope,
-	): Promise<Message[]> {
-		const transformedMessages =
-			scope === undefined
-				? await this.#transformContext(messages, signal)
-				: await this.#transformContext(messages, signal, scope);
+	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {
+		const transformedMessages = await this.#transformContext(messages, signal);
 		return await this.#convertToLlm(transformedMessages);
 	}
 
 	/** Apply session-level stream hooks to a direct side request. */
-	prepareSimpleStreamOptions(
-		options: SimpleStreamOptions,
-		provider = "anthropic",
-		scope?: AttemptScope,
-	): SimpleStreamOptions {
+	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
 		const sessionOnPayload = this.#onPayload;
 		const sessionOnResponse = this.#onResponse;
 		const sessionMetadata = this.agent.metadataForProvider(provider);
 		const sessionOnSseEvent = this.#onSseEvent;
-		if (!sessionOnPayload && !sessionOnResponse && !sessionMetadata && !sessionOnSseEvent && !scope) return options;
+		if (!sessionOnPayload && !sessionOnResponse && !sessionMetadata && !sessionOnSseEvent) return options;
 
 		const preparedOptions: SimpleStreamOptions = { ...options };
-		if (scope) preparedOptions.attemptScope = scope;
 
 		// Stamp session metadata (e.g. user_id={session_id}) onto direct-call requests so
 		// they share the same session bucket as Agent.prompt-routed requests on Anthropic
@@ -7468,10 +7218,10 @@ export class AgentSession {
 				preparedOptions.onPayload = sessionOnPayload;
 			} else {
 				const requestOnPayload = options.onPayload;
-				preparedOptions.onPayload = async (payload, model, callbackScope) => {
-					const sessionPayload = await sessionOnPayload(payload, model, callbackScope);
+				preparedOptions.onPayload = async (payload, model) => {
+					const sessionPayload = await sessionOnPayload(payload, model);
 					const sessionResolvedPayload = sessionPayload ?? payload;
-					const requestPayload = await requestOnPayload(sessionResolvedPayload, model, callbackScope);
+					const requestPayload = await requestOnPayload(sessionResolvedPayload, model);
 					return requestPayload ?? sessionResolvedPayload;
 				};
 			}
@@ -7482,9 +7232,9 @@ export class AgentSession {
 				preparedOptions.onResponse = sessionOnResponse;
 			} else {
 				const requestOnResponse = options.onResponse;
-				preparedOptions.onResponse = async (response, model, callbackScope) => {
-					await sessionOnResponse(response, model, callbackScope);
-					await requestOnResponse(response, model, callbackScope);
+				preparedOptions.onResponse = async (response, model) => {
+					await sessionOnResponse(response, model);
+					await requestOnResponse(response, model);
 				};
 			}
 		}
@@ -7494,9 +7244,9 @@ export class AgentSession {
 				preparedOptions.onSseEvent = sessionOnSseEvent;
 			} else {
 				const requestOnSseEvent = options.onSseEvent;
-				preparedOptions.onSseEvent = (event, model, callbackScope) => {
-					sessionOnSseEvent(event, model, callbackScope);
-					requestOnSseEvent(event, model, callbackScope);
+				preparedOptions.onSseEvent = (event, model) => {
+					sessionOnSseEvent(event, model);
+					requestOnSseEvent(event, model);
 				};
 			}
 		}
@@ -8543,7 +8293,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
-			onRunAccepted?: (handle: AttemptRunHandle) => void;
+			onRunAccepted?: () => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
 		},
@@ -8769,9 +8519,8 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
-				onRunAccepted: (handle: AttemptRunHandle) => {
-					this.#acceptRunHandle(handle);
-					options?.onRunAccepted?.(handle);
+				onRunAccepted: () => {
+					options?.onRunAccepted?.();
 					options?.admissionLease?.release();
 					if (hindsightRecall) this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 				},
@@ -9894,9 +9643,7 @@ export class AgentSession {
 			]);
 			if (outcome.kind === "timeout") {
 				this.#abandonPostPromptTasks();
-				const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
-				if (forceAbortLogicalRunId !== undefined)
-					this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+				this.agent.forceAbort("Abort cleanup timed out");
 				this.emitNotice(
 					"warning",
 					"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
@@ -14680,7 +14427,7 @@ export class AgentSession {
 							true,
 							() => {
 								terminalized = true;
-								this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+								this.agent.requestRunTerminal(ownership.logicalRunId, {
 									stopReason: "error",
 									messages: [outcome.message],
 								});
@@ -14690,7 +14437,7 @@ export class AgentSession {
 						);
 						if (terminalized || successorScheduled || !ownership.isCurrent() || ownership.lease.signal.aborted)
 							return;
-						this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+						this.agent.requestRunTerminal(ownership.logicalRunId, {
 							stopReason: "error",
 							messages: [outcome.message],
 						});
@@ -15014,7 +14761,7 @@ export class AgentSession {
 					: this.#fallbackExhaustionError(controller);
 				this.emitNotice("error", errorMessage, "fallback");
 				if (managedOutcome && ownership) {
-					this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
+					this.agent.requestRunTerminal(ownership.logicalRunId, {
 						stopReason: "exhausted",
 						messages: [this.#managedFallbackExhaustionMessage(message, errorMessage)],
 					});
@@ -15205,11 +14952,7 @@ export class AgentSession {
 
 	async #promptAgentWithIdleRetry(
 		messages: AgentMessage[],
-		options?: {
-			toolChoice?: ToolChoice;
-			fallbackManaged?: boolean;
-			onRunAccepted?: (handle: AttemptRunHandle) => void;
-		},
+		options?: { toolChoice?: ToolChoice; fallbackManaged?: boolean; onRunAccepted?: () => void },
 		predecessorAgentEndHold?: symbol,
 	): Promise<void> {
 		const deadline = Date.now() + 30_000;
@@ -15974,30 +15717,19 @@ export class AgentSession {
 			!rosterClaim || this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		const prependMessagesValid = () => rosterClaimIsCurrent() && args.prependMessagesValid?.() !== false;
 		const rosterMessage = !callerOwnsRosterClaim && rosterClaimIsCurrent() ? rosterClaim?.message : undefined;
-		let sideAttempt: { scope: AttemptScope; dispose: () => void } | undefined;
 		try {
 			const model = this.model;
 			if (!model) throw new Error("No active model on session");
 			const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, this.sessionId), args.signal);
 			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-			sideAttempt = this.agent.mintSideAttemptScope();
-			const sideScope = sideAttempt.scope;
-			this.#attemptRecordStore.register(sideScope);
-			this.#attemptRecordStore.establishClean(sideScope);
 			const prependMessages = prependMessagesValid()
 				? [...(rosterMessage ? [rosterMessage] : []), ...(args.prependMessages ?? [])]
 				: undefined;
 			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
-			let llmMessages = await awaitEphemeralAbort(
-				this.convertMessagesToLlm(snapshot, args.signal, sideScope),
-				args.signal,
-			);
+			let llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
-				llmMessages = await awaitEphemeralAbort(
-					this.convertMessagesToLlm(snapshot, args.signal, sideScope),
-					args.signal,
-				);
+				llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 			}
 			const context: Context = { systemPrompt: this.systemPrompt, messages: llmMessages, tools: [] };
 			const ephemeralSessionId = crypto.randomUUID();
@@ -16018,7 +15750,6 @@ export class AgentSession {
 					toolChoice: "none",
 				},
 				model.provider,
-				sideScope,
 			);
 			args.signal?.throwIfAborted();
 			let replyText = "";
@@ -16046,10 +15777,6 @@ export class AgentSession {
 			}
 			return { replyText: replyText.trim(), assistantMessage };
 		} finally {
-			if (sideAttempt) {
-				sideAttempt.dispose();
-				this.#attemptRecordStore.retire(sideAttempt.scope);
-			}
 			if (!callerOwnsRosterClaim && rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		}
 	}
@@ -16063,15 +15790,8 @@ export class AgentSession {
 		}
 		const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, credentialSessionId), args.signal);
 		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-		const sideAttempt = this.agent.mintSideAttemptScope();
-		this.#attemptRecordStore.register(sideAttempt.scope);
-		this.#attemptRecordStore.establishClean(sideAttempt.scope);
 		const scope = args.turn.scope;
-		if (!scope) {
-			sideAttempt.dispose();
-			this.#attemptRecordStore.retire(sideAttempt.scope);
-			throw new Error("The /btw conversation scope was scrubbed.");
-		}
+		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
 		const messages = scope.messages.map(message => ({
 			role: message.role,
 			content: [{ type: "text" as const, text: message.text }],
@@ -16104,7 +15824,6 @@ export class AgentSession {
 			requestMaxRetries: 0,
 			streamMaxRetries: 0,
 			streamFirstEventTimeoutMs: 0,
-			attemptScope: sideAttempt.scope,
 		};
 		const iterator = streamSimple(scope.model, context, options)[Symbol.asyncIterator]();
 		let replyText = "";
@@ -16164,8 +15883,6 @@ export class AgentSession {
 			if (idleTimer) clearTimeout(idleTimer);
 			clearTimeout(totalTimer);
 			void iterator.return?.().catch(() => undefined);
-			sideAttempt.dispose();
-			this.#attemptRecordStore.retire(sideAttempt.scope);
 		}
 	}
 

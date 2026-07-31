@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
@@ -34,14 +33,14 @@ beforeEach(() => {
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
-	// Temp dirs live outside the enclosing git work tree (os.tmpdir) so
-	// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
-	// path. Pin a non-computer path so the mandatory computer red-team suite is
-	// not falsely triggered by captureIncomplete or git-command timeouts under
-	// parallel shard load.
+	// These checkpoints create temp dirs inside the enclosing git work tree, so
+	// computeCheckpointChangeSet would otherwise sweep the CI planner's
+	// CI_DEV_CHANGED_PATHS (which includes computer control surface paths on
+	// branches that touch them) into the computed change set and falsely trigger
+	// the mandatory computer red-team suite. Pin it away so the generic gate
+	// fixtures validate their own contract instead of the host branch's diff.
 	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
-	process.env.CI_DEV_CHANGED_PATHS =
-		"packages/coding-agent/test/gjc-runtime/ultragoal-durable-completion-release.test.ts";
+	delete process.env.CI_DEV_CHANGED_PATHS;
 });
 
 afterEach(async () => {
@@ -55,7 +54,7 @@ afterEach(async () => {
 });
 
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-durable-release-"));
+	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-durable-release-"));
 	tempRoots.push(dir);
 	return dir;
 }

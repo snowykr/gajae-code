@@ -2,20 +2,12 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
-import type {
-	AttemptScopeRef,
-	CredentialDisabledEvent,
-	ImageContent,
-	Model,
-	ProviderResponseMetadata,
-} from "@gajae-code/ai";
+import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@gajae-code/ai";
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { AttemptRecordStore } from "../../session/attempt-record-store";
 import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import type {
 	AfterProviderResponseEvent,
@@ -184,7 +176,6 @@ export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#handlersByEvent: Map<string, IndexedHandler[]> = new Map();
-	#attemptRecordStore: AttemptRecordStore | undefined;
 
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -513,27 +504,6 @@ export class ExtensionRunner {
 		return (this.#handlersByEvent.get(eventType)?.length ?? 0) > 0;
 	}
 
-	setAttemptRecordStore(store: AttemptRecordStore): void {
-		this.#attemptRecordStore = store;
-	}
-
-	#markAttemptExecuted(scope: AttemptScopeRef | undefined): void {
-		if (scope !== undefined) this.#attemptRecordStore?.markExecuted(scope as AttemptScope);
-	}
-
-	/**
-	 * Scope-presence guard. When the AttemptScope facility is active but a
-	 * handler-capable delivery lacks a scope, the handler is still delivered
-	 * (backward-compatible) but NO mark is recorded. The record stays
-	 * unknown/missing → `isClean` returns false → admission refuses
-	 * (fail-closed at the decision point, not at delivery).
-	 */
-	#requireScopeOrFailClosed(_scope: AttemptScopeRef | undefined, _eventLabel: string): void {
-		// No throw — handler is delivered (backward-compatible); mark is not
-		// recorded when scope is absent. isClean returns false for an
-		// unmarked scope → admission refuses (fail-closed at decision point).
-	}
-
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
 		for (const ext of this.extensions) {
 			const renderer = ext.messageRenderers.get(customType);
@@ -734,22 +704,15 @@ export class ExtensionRunner {
 	async emit<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
 		continueWhile?: () => boolean,
-		scope?: AttemptScopeRef,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const handlers = this.#handlersByEvent.get(event.type) ?? [];
 		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
-		this.#requireScopeOrFailClosed(scope, event.type);
 
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
 			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 
@@ -768,21 +731,15 @@ export class ExtensionRunner {
 		return result as RunnerEmitResult<TEvent>;
 	}
 
-	async emitToolResult(event: ToolResultEvent, scope?: AttemptScopeRef): Promise<ToolResultEventResult | undefined> {
+	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
 		const handlers = this.#handlersByEvent.get("tool_result") ?? [];
 		if (handlers.length === 0) return undefined;
-		this.#requireScopeOrFailClosed(scope, "tool_result");
 
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			const handlerResult = (await this.#runHandlerWithTimeout(
 				handler,
 				currentEvent,
@@ -815,20 +772,14 @@ export class ExtensionRunner {
 		};
 	}
 
-	async emitToolCall(event: ToolCallEvent, scope?: AttemptScopeRef): Promise<ToolCallEventResult | undefined> {
+	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
 		const handlers = this.#handlersByEvent.get("tool_call") ?? [];
 		if (handlers.length === 0) return undefined;
-		this.#requireScopeOrFailClosed(scope, "tool_call");
 
 		const ctx = this.createContext();
 		let result: ToolCallEventResult | undefined;
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			try {
 				const handlerResult = await handler(event, ctx);
 
@@ -943,10 +894,9 @@ export class ExtensionRunner {
 		return currentText !== text || currentImages !== images ? { text: currentText, images: currentImages } : {};
 	}
 
-	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef): Promise<AgentMessage[]> {
+	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
 		const handlers = this.#handlersByEvent.get("context") ?? [];
 		if (handlers.length === 0) return messages;
-		this.#requireScopeOrFailClosed(scope, "context");
 
 		const ctx = this.createContext();
 		let currentMessages: AgentMessage[];
@@ -958,13 +908,8 @@ export class ExtensionRunner {
 			// return new message arrays rather than mutating in place.
 			currentMessages = [...messages];
 		}
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			const event: ContextEvent = { type: "context", messages: currentMessages };
 			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
@@ -976,23 +921,14 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(
-		payload: unknown,
-		scope?: AttemptScopeRef,
-	): Promise<BeforeProviderRequestEventResult> {
+	async emitBeforeProviderRequest(payload: unknown): Promise<BeforeProviderRequestEventResult> {
 		const handlers = this.#handlersByEvent.get("before_provider_request") ?? [];
 		if (handlers.length === 0) return payload;
-		this.#requireScopeOrFailClosed(scope, "before_provider_request");
 
 		const ctx = this.createContext();
 		let currentPayload = payload;
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			const event: BeforeProviderRequestEvent = {
 				type: "before_provider_request",
 				payload: currentPayload,
@@ -1006,23 +942,13 @@ export class ExtensionRunner {
 		return currentPayload;
 	}
 
-	async emitAfterProviderResponse(
-		response: ProviderResponseMetadata,
-		_model?: Model,
-		scope?: AttemptScopeRef,
-	): Promise<void> {
+	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
 		const handlers = this.#handlersByEvent.get("after_provider_response") ?? [];
 		if (handlers.length === 0) return;
-		this.#requireScopeOrFailClosed(scope, "after_provider_response");
 
 		const ctx = this.createContext();
-		let marked = false;
 
 		for (const { ext, handler } of handlers) {
-			if (!marked) {
-				this.#markAttemptExecuted(scope);
-				marked = true;
-			}
 			const event: AfterProviderResponseEvent = {
 				type: "after_provider_response",
 				status: response.status,

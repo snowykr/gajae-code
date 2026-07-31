@@ -647,7 +647,7 @@ async function buildCodexRequestContext(
 	const url = resolveCodexResponsesUrl(baseUrl);
 	const promptCacheKey = normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options);
-	options?.onPayload?.(transformedBody, model, options?.attemptScope);
+	options?.onPayload?.(transformedBody);
 
 	const requestHeaders = { ...(model.headers ?? {}), ...(options?.headers ?? {}) };
 	const rawRequestDump: RawHttpRequestDump = {
@@ -881,7 +881,7 @@ async function openCodexSseTransport(
 			body,
 			state,
 			requestSetup.requestSignal,
-			event => options?.onSseEvent?.(event, model, options?.attemptScope),
+			event => options?.onSseEvent?.(event, model),
 			options?.fetch,
 			options,
 		),

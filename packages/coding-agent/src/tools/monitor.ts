@@ -51,7 +51,6 @@ const MONITOR_LABEL_MAX = 120;
 const MAX_PENDING_MONITOR_NOTIFICATIONS = 3;
 const MONITOR_NOTIFICATION_LINE_MAX_BYTES = 16 * 1024;
 const MONITOR_NOTIFICATION_LINE_MAX_LINES = 20;
-const PERSISTENT_MONITOR_DEBOUNCE_MS = 250;
 
 function buildMonitorLabel(params: MonitorParams): string {
 	const base = `[monitor:${params.kind}] ${params.description}`;
@@ -125,7 +124,6 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		const controller = { closed: false };
 		let currentJobId = "";
 		let sequence = 0;
-		let flushTimer: NodeJS.Timeout | undefined;
 		let latestLine: string | undefined;
 		let coalescedCount = 0;
 		let flushScheduled = false;
@@ -138,10 +136,6 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			(message.details as { taskId?: string } | undefined)?.taskId === currentJobId;
 		const flushLatest = () => {
 			if (!persistent || latestLine === undefined) return;
-			if (flushTimer) {
-				clearTimeout(flushTimer);
-				flushTimer = undefined;
-			}
 			const line = latestLine;
 			const count = coalescedCount;
 			latestLine = undefined;
@@ -211,7 +205,7 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			coalescedCount += flushScheduled ? 1 : 0;
 			if (flushScheduled) return;
 			flushScheduled = true;
-			flushTimer = setTimeout(flushLatest, PERSISTENT_MONITOR_DEBOUNCE_MS);
+			queueMicrotask(flushLatest);
 		};
 		const monitorJob = await bash.startMonitorJob(
 			{ command: params.command, timeout: params.timeout },

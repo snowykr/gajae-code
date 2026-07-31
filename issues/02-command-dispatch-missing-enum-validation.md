@@ -65,7 +65,3 @@ if (!THINKING_LEVELS.includes(command.level)) {
 
 Apply the same guard for `steeringMode`/`followUpMode` (`all` | `one-at-a-time`)
 and `interruptMode` (`immediate` | `wait`).
-
-## Resolution
-
-**Resolved on current `dev`.** The RPC dispatcher validates thinking, steering, follow-up, and interrupt mode values before applying them.

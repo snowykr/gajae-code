@@ -163,6 +163,34 @@ function resolveOpenAIProviderBaseUrl(
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 }
+function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	endpointQuery: string | undefined;
+} {
+	if (!baseUrl) return { baseUrl, endpointQuery: undefined };
+	try {
+		const url = new URL(baseUrl);
+		const endpointQuery = url.search.slice(1);
+		if (!endpointQuery) return { baseUrl, endpointQuery: undefined };
+		url.search = "";
+		return { baseUrl: url.toString(), endpointQuery };
+	} catch {
+		return { baseUrl, endpointQuery: undefined };
+	}
+}
+
+function wrapFetchWithEndpointQuery(fetchImpl: FetchImpl, endpointQuery: string | undefined): FetchImpl {
+	if (!endpointQuery) return fetchImpl;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			url.search += `${url.search ? "&" : "?"}${endpointQuery}`;
+			if (input instanceof Request) return fetchImpl(new Request(url.toString(), input), init);
+			return fetchImpl(url, init);
+		},
+		fetchImpl.preconnect ? { preconnect: fetchImpl.preconnect } : {},
+	);
+}
 
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAIProviderBaseUrlForTest(
@@ -284,13 +312,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.maxRetryDelayMs,
-				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const { params } = buildParams(model, context, options, providerSessionState, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
-			options?.onPayload?.(params, undefined, options?.attemptScope);
+			options?.onPayload?.(params);
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,
@@ -434,7 +461,6 @@ function createClient(
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	maxRetryDelayMs?: number,
-	attemptScope?: import("../types.js").AttemptScopeRef,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -489,7 +515,8 @@ function createClient(
 		headers.session_id ??= sessionId;
 		headers["x-client-request-id"] ??= sessionId;
 	}
-	const baseFetch = fetchOverride ?? fetch;
+	const { baseUrl: clientBaseUrl, endpointQuery } = splitOpenAIEndpointQuery(baseUrl);
+	const baseFetch = wrapFetchWithEndpointQuery(fetchOverride ?? fetch, endpointQuery);
 	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(baseFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
 		boundedFetch,
@@ -499,12 +526,12 @@ function createClient(
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,
 			fetch: onSseEvent
-				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
+				? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
 				: transformedFetch,
 		}),
 		copilotPremiumRequests,

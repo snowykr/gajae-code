@@ -1,10 +1,6 @@
 # Changelog
 
 ## [Unreleased]
-### Added
-
-- Added the bundled `lunamaxxing` OpenAI Codex profile, mapping every role to GPT-5.6 Luna with medium default reasoning, maximum executor/planner/architect reasoning, and xhigh critic reasoning.
-
 ### Fixed
 
 - Deferred `agent_end` publication again settles public session readiness before slow extension handlers finish, while retaining exact cancellation leases through queued extension delivery and draining that delivery before session shutdown.
@@ -12,19 +8,24 @@
 - Fixture quality gates that complete intermediate Ultragoal stories now write file-backed adversarial artifact proof; skill-state hooks and computer red-team fixtures match the unconditional adversarial path check so #3543 CI stays fail-closed without weakening hydration exactness (#3543).
 - Runtime settings reconciliation now validates every `web_search.fallback` entry against the declared provider enum instead of accepting unsupported or non-string array items (#3601).
 - Ultragoal critic-gate, dogfood, review, durable-completion, and runtime test suites now pin `CI_DEV_CHANGED_PATHS` hermetically in their setup/teardown. Their temp checkpoints live inside the enclosing git work tree, so the CI planner's changed paths (which include computer control surface paths on branches that touch them) previously leaked into the computed change set and falsely triggered the mandatory computer red-team suite (`COMPUTER_REDTEAM_CASE_MISSING: … must include kill-switch-bypass`). The production kill-switch-bypass gate is unchanged; only the test fixtures now isolate their own contract from the host branch's diff (#3533).
-- Ultragoal critic-gate, dogfood, review, durable-completion, and runtime test suites now relocate temp dirs to `os.tmpdir()` (outside the enclosing git work tree) and pin `CI_DEV_CHANGED_PATHS` to a non-computer test path. The prior in-repo temp dirs caused `computeCheckpointChangeSet` to return `captureIncomplete=true` under parallel shard load (git command timeouts), which unconditionally triggered the mandatory computer red-team suite even when no computer surface was touched. The production kill-switch-bypass gate is unchanged; the `.tmp-*` gitignore entry prevents in-repo test artifacts from polluting untracked-file inventory (#3533).
 
 ### Fixed
 
 - Canonical wrapped first-event timeouts now continue the same clean turn through bounded retries and configured fallback rotation, while preserving replay-safety, cancellation, provider-terminal policies, exact attempt diagnostics, and task/subagent retry-status truth (#3553).
 - Runtime skill discovery now preserves a candidate when its exact skill name appears as a query token, so additional task-specific terms no longer discard an explicitly named skill.
+### Added
+- Added the paginated public SDK query `providers.list/active` (Q29), returning deterministic, deduplicated `{ provider, connectionKind }` descriptors for locally eligible providers without exposing credentials or performing remote health probes.
+- Added cross-platform memory-pressure observability with effective host/cgroup limits, configurable GC and restart advisory thresholds, typed Linux process probes, and a Windows Job Object native probe; unsupported lifecycle actions remain advisory-only.
 
-## [0.12.5] - 2026-07-30
 ### Fixed
-
-- ACP and SDK broker session deletion no longer promotes a non-empty retained artifact quarantine to transcript deletion. `cleanup_pending` keeps transcript and exact quarantine authority across retries and restarts while payload bytes survive; root-only transcript preauthorization remains replay-bound and is revalidated after ledger persistence immediately before mutation, while ordinary completion still requires an empty identity-bound root or `artifacts_removed`.
-
-## [0.12.5] - 2026-07-30
+- Post-merge Dev CI: update SDK operation matrix length pins for `model.profile.set` (C53) added by #3191 so registry bijection and control-count gates match the generated inventory.
+- `model.profile.set` now exposes `model_profile_registry_error` to SDK clients when profile activation detects an invalid model registry, and Windows memory-pressure probing uses the compile-safe top-level native loader rather than a function-local CommonJS dependency.
+- Profile availability checks now reject dangling selected credentials even when a runtime or configuration API-key override exists, matching the authoritative profile-activation path without refreshing credentials.
+- First-pass provider discovery now retains the initially resolved command-backed credential when resolution changes its evidence generation, preventing multi-key round-robin from discarding valid discovery results as stale.
+- Descriptor-only provider discovery now retains the first resolved command-backed credential through evidence-generation updates, and malformed tool-call circuit breakers mark their synthetic terminal as non-retryable even for single-model sessions.
+- Keyless providers now take their no-auth fallback before irrelevant selected-credential validation, so dangling selectors cannot make available profiles disagree with activation.
+- Windows memory-pressure sampling now caches the resolved native probe, avoiding repeated native-loader setup work while retaining its unsupported-platform fallback.
+- MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. Both explicit and default MCP startup waits honor that ceiling, so an ACP launch that reaches the readiness cutoff before MCP startup fails fast as pending startup instead of silently crossing its deadline.
 
 ## [0.12.4] - 2026-07-30
 
@@ -61,7 +62,6 @@
 - The interactive `Working…` indicator now remains visible and explicitly labels owner-scoped detached background work across foreground completion, provider errors, pending-submission aborts, and job completion, without resurrecting after TUI disposal (#3479).
 - Activity-indicator suspension now detaches and restores the exact owned loader instead of stopping foreign transition UI; optimistic pre-init prompts still show and clear their spinner, context clear retains its eager teardown contract, and resume cancellation preserves transient state until session mutation actually begins.
 - Activity-indicator stop and suspension helpers now fail safely for lightweight controller contexts with absent or partial status rails, while full interactive contexts retain exact loader detach/restore ownership.
-- Bash now uses bounded core-to-native and N-API callback backpressure plus a 64 KiB terminal tail after the core 8 MiB stream budget, emits at most one typed aggregate loss marker, carries source-loss evidence through merged and raw stream cancellation/error paths, bounds ACP terminal lifecycle/output RPC settlement, cleans settled native sessions, labels every combined omission honestly through inline backstops and failure paths, omits false source ranges, and rejects malformed artifact IDs/counts.
 
 ## [0.12.1] - 2026-07-29
 

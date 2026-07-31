@@ -337,10 +337,7 @@ export async function withGjcTeamMutationFence<T>(dir: string, fn: () => Promise
 	const active = activeTeamMutationFences.getStore();
 	if (active?.has(lockPath)) return await fn();
 	const previous = teamMutationFenceTails.get(lockPath) ?? Promise.resolve();
-	let releaseQueue!: () => void;
-	const queued = new Promise<void>(resolve => {
-		releaseQueue = resolve;
-	});
+	const { promise: queued, resolve: releaseQueue } = Promise.withResolvers<void>();
 	teamMutationFenceTails.set(lockPath, queued);
 	await previous;
 	try {

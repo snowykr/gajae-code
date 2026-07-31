@@ -11,7 +11,6 @@ import {
 } from "@gajae-code/agent-core";
 import {
 	type AssistantMessage,
-	type AttemptScopeRef,
 	type AuthCredentialSelector,
 	type CredentialDisabledEvent,
 	type Message,
@@ -2539,21 +2538,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets()) return converted;
 			return obfuscateMessages(obfuscator, converted);
 		};
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal, scope?: AttemptScopeRef) => {
+		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
 			// External Agent events dispatch listeners without awaiting them. The
 			// session-owned barrier makes any pre-admission artifact transformation
 			// visible before this provider context is normalized.
 			await session?.awaitPendingContextTransformations();
-			return extensionRunner ? await extensionRunner.emitContext(messages, scope) : messages;
+			return extensionRunner ? await extensionRunner.emitContext(messages) : messages;
 		};
 		const onPayload = extensionRunner
-			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef) => {
-					return await extensionRunner.emitBeforeProviderRequest(payload, scope);
+			? async (payload: unknown, _model?: Model) => {
+					return await extensionRunner.emitBeforeProviderRequest(payload);
 				}
 			: undefined;
 		const onResponse: SimpleStreamOptions["onResponse"] | undefined = extensionRunner
-			? async (response, model, scope) => {
-					await extensionRunner.emitAfterProviderResponse(response, model, scope);
+			? async (response, model) => {
+					await extensionRunner.emitAfterProviderResponse(response, model);
 				}
 			: undefined;
 

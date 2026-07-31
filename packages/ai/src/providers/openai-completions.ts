@@ -111,6 +111,34 @@ function resolveOpenAIProviderBaseUrl(
 	}
 	return configuredBaseUrl || envBaseUrl || OPENAI_DEFAULT_BASE_URL;
 }
+function splitOpenAIEndpointQuery(baseUrl: string | undefined): {
+	baseUrl: string | undefined;
+	endpointQuery: string | undefined;
+} {
+	if (!baseUrl) return { baseUrl, endpointQuery: undefined };
+	try {
+		const url = new URL(baseUrl);
+		const endpointQuery = url.search.slice(1);
+		if (!endpointQuery) return { baseUrl, endpointQuery: undefined };
+		url.search = "";
+		return { baseUrl: url.toString(), endpointQuery };
+	} catch {
+		return { baseUrl, endpointQuery: undefined };
+	}
+}
+
+function wrapFetchWithEndpointQuery(fetchImpl: FetchImpl, endpointQuery: string | undefined): FetchImpl {
+	if (!endpointQuery) return fetchImpl;
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			url.search += `${url.search ? "&" : "?"}${endpointQuery}`;
+			if (input instanceof Request) return fetchImpl(new Request(url.toString(), input), init);
+			return fetchImpl(url, init);
+		},
+		fetchImpl.preconnect ? { preconnect: fetchImpl.preconnect } : {},
+	);
+}
 
 /** Test seam: the provider base URL as resolved from trusted env. */
 export function resolveOpenAICompletionsBaseUrlForTest(
@@ -482,7 +510,6 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.requestMaxRetries,
 				options?.sessionId,
 				options?.maxRetryDelayMs,
-				options?.attemptScope,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -505,7 +532,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					effectiveToolStrictModeOverride,
 				);
 				appliedToolStrictMode = toolStrictMode;
-				options?.onPayload?.(params, undefined, options?.attemptScope);
+				options?.onPayload?.(params);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -1024,7 +1051,6 @@ async function createClient(
 	requestMaxRetries?: number,
 	sessionId?: string,
 	maxRetryDelayMs?: number,
-	attemptScope?: import("../types.js").AttemptScopeRef,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -1103,16 +1129,22 @@ async function createClient(
 	}
 	// Azure OpenAI requires /deployments/{id}/chat/completions?api-version=YYYY-MM-DD.
 	// The generic openai-completions path adds neither, producing silent 404s.
+	const { baseUrl: endpointBaseUrl, endpointQuery } = splitOpenAIEndpointQuery(baseUrl);
+	let clientBaseUrl = endpointBaseUrl;
+	// Azure OpenAI requires /deployments/{id}/chat/completions?api-version=YYYY-MM-DD.
+	// The generic openai-completions path adds neither, producing silent 404s.
 	let azureDefaultQuery: Record<string, string> | undefined;
-	if (baseUrl?.includes(".openai.azure.com")) {
+	if (clientBaseUrl?.includes(".openai.azure.com")) {
 		const apiVersion = $env.AZURE_OPENAI_API_VERSION || "2024-10-21";
-		if (!baseUrl.includes("/deployments/")) {
-			baseUrl = `${baseUrl}/deployments/${model.id}`;
+		if (!clientBaseUrl.includes("/deployments/")) {
+			clientBaseUrl = `${clientBaseUrl}/deployments/${model.id}`;
 		}
-		azureDefaultQuery = { "api-version": apiVersion };
+		if (!endpointQuery || !new URLSearchParams(endpointQuery).has("api-version")) {
+			azureDefaultQuery = { "api-version": apiVersion };
+		}
 	}
 	let capturedErrorResponse: CapturedHttpErrorResponse | undefined;
-	const baseFetch = fetchOverride ?? fetch;
+	const baseFetch = wrapFetchWithEndpointQuery(fetchOverride ?? fetch, endpointQuery);
 	const wrappedFetch = Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const response = await baseFetch(input, init);
@@ -1147,7 +1179,7 @@ async function createClient(
 		`Gajae-Code/${packageJson.version}`,
 	);
 	const debugFetch = onSseEvent
-		? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model, attemptScope))
+		? wrapFetchForSseDebug(transformedFetch, event => onSseEvent(event, model))
 		: transformedFetch;
 	// Bound HTTP request timeout to roughly the first-event watchdog window.
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which
@@ -1171,7 +1203,7 @@ async function createClient(
 	return {
 		client: new OpenAI({
 			apiKey,
-			baseURL: baseUrl,
+			baseURL: clientBaseUrl,
 			dangerouslyAllowBrowser: true,
 			maxRetries: resolveRetryBudget(requestMaxRetries, 5),
 			defaultHeaders: headers,

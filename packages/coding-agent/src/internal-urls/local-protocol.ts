@@ -80,32 +80,10 @@ async function listFilesRecursively(rootPath: string): Promise<string[]> {
 
 	return files.sort((a, b) => a.localeCompare(b));
 }
-function localListingLabel(file: string): string {
-	return file.replace(/[\\[\]\r\n]/g, character => {
-		switch (character) {
-			case "\r":
-				return "\\r";
-			case "\n":
-				return "\\n";
-			default:
-				return `\\${character}`;
-		}
-	});
-}
-
-function localListingHref(file: string): string {
-	return file
-		.split("/")
-		.map(component => encodeURIComponent(component).replaceAll("(", "%28").replaceAll(")", "%29"))
-		.join("/");
-}
 
 async function buildListing(url: InternalUrl, localRoot: string): Promise<InternalResource> {
 	const files = await listFilesRecursively(localRoot);
-	const listing =
-		files.length === 0
-			? "(empty)"
-			: files.map(file => `- [${localListingLabel(file)}](local://${localListingHref(file)})`).join("\n");
+	const listing = files.length === 0 ? "(empty)" : files.map(file => `- [${file}](local://${file})`).join("\n");
 	const content =
 		`# Local\n\n` +
 		`Session-scoped scratch space for large intermediate data, subagent handoffs, and reusable planning artifacts.\n\n` +
@@ -125,30 +103,31 @@ async function buildListing(url: InternalUrl, localRoot: string): Promise<Intern
 function extractRelativePath(url: InternalUrl): string {
 	const host = url.rawHost || url.hostname;
 	const pathname = url.rawPathname ?? url.pathname;
-	const encodedAuthority = /^local:\/\/([^/?#]*)/i.exec(url.href)?.[1] ?? "";
-	const validatedHost = host;
-	let decodedPathname = pathname;
+
+	const combined = host
+		? pathname && pathname !== "/"
+			? `${host}${pathname}`
+			: host
+		: pathname && pathname !== "/"
+			? pathname.slice(1)
+			: "";
+
+	if (!combined) {
+		return "";
+	}
+
+	let decoded: string;
 	try {
-		const decodedAuthority = decodeURIComponent(encodedAuthority);
-		if (host && decodedAuthority !== host) throw new Error("authority_mismatch");
-		decodedPathname = decodeURIComponent(pathname.replaceAll("\\", "/"));
+		decoded = decodeURIComponent(combined.replaceAll("\\", "/"));
 	} catch {
 		throw new Error(`Invalid URL encoding in local:// path: ${url.href}`);
 	}
-	const combined = validatedHost
-		? decodedPathname && decodedPathname !== "/"
-			? `${validatedHost}${decodedPathname}`
-			: validatedHost
-		: decodedPathname && decodedPathname !== "/"
-			? decodedPathname.slice(1)
-			: "";
-	if (!combined) return "";
 	try {
-		validateRelativePath(combined);
+		validateRelativePath(decoded);
 	} catch (error) {
 		throw toLocalValidationError(error);
 	}
-	return combined;
+	return decoded;
 }
 
 function safeSessionId(options: LocalProtocolOptions): string {

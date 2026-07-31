@@ -1348,9 +1348,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					dynamicHeaders: copilotDynamicHeaders?.headers,
 					isOAuth: options?.isOAuth,
 					hasTools: !!context.tools?.length,
-					onSseEvent: options?.onSseEvent
-						? event => options.onSseEvent!(event, model, options?.attemptScope)
-						: undefined,
+					onSseEvent: options?.onSseEvent,
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -1388,7 +1386,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (dropFastMode) {
 					dropAnthropicFastMode(nextParams);
 				}
-				const replacementPayload = await options?.onPayload?.(nextParams, model, options?.attemptScope);
+				const replacementPayload = await options?.onPayload?.(nextParams, model);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}
@@ -1491,7 +1489,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					} = await getAnthropicStreamResponse(
 						anthropicRequest,
 						requestSignal,
-						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
+						options?.client ? event => options?.onSseEvent?.(event, model) : undefined,
 					);
 					await notifyProviderResponse(options, response, model, requestId);
 					let sawEvent = false;
