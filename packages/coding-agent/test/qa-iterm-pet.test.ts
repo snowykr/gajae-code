@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
-const runner = join(import.meta.dir, "../scripts/qa-iterm-pet.ts");
+const runner = path.join(import.meta.dir, "../scripts/qa-iterm-pet.ts");
 const expectedSha = "a".repeat(40);
 const versions = ["3.5.0", "3.6.11"];
 const modes = ["direct", "tmux"];
@@ -46,15 +46,15 @@ const firstObject = (value: unknown): Json => {
 	if (!Array.isArray(value) || value.length === 0) throw Error("fixture array is missing");
 	return asObject(value[0]);
 };
-const hash = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
-function fixture() {
-	const dir = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "pet-v2-"));
+const hash = (value: Uint8Array | string) => crypto.createHash("sha256").update(value).digest("hex");
+async function fixture() {
+	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pet-v2-"));
 	const refs: Json[] = [];
-	const put = (path: string, bytes: Buffer, format = "rgba8") => {
-		mkdirSync(join(dir, path, ".."), { recursive: true });
-		writeFileSync(join(dir, path), bytes);
+	const put = async (relativePath: string, bytes: Buffer, format = "rgba8") => {
+		await fs.mkdir(path.join(dir, relativePath, ".."), { recursive: true });
+		await Bun.write(path.join(dir, relativePath), bytes);
 		const sha256 = hash(bytes);
-		refs.push({ path, sha256, format });
+		refs.push({ path: relativePath, sha256, format });
 		return sha256;
 	};
 	const rasterByCapture = new Map<string, string[]>();
@@ -62,8 +62,8 @@ function fixture() {
 	for (const version of versions)
 		for (const mode of modes) {
 			const key = `${version}/${mode}`;
-			const expected = put(`rasters/${version}-${mode}-expected.rgba`, Buffer.alloc(20 * 20 * 4));
-			const after = put(`rasters/${version}-${mode}-after.rgba`, Buffer.alloc(20 * 20 * 4));
+			const expected = await put(`rasters/${version}-${mode}-expected.rgba`, Buffer.alloc(20 * 20 * 4));
+			const after = await put(`rasters/${version}-${mode}-after.rgba`, Buffer.alloc(20 * 20 * 4));
 			const actual: string[] = [];
 			for (let n = 0; n < 8; n++) {
 				const bytes = Buffer.alloc(20 * 20 * 4);
@@ -73,11 +73,11 @@ function fixture() {
 				bytes[2 * 20 * 4 + 3 * 4] = 40;
 				bytes[2 * 20 * 4 + 3 * 4 + 1] = 220;
 				bytes[2 * 20 * 4 + 3 * 4 + 3] = 255;
-				actual.push(put(`rasters/${version}-${mode}-actual-${n}.rgba`, bytes));
+				actual.push(await put(`rasters/${version}-${mode}-actual-${n}.rgba`, bytes));
 			}
 			rasterByCapture.set(key, [expected, after, ...actual]);
 			const bundles: Json[] = [];
-			const bundle = (caseId: string, viewport: string, scroll: string, text: string, range?: number[]) => {
+			const bundle = async (caseId: string, viewport: string, scroll: string, text: string, range?: number[]) => {
 				const base = `captures/${version}/${mode}/${caseId}/${viewport}/${scroll}`;
 				const metadata: Json = {
 					schemaVersion: 2,
@@ -112,12 +112,15 @@ function fixture() {
 					["terminal.html", Buffer.from(`<pre>${text}</pre>`, "utf8")],
 					["metadata.json", Buffer.from(`${JSON.stringify(metadata)}\n`)],
 				];
-				const members = memberBytes.map(([name, bytes]) => ({
-					path: `${base}/${name}`,
-					sha256: put(`${base}/${name}`, bytes, name === "metadata.json" ? "metadata" : name),
-					size: bytes.length,
-					kind: name,
-				}));
+				const members: Json[] = [];
+				for (const [name, bytes] of memberBytes) {
+					members.push({
+						path: `${base}/${name}`,
+						sha256: await put(`${base}/${name}`, bytes, name === "metadata.json" ? "metadata" : name),
+						size: bytes.length,
+						kind: name,
+					});
+				}
 				bundles.push({
 					caseId,
 					viewport,
@@ -130,10 +133,10 @@ function fixture() {
 				});
 			};
 			for (const id of [...petIds, ...(mode === "tmux" ? ["topology-ineligible"] : [])])
-				bundle(id, "80x24", "top", `${id}: pet evidence`);
+				await bundle(id, "80x24", "top", `${id}: pet evidence`);
 			for (const id of Object.keys(cjk)) {
 				for (const viewport of ["80x24", "40x12"])
-					bundle(
+					await bundle(
 						id,
 						viewport,
 						"top",
@@ -141,8 +144,8 @@ function fixture() {
 						id === "cjk-mixed-preview-scroll" ? [1, 21] : undefined,
 					);
 				if (id === "cjk-mixed-preview-scroll") {
-					bundle(id, "80x24", "middle", deterministicCjkBody(cjk[id], [50, 70]), [50, 70]);
-					bundle(id, "80x24", "bottom", deterministicCjkBody(cjk[id], [100, 120]), [100, 120]);
+					await bundle(id, "80x24", "middle", deterministicCjkBody(cjk[id], [50, 70]), [50, 70]);
+					await bundle(id, "80x24", "bottom", deterministicCjkBody(cjk[id], [100, 120]), [100, 120]);
 				}
 			}
 			const states = Object.fromEntries(
@@ -193,11 +196,11 @@ function fixture() {
 		},
 	};
 }
-function run(mutate?: (root: Json, dir: string) => void, sha = expectedSha) {
-	const fixtureValue = fixture();
-	mutate?.(fixtureValue.root, fixtureValue.dir);
-	const input = join(fixtureValue.dir, "capture.json");
-	writeFileSync(input, JSON.stringify(fixtureValue.root));
+async function run(mutate?: (root: Json, dir: string) => void | Promise<void>, sha = expectedSha) {
+	const fixtureValue = await fixture();
+	await mutate?.(fixtureValue.root, fixtureValue.dir);
+	const input = path.join(fixtureValue.dir, "capture.json");
+	await Bun.write(input, JSON.stringify(fixtureValue.root));
 	const output = `${fixtureValue.dir}-published`;
 	const result = Bun.spawnSync([
 		"bun",
@@ -213,16 +216,16 @@ function run(mutate?: (root: Json, dir: string) => void, sha = expectedSha) {
 		"--output",
 		output,
 	]);
-	rmSync(fixtureValue.dir, { recursive: true, force: true });
+	await fs.rm(fixtureValue.dir, { recursive: true, force: true });
 	return result;
 }
 describe("iTerm Pet QA schema v2", () => {
-	it("publishes the complete declared fixture matrix", () => expect(run().exitCode).toBe(0));
-	it("requires an explicit lowercase expected SHA", () => {
-		const result = fixture();
+	it("publishes the complete declared fixture matrix", async () => expect((await run()).exitCode).toBe(0));
+	it("requires an explicit lowercase expected SHA", async () => {
+		const result = await fixture();
 		try {
-			const input = join(result.dir, "capture.json");
-			writeFileSync(input, JSON.stringify(result.root));
+			const input = path.join(result.dir, "capture.json");
+			await Bun.write(input, JSON.stringify(result.root));
 			expect(
 				Bun.spawnSync([
 					"bun",
@@ -234,102 +237,122 @@ describe("iTerm Pet QA schema v2", () => {
 					"--input",
 					input,
 					"--output",
-					join(result.dir, "out"),
+					path.join(result.dir, "out"),
 				]).exitCode,
 			).not.toBe(0);
 		} finally {
-			rmSync(result.dir, { recursive: true, force: true });
+			await fs.rm(result.dir, { recursive: true, force: true });
 		}
 	});
-	it("rejects an altered required member", () =>
+	it("rejects an altered required member", async () =>
 		expect(
-			run((_root, dir) =>
-				writeFileSync(
-					join(dir, "captures", "3.5.0", "direct", "red-idle", "80x24", "top", "terminal.txt"),
-					"altered",
-				),
+			(
+				await run(async (_root, dir) => {
+					await Bun.write(
+						path.join(dir, "captures", "3.5.0", "direct", "red-idle", "80x24", "top", "terminal.txt"),
+						"altered",
+					);
+				})
 			).exitCode,
 		).not.toBe(0));
-	it("rejects a root/capture SHA mismatch", () =>
-		expect(run(root => (firstObject(root.captures).expectedSha = "b".repeat(40))).exitCode).not.toBe(0));
-	it("rejects a classification/source mismatch", () =>
-		expect(run(root => (firstObject(root.captures).source = { kind: "live-pty" })).exitCode).not.toBe(0));
-	it("rejects a CJK scroll range failure", () =>
+	it("rejects a root/capture SHA mismatch", async () =>
 		expect(
-			run((root, dir) => {
-				const capture = firstObject(root.captures);
-				const bundle = asObject(
-					(Array.isArray(capture.bundles) ? capture.bundles : [])
-						.map(asObject)
-						.find(
-							value =>
-								typeof value.caseId === "string" &&
-								value.caseId === "cjk-mixed-preview-scroll" &&
-								value.scroll === "bottom",
-						),
-				);
-				const metadataMember = asObject(
-					(Array.isArray(bundle.members) ? bundle.members : [])
-						.map(asObject)
-						.find(value => typeof value.path === "string" && value.path.endsWith("metadata.json")),
-				);
-				if (typeof metadataMember.path !== "string") throw Error("fixture metadata path is invalid");
-				const metadataPath = join(dir, metadataMember.path);
-				const metadata = asObject(JSON.parse(readFileSync(metadataPath, "utf8")));
-				metadata.scrollRange = [99, 120];
-				const bytes = Buffer.from(`${JSON.stringify(metadata)}\n`);
-				writeFileSync(metadataPath, bytes);
-				metadataMember.sha256 = hash(bytes);
-				metadataMember.size = bytes.length;
-			}).exitCode,
+			(
+				await run(root => {
+					firstObject(root.captures).expectedSha = "b".repeat(40);
+				})
+			).exitCode,
 		).not.toBe(0));
-	it("rejects a recomputed digest for a short CJK scroll body", () =>
+	it("rejects a classification/source mismatch", async () =>
 		expect(
-			run((_root, dir) => {
-				const capture = firstObject((_root as Json).captures);
-				const bundle = asObject(
-					(Array.isArray(capture.bundles) ? capture.bundles : [])
-						.map(asObject)
-						.find(value => value.caseId === "cjk-mixed-preview-scroll" && value.scroll === "bottom"),
-				);
-				for (const name of ["terminal.txt", "terminal-ansi.txt"]) {
+			(
+				await run(root => {
+					firstObject(root.captures).source = { kind: "live-pty" };
+				})
+			).exitCode,
+		).not.toBe(0));
+	it("rejects a CJK scroll range failure", async () =>
+		expect(
+			(
+				await run(async (root, dir) => {
+					const capture = firstObject(root.captures);
+					const bundle = asObject(
+						(Array.isArray(capture.bundles) ? capture.bundles : [])
+							.map(asObject)
+							.find(
+								value =>
+									typeof value.caseId === "string" &&
+									value.caseId === "cjk-mixed-preview-scroll" &&
+									value.scroll === "bottom",
+							),
+					);
+					const metadataMember = asObject(
+						(Array.isArray(bundle.members) ? bundle.members : [])
+							.map(asObject)
+							.find(value => typeof value.path === "string" && value.path.endsWith("metadata.json")),
+					);
+					if (typeof metadataMember.path !== "string") throw Error("fixture metadata path is invalid");
+					const metadataPath = path.join(dir, metadataMember.path);
+					const metadata = asObject(JSON.parse(await Bun.file(metadataPath).text()));
+					metadata.scrollRange = [99, 120];
+					const bytes = Buffer.from(`${JSON.stringify(metadata)}\n`);
+					await Bun.write(metadataPath, bytes);
+					metadataMember.sha256 = hash(bytes);
+					metadataMember.size = bytes.length;
+				})
+			).exitCode,
+		).not.toBe(0));
+	it("rejects a recomputed digest for a short CJK scroll body", async () =>
+		expect(
+			(
+				await run(async (_root, dir) => {
+					const capture = firstObject((_root as Json).captures);
+					const bundle = asObject(
+						(Array.isArray(capture.bundles) ? capture.bundles : [])
+							.map(asObject)
+							.find(value => value.caseId === "cjk-mixed-preview-scroll" && value.scroll === "bottom"),
+					);
+					for (const name of ["terminal.txt", "terminal-ansi.txt"]) {
+						const member = asObject(
+							(Array.isArray(bundle.members) ? bundle.members : [])
+								.map(asObject)
+								.find(value => typeof value.path === "string" && value.path.endsWith(name)),
+						);
+						if (typeof member.path !== "string") throw Error("fixture terminal path is invalid");
+						const filePath = path.join(dir, member.path);
+						const short = (await Bun.file(filePath).text()).split("\n").slice(0, -1).join("\n");
+						const bytes = Buffer.from(short);
+						await Bun.write(filePath, bytes);
+						member.sha256 = hash(bytes);
+						member.size = bytes.length;
+					}
+				})
+			).exitCode,
+		).not.toBe(0));
+	it("rejects disagreeing mode and transport metadata", async () =>
+		expect(
+			(
+				await run(async (_root, dir) => {
+					const capture = firstObject((_root as Json).captures);
+					const bundle = asObject(
+						(Array.isArray(capture.bundles) ? capture.bundles : [])
+							.map(asObject)
+							.find(value => value.caseId === "red-idle"),
+					);
 					const member = asObject(
 						(Array.isArray(bundle.members) ? bundle.members : [])
 							.map(asObject)
-							.find(value => typeof value.path === "string" && value.path.endsWith(name)),
+							.find(value => typeof value.path === "string" && value.path.endsWith("metadata.json")),
 					);
-					if (typeof member.path !== "string") throw Error("fixture terminal path is invalid");
-					const path = join(dir, member.path);
-					const short = readFileSync(path, "utf8").split("\n").slice(0, -1).join("\n");
-					const bytes = Buffer.from(short);
-					writeFileSync(path, bytes);
+					if (typeof member.path !== "string") throw Error("fixture metadata path is invalid");
+					const filePath = path.join(dir, member.path);
+					const metadata = asObject(JSON.parse(await Bun.file(filePath).text()));
+					metadata.mode = "tmux";
+					const bytes = Buffer.from(`${JSON.stringify(metadata)}\n`);
+					await Bun.write(filePath, bytes);
 					member.sha256 = hash(bytes);
 					member.size = bytes.length;
-				}
-			}).exitCode,
-		).not.toBe(0));
-	it("rejects disagreeing mode and transport metadata", () =>
-		expect(
-			run((_root, dir) => {
-				const capture = firstObject((_root as Json).captures);
-				const bundle = asObject(
-					(Array.isArray(capture.bundles) ? capture.bundles : [])
-						.map(asObject)
-						.find(value => value.caseId === "red-idle"),
-				);
-				const member = asObject(
-					(Array.isArray(bundle.members) ? bundle.members : [])
-						.map(asObject)
-						.find(value => typeof value.path === "string" && value.path.endsWith("metadata.json")),
-				);
-				if (typeof member.path !== "string") throw Error("fixture metadata path is invalid");
-				const path = join(dir, member.path);
-				const metadata = asObject(JSON.parse(readFileSync(path, "utf8")));
-				metadata.mode = "tmux";
-				const bytes = Buffer.from(`${JSON.stringify(metadata)}\n`);
-				writeFileSync(path, bytes);
-				member.sha256 = hash(bytes);
-				member.size = bytes.length;
-			}).exitCode,
+				})
+			).exitCode,
 		).not.toBe(0));
 });
