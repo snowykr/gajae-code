@@ -4650,11 +4650,9 @@ export class TUI extends Container {
 			return;
 		}
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
-		const nativeScrollbackAppend = appendedLines && nextLiveViewportTop > prevViewportTop;
 		if (
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
-			!nativeScrollbackAppend &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
 		) {
 			viewportRepaint("changed frame with active raster lease");
@@ -4874,7 +4872,6 @@ export class TUI extends Container {
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
-			!nativeScrollbackAppend &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
 		) {
 			viewportRepaint("streaming append with active raster lease");
@@ -4920,7 +4917,6 @@ export class TUI extends Container {
 		const preserveRasterLeases =
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
-			!nativeScrollbackAppend &&
 			moveTargetRow <= prevViewportBottom &&
 			!newLines.slice(firstChanged, renderEnd + 1).some(line => TERMINAL.isImageLine(line));
 		for (let i = firstChanged; i <= renderEnd; i++) {
