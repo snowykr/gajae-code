@@ -105,6 +105,7 @@ describe("generation-scoped render commits", () => {
 		tui.addChild(text);
 		tui.start();
 		await terminal.waitForRender();
+		terminal.clearWriteLog();
 
 		const lease = await tui.acquireRasterLease({
 			ownerId: "render-commit",
@@ -129,12 +130,13 @@ describe("generation-scoped render commits", () => {
 		text.setText("queued-raster-frame-updated");
 
 		const generation = tui.requestRenderWithGeneration(false, "test.queued-raster");
-		const committed = tui.waitForRenderCommit(generation);
-		releaseBarrier.resolve(true);
+		expect(await tui.waitForRenderCommit(generation, 10)).toBe(false);
+		expect(terminal.getWriteLog().join(" ")).not.toContain("queued-raster-frame-updated");
 
+		releaseBarrier.resolve(true);
 		expect(await raster).toMatchObject({ status: "written" });
-		expect(await committed).toBe(true);
-		expect(terminal.getWriteLog().join(" ")).toContain("queued-raster-frame");
+		expect(await tui.waitForRenderCommit(generation)).toBe(true);
+		expect(terminal.getWriteLog().join(" ")).toContain("queued-raster-frame-updated");
 		tui.stop();
 	});
 
