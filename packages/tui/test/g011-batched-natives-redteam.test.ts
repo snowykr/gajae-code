@@ -1,7 +1,4 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
 	__textHelperPerfCounters,
 	type Component,
@@ -17,7 +14,7 @@ import { ImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
-const REPORT_PATH = join(mkdtempSync(join(tmpdir(), "g011-qa-")), "g011-qa-report.json");
+const REPORT_PATH = "artifacts/g011-qa-report.json";
 const SEGMENT_RESET = "\x1b[0m";
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x1b\\";
 
@@ -318,7 +315,7 @@ describe("G011 batched text natives red-team", () => {
 		});
 	});
 
-	it("writes a temporary QA report", async () => {
+	it("writes artifacts/g011-qa-report.json", async () => {
 		const blockers = cases
 			.filter(entry => entry.verdict === "failed")
 			.map(entry => ({

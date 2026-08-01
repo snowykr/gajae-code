@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import type { AutocompleteItem, AutocompleteProvider } from "@gajae-code/tui/autocomplete";
 import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor";
@@ -21,7 +19,7 @@ type CaseResult = {
 };
 
 const WIDTH = 72;
-const reportPath = join(mkdtempSync(join(tmpdir(), "g014-qa-")), "g014-qa-report.json");
+const reportPath = "artifacts/g014-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
 
 afterEach(() => {
@@ -413,6 +411,7 @@ describe("G014 editor layout cache red-team", () => {
 			artifactRefs: [{ id: "g014-qa-report", kind: "api-package-test-report", description: reportPath }],
 			blockers,
 		};
+		mkdirSync("artifacts", { recursive: true });
 		writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 		expect(results.map(result => result.id)).toEqual([
 			"CURSOR-PARITY-FUZZ",
