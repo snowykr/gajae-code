@@ -1,12 +1,10 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Component, renderMetrics, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 const FLAG = "PI_TUI_VIRTUAL_VIEWPORT";
-const REPORT_PATH = join(mkdtempSync(join(tmpdir(), "g003-qa-")), "g003-qa-report.json");
 const ROWS = 12;
 const OVERSCAN = 8;
 
@@ -169,8 +167,9 @@ describe("G003 virtual viewport adversarial parity QA", () => {
 
 		const passed = cases.filter(c => c.status === "passed").length;
 		const failed = cases.filter(c => c.status === "failed").length;
+		mkdirSync("artifacts", { recursive: true });
 		writeFileSync(
-			REPORT_PATH,
+			join("artifacts", "g003-qa-report.json"),
 			`${JSON.stringify({ schemaVersion: 1, kind: "tui-parity-test-report", cases, summary: { total: cases.length, passed, failed } }, null, 2)}\n`,
 		);
 	});
