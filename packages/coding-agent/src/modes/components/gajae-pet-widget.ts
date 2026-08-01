@@ -659,6 +659,7 @@ export class GajaePetWidget {
 						).join("")}`,
 					),
 				},
+				nativeScrollbackEligible: true,
 				onInvalidated: notice => {
 					if (this.#itermLease === notice.token) {
 						this.#releaseFixedSuffixScrollRegion();

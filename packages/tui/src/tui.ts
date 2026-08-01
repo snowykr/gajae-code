@@ -55,6 +55,7 @@ export type RasterLeaseRequest = Readonly<{
 	rect: CellRect;
 	erase: Readonly<{ type: "raster-erase"; bytes: Uint8Array }>;
 	onInvalidated?: (notice: RasterLeaseInvalidatedNotification) => void;
+	nativeScrollbackEligible?: boolean;
 }>;
 export type TerminalOutputOperation =
 	| Readonly<{ type: "generic-render"; rect: CellRect; bytes: Uint8Array }>
@@ -1002,6 +1003,7 @@ export class TUI extends Container {
 			token: RasterLeaseToken;
 			erase: Uint8Array;
 			callback?: (n: RasterLeaseInvalidatedNotification) => void;
+			nativeScrollbackEligible: boolean;
 			revoked: boolean;
 		}
 	>();
@@ -1809,7 +1811,8 @@ export class TUI extends Container {
 				typeof request.erase !== "object" ||
 				request.erase.type !== "raster-erase" ||
 				!(request.erase.bytes instanceof Uint8Array) ||
-				(request.onInvalidated !== undefined && typeof request.onInvalidated !== "function")
+				(request.onInvalidated !== undefined && typeof request.onInvalidated !== "function") ||
+				(request.nativeScrollbackEligible !== undefined && typeof request.nativeScrollbackEligible !== "boolean")
 			)
 				return { status: "rejected", reason: "invalid-geometry" };
 			if (!this.#validRect(request.rect)) return { status: "rejected", reason: "invalid-geometry" };
@@ -1831,6 +1834,7 @@ export class TUI extends Container {
 				token,
 				erase: new Uint8Array(request.erase.bytes),
 				callback: request.onInvalidated,
+				nativeScrollbackEligible: request.nativeScrollbackEligible === true,
 				revoked: false,
 			});
 			return { status: "acquired", token };
@@ -4768,14 +4772,20 @@ export class TUI extends Container {
 					fixedSuffixScrollRegionRasterLease !== undefined &&
 					this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId)?.token ===
 						fixedSuffixScrollRegionRasterLease));
-		// A fixed suffix owner promises native transcript admission. If its raster
-		// binding is no longer sole/current, erase that exceptional lease through
-		// the protected ingress rather than repainting rows that host history misses.
-		const fixedSuffixScrollbackFallback =
-			fixedSuffixScrollRegionToken !== undefined && appendedLines && !fixedSuffixNativeAppendPreservesRasterLease;
+		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
+		// A verified iTerm lease must yield before an overflow can overwrite a row
+		// that native history has not received. The fixed token covers an armed
+		// owner; the explicit capability covers the pre-arm upload window.
+		const rasterMustYieldForNativeAdmission =
+			appendedLines &&
+			nextLiveViewportTop > prevViewportTop &&
+			!fixedSuffixNativeAppendPreservesRasterLease &&
+			this.#rasterLeases.size > 0 &&
+			this.#rasterCleanup.size === 0 &&
+			(fixedSuffixScrollRegionToken !== undefined || soleRasterLease?.nativeScrollbackEligible === true);
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
-			!fixedSuffixScrollbackFallback &&
+			!rasterMustYieldForNativeAdmission &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
@@ -5066,7 +5076,7 @@ export class TUI extends Container {
 		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
-			!fixedSuffixScrollbackFallback &&
+			!rasterMustYieldForNativeAdmission &&
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
@@ -5113,7 +5123,7 @@ export class TUI extends Container {
 		// Only render changed lines (firstChanged to lastChanged), not all lines to end.
 		// This reduces flicker when only a single line changes (e.g., spinner animation).
 		const preserveRasterLeases =
-			!fixedSuffixScrollbackFallback &&
+			!rasterMustYieldForNativeAdmission &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			moveTargetRow <= prevViewportBottom &&

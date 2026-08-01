@@ -39,6 +39,7 @@ function makeStubs(columns = 80, rows = 30) {
 	const rasterLeaseRequests: Array<{
 		rect: { column: number; row: number; width: number; height: number };
 		erase: { type: string; bytes: Uint8Array };
+		nativeScrollbackEligible?: boolean;
 	}> = [];
 	let delayRasterAcquire = false;
 	const rasterAcquireWaiters: Array<() => void> = [];
@@ -104,8 +105,13 @@ function makeStubs(columns = 80, rows = 30) {
 			ownerId: string;
 			rect: { column: number; row: number; width: number; height: number };
 			erase: { type: string; bytes: Uint8Array };
+			nativeScrollbackEligible?: boolean;
 		}) => {
-			rasterLeaseRequests.push({ rect: request.rect, erase: request.erase });
+			rasterLeaseRequests.push({
+				rect: request.rect,
+				erase: request.erase,
+				nativeScrollbackEligible: request.nativeScrollbackEligible,
+			});
 			const result = {
 				status: "acquired",
 				token: { ownerId: request.ownerId, generation: ++rasterToken, rect: request.rect },
@@ -1319,6 +1325,7 @@ describe("GajaePetWidget", () => {
 			expect(new TextDecoder().decode(lease?.erase.bytes)).toBe(
 				"\x1b[0m\x1b[1;76H\x1b[4X\x1b[2;76H\x1b[4X\x1b[3;76H\x1b[4X",
 			);
+			expect(lease?.nativeScrollbackEligible).toBe(true);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
