@@ -4983,10 +4983,11 @@ export class TUI extends Container {
 				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
 			}
 			fixedSuffixBuffer += "\x1b[r\x1b[?6l";
+			const suffixLinePrefix = fixedSuffixScrollRegionRasterLease === undefined ? "\x1b[2K" : "";
 			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
 				const suffixRow = regionBottom + suffixIndex + 1;
 				const suffixLine = newLines[nextTranscriptLineCount + suffixIndex] ?? "";
-				fixedSuffixBuffer += `\x1b[${suffixRow};1H\x1b[2K${this.#padLineToWidth(suffixLine, width)}`;
+				fixedSuffixBuffer += `\x1b[${suffixRow};1H${suffixLinePrefix}${this.#padLineToWidth(suffixLine, width)}`;
 			}
 			const transcriptDelta = nextTranscriptLineCount - previousTranscriptLineCount;
 			const restoredHardwareCursorRow = this.#hardwareCursorRow + transcriptDelta;
