@@ -911,6 +911,8 @@ export class TUI extends Container {
 	#committedRenderGeneration = 0;
 	#renderCommitWaiters = new Map<number, Set<RenderCommitWaiter>>();
 	#lastRenderWriteSucceeded = false;
+	/** Generation whose render path is currently capturing terminal output. */
+	#renderGenerationInProgress = 0;
 	#resizeRenderQueued = false;
 	#resizeRenderMutationQueued = false;
 	#renderMutationQueued = false;
@@ -2682,7 +2684,9 @@ export class TUI extends Container {
 				this.#lastRenderAt = performance.now();
 				this.#lastRenderWriteSucceeded = false;
 				const t0 = renderMetrics.now();
+				this.#renderGenerationInProgress = requestedGeneration;
 				this.#doRender();
+				this.#renderGenerationInProgress = 0;
 				this.#commitRenderGeneration(requestedGeneration);
 				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			});
@@ -2725,7 +2729,9 @@ export class TUI extends Container {
 			this.#lastRenderAt = performance.now();
 			this.#lastRenderWriteSucceeded = false;
 			const t0 = renderMetrics.now();
+			this.#renderGenerationInProgress = requestedGeneration;
 			this.#doRender();
+			this.#renderGenerationInProgress = 0;
 			this.#commitRenderGeneration(requestedGeneration);
 			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			if (this.#renderRequested) {
@@ -2755,7 +2761,9 @@ export class TUI extends Container {
 		this.#lastRenderAt = performance.now();
 		this.#lastRenderWriteSucceeded = false;
 		const t0 = renderMetrics.now();
+		this.#renderGenerationInProgress = requestedGeneration;
 		this.#doRender();
+		this.#renderGenerationInProgress = 0;
 		this.#commitRenderGeneration(requestedGeneration);
 		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 	}
@@ -4625,16 +4633,17 @@ export class TUI extends Container {
 			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
+		const nextLiveViewportTop = Math.max(0, newLines.length - height);
+		const nativeScrollbackAppend = appendedLines && nextLiveViewportTop > prevViewportTop;
 		if (
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
+			!nativeScrollbackAppend &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
 		) {
 			viewportRepaint("changed frame with active raster lease");
 			return;
 		}
-
-		const nextLiveViewportTop = Math.max(0, newLines.length - height);
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
@@ -4868,6 +4877,7 @@ export class TUI extends Container {
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
+			!nativeScrollbackAppend &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
 		) {
 			viewportRepaint("streaming append with active raster lease");
@@ -4913,6 +4923,7 @@ export class TUI extends Container {
 		const preserveRasterLeases =
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
+			!nativeScrollbackAppend &&
 			moveTargetRow <= prevViewportBottom &&
 			!newLines.slice(firstChanged, renderEnd + 1).some(line => TERMINAL.isImageLine(line));
 		for (let i = firstChanged; i <= renderEnd; i++) {
@@ -5158,10 +5169,12 @@ export class TUI extends Container {
 		const writeIngress = preserveRasterLeases
 			? (bytes: string) => this.#writeRasterPreservingRenderIngress(bytes)
 			: (bytes: string) => this.#writeProtectedRenderIngress(bytes);
+		const renderGeneration = this.#renderGenerationInProgress;
 		const write = () => {
 			if (!writeIngress(buffer)) return false;
 			onBufferWritten?.();
 			this.#lastRenderWriteSucceeded = true;
+			if (renderGeneration > 0) this.#settleRenderCommitWaiters(true, renderGeneration);
 			const emission = this.#postRenderEmitter?.();
 			if (emission) {
 				const overlay = typeof emission === "string" ? emission : emission.payload;
