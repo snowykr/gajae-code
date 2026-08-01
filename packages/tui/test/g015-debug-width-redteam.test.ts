@@ -1,11 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { type Component, TUI } from "@gajae-code/tui";
 import { Ellipsis, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
 import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
-const REPORT_PATH = "artifacts/g015-qa-report.json";
+const REPORT_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "g015-qa-")), "g015-qa-report.json");
 const originalTabWidth = getDefaultTabWidth();
 
 type CaseResult = {
@@ -207,7 +209,6 @@ afterEach(() => {
 });
 
 afterAll(async () => {
-	await fs.promises.mkdir("artifacts", { recursive: true });
 	await fs.promises.writeFile(REPORT_PATH, `${JSON.stringify(makeReport(), null, "\t")}\n`);
 });
 

@@ -62,8 +62,12 @@ describe("generation-scoped render commits", () => {
 		setTerminalImageProtocol(null);
 		const terminal = new SecondWriteFailureTerminal(40, 8);
 		const tui = new TUI(terminal, true);
+		let overlayWrites = 0;
 		tui.addChild(new Text("overlay-frame", 1, 0));
-		tui.setPostRenderEmitter(() => "\x1b[?25l");
+		tui.setPostRenderEmitter(() => ({
+			payload: "\x1b[?25l",
+			onWritten: () => overlayWrites++,
+		}));
 
 		try {
 			tui.start();
@@ -71,10 +75,26 @@ describe("generation-scoped render commits", () => {
 
 			expect(await tui.waitForRenderCommit(generation)).toBe(true);
 			expect(tui.terminalAvailable).toBe(false);
+			expect(overlayWrites).toBe(0);
 		} finally {
 			tui.stop();
 			setTerminalImageProtocol(previousImageProtocol);
 		}
+	});
+	it("runs queued-output delivery callbacks at the terminal write boundary", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const events: string[] = [];
+		tui.start();
+
+		await tui
+			.queueTerminalOutput("queued-overlay", {
+				onWritten: () => events.push("written"),
+			})
+			.then(() => events.push("ack"));
+
+		expect(events).toEqual(["written", "ack"]);
+		tui.stop();
 	});
 
 	it("fails open immediately after the renderer is stopped", async () => {
