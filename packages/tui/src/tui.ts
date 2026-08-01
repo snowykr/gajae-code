@@ -1123,6 +1123,22 @@ export class TUI extends Container {
 			terminalGeneration: this.#terminalGeneration,
 		});
 	}
+	#flushRasterLeasesBeforeStop(cause: RasterLeaseInvalidatedNotification["cause"]): void {
+		this.#revokeRasterLeases(cause);
+		for (const [owner, record] of this.#rasterCleanup) {
+			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(record.erase));
+			if (!this.#writeTerminal(erase)) return;
+			this.#rasterCleanup.delete(owner);
+			record.callback?.({
+				type: "raster-lease-invalidated",
+				queueId: record.queueId,
+				token: record.token,
+				cause: record.cause,
+				eraseAck: { queueId: record.queueId, operation: "raster-erase", status: "written", token: record.token },
+			});
+		}
+		this.flushTerminalCleanup();
+	}
 
 	get fullRedraws(): number {
 		return this.#fullRedrawCount;
@@ -2454,7 +2470,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
-		this.#finalizeRasterLeases("terminal-loss");
+		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
 		if (placementCleanup.length > 0 && this.#writeTerminal(placementCleanup)) this.#kittyPlacementSpans = [];
 		this.#clearSixelProbeState();
