@@ -420,7 +420,7 @@ describe("TUI raster lease public boundary", () => {
 		expect(calls).toBe(0);
 		tui.stop();
 	});
-	it("releases a raster lease before a streaming append enters native scrollback", async () => {
+	it("repaints streaming overflow around the lease without erasing or re-uploading it", async () => {
 		const { tui, terminal } = await setup();
 		let lines = ["one", "two", "three", "four"];
 		let calls = 0;
@@ -437,10 +437,12 @@ describe("TUI raster lease public boundary", () => {
 		await terminal.waitForRender();
 
 		const output = terminal.getWriteLog().join("");
-		expect(output).toContain("ERASE");
-		expect(output).toContain("\r\n");
-		expect(terminal.getScrollBuffer().map(line => line.trim())).toContain("one");
-		expect(calls).toBe(1);
+		expect(output).not.toContain("ERASE");
+		expect(output).not.toContain("\r\n");
+		expect(output).toContain("\x1b[1G\x1b[8X");
+		expect(output).toContain("\x1b[1;1H");
+		expect(output).toContain("\x1b[4;1H");
+		expect(calls).toBe(0);
 		tui.stop();
 	});
 	it("repaints rewritten streaming output without scrolling an active raster", async () => {
