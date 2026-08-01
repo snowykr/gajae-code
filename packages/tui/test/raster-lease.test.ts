@@ -112,6 +112,22 @@ describe("TUI raster lease public boundary", () => {
 		await Promise.all([prior, successor]);
 		expect(terminal.getWriteLog()).toEqual(["PRIOR", "PET_CLEANUP", "SUCCESSOR"]);
 	});
+	it("erases an active raster lease before terminal teardown", async () => {
+		const { tui, terminal } = await setup();
+		let invalidated = 0;
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease(request("stop", rect(8, 3, 2, 1), "ERASE", () => invalidated++));
+		expect(lease.status).toBe("acquired");
+		terminal.clearWriteLog();
+
+		tui.stop();
+
+		const output = terminal.getWriteLog().join("");
+		expect(output).toContain("ERASE");
+		expect(output.indexOf("ERASE")).toBeLessThan(output.indexOf("\x1b[?2004l"));
+		expect(invalidated).toBe(1);
+	});
 	it("refreshes cell metrics when a raster lease is revoked by resize", async () => {
 		setTerminalImageProtocol(null);
 		const { tui, terminal } = await setup();
