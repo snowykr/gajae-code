@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, TUI } from "@gajae-code/tui";
+import { type Component, CURSOR_MARKER, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class LinesComponent implements Component {
@@ -18,7 +18,7 @@ class LinesComponent implements Component {
 
 function createPinnedTui(
 	rows = 5,
-	transcriptLines = ["line-1", "line-2", "line-3"],
+	transcriptLines = ["line-1", `line-2${CURSOR_MARKER}`, "line-3"],
 ): { term: VirtualTerminal; transcript: LinesComponent; tui: TUI } {
 	const term = new VirtualTerminal(40, rows);
 	const tui = new TUI(term);
@@ -39,7 +39,7 @@ describe("TUI fixed suffix scroll region", () => {
 			const token = tui.acquireFixedSuffixScrollRegion("test-owner");
 			expect(token).toBeDefined();
 			if (token === undefined) throw new Error("Expected fixed suffix token");
-			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			transcript.setLines(["line-1", `line-2${CURSOR_MARKER}`, "line-3", "line-4"]);
 			term.clearWriteLog();
 			expect(tui.armFixedSuffixScrollRegion(token)).toBeGreaterThan(0);
 			await term.waitForRender();
@@ -51,6 +51,7 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(output).toContain("\x1b[5;1H\x1b[2Kcomposer");
 			expect(output).toContain("\x1b8");
 			expect(output).toContain("\x1b[?2026l");
+			expect(output).toContain("\x1b[1A");
 			expect(output).not.toContain("\r\nline-4");
 			await term.flush();
 			expect(term.getViewport().map(line => line.trimEnd())).toEqual([
@@ -129,5 +130,16 @@ describe("TUI fixed suffix scroll region", () => {
 		} finally {
 			tui.stop();
 		}
+	});
+	it("does not acquire or arm a fixed suffix owner after stop", async () => {
+		const { term, tui } = createPinnedTui();
+		tui.start();
+		await term.waitForRender();
+		const token = tui.acquireFixedSuffixScrollRegion("test-owner");
+		expect(token).toBeDefined();
+		if (token === undefined) throw new Error("Expected fixed suffix token");
+		tui.stop();
+		expect(tui.acquireFixedSuffixScrollRegion("new-owner")).toBeUndefined();
+		expect(tui.armFixedSuffixScrollRegion(token)).toBeUndefined();
 	});
 });

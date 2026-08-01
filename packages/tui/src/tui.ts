@@ -1278,6 +1278,7 @@ export class TUI extends Container {
 			typeof ownerId !== "string" ||
 			ownerId.trim().length === 0 ||
 			!this.terminalAvailable ||
+			this.#stopped ||
 			this.manualViewportActive ||
 			this.#bottomPinnedComponent === null ||
 			this.#fixedSuffixScrollRegionOwners.size > 0
@@ -1304,6 +1305,7 @@ export class TUI extends Container {
 		if (
 			this.#fixedSuffixScrollRegionOwners.get(token.ownerId) !== token ||
 			!this.terminalAvailable ||
+			this.#stopped ||
 			this.manualViewportActive ||
 			this.#bottomPinnedComponent === null
 		)
@@ -4968,10 +4970,7 @@ export class TUI extends Container {
 				fixedSuffixBuffer += `\x1b[${suffixRow};1H\x1b[2K${this.#padLineToWidth(suffixLine, width)}`;
 			}
 			const transcriptDelta = nextTranscriptLineCount - previousTranscriptLineCount;
-			const restoredHardwareCursorRow =
-				this.#hardwareCursorRow >= previousTranscriptLineCount
-					? this.#hardwareCursorRow + transcriptDelta
-					: this.#hardwareCursorRow;
+			const restoredHardwareCursorRow = this.#hardwareCursorRow + transcriptDelta;
 			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, restoredHardwareCursorRow);
 			fixedSuffixBuffer += `\x1b8${seq}\x1b[?2026l`;
 			this.#fixedSuffixScrollRegionResetPending = true;
