@@ -4723,6 +4723,7 @@ export class TUI extends Container {
 			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
+
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
 		if (
 			this.#rasterLeases.size > 0 &&

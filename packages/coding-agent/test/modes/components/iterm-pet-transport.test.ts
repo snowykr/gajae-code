@@ -349,7 +349,10 @@ describe("iTerm Pet transport", () => {
 		expect(split(ack)).toEqual({ consume: true });
 		expect(split("\x1b]1337;Cap")).toEqual({ consume: true });
 		expect(split("abilities=F\x07")).toEqual({ consume: true });
+<<<<<<< HEAD
 		expect(split("\x1b")).toEqual({ data: "\x1b" });
+=======
+>>>>>>> 074002d17 (feat(tui): add stable iTerm2 pet rendering)
 	});
 
 	it("classifies completed replies as missing F only when syntax is valid", async () => {
