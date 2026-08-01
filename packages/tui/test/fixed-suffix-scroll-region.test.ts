@@ -131,6 +131,39 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
+	it("releases an ineligible raster lease before admitting a fixed-suffix append", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "other-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+			});
+			expect(lease.status).toBe("acquired");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			term.clearWriteLog();
+			expect(tui.armFixedSuffixScrollRegion(token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).toContain("ITERM_ERASE");
+			expect(output).toContain("\x1b[1;3r");
+			expect(output).toContain("\x1bD\r\x1b[2Kline-4");
+			expect(invalidated).toBe(1);
+			await term.flush();
+			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-1");
+		} finally {
+			tui.stop();
+		}
+	});
 	it("uses the existing renderer unless a current owner arms the fixed suffix region", async () => {
 		const { term, transcript, tui } = createPinnedTui();
 		try {

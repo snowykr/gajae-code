@@ -4768,8 +4768,14 @@ export class TUI extends Container {
 					fixedSuffixScrollRegionRasterLease !== undefined &&
 					this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId)?.token ===
 						fixedSuffixScrollRegionRasterLease));
+		// A fixed suffix owner promises native transcript admission. If its raster
+		// binding is no longer sole/current, erase that exceptional lease through
+		// the protected ingress rather than repainting rows that host history misses.
+		const fixedSuffixScrollbackFallback =
+			fixedSuffixScrollRegionToken !== undefined && appendedLines && !fixedSuffixNativeAppendPreservesRasterLease;
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
+			!fixedSuffixScrollbackFallback &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
@@ -4976,14 +4982,17 @@ export class TUI extends Container {
 			}
 			return;
 		}
-		if (fixedSuffixNativeAppendPreservesRasterLease) {
+		if (fixedSuffixNativeAppend) {
 			const regionBottom = height - nextSuffixLineCount;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
 			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
 				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
 			}
 			fixedSuffixBuffer += "\x1b[r\x1b[?6l";
-			const suffixLinePrefix = fixedSuffixScrollRegionRasterLease === undefined ? "\x1b[2K" : "";
+			const suffixLinePrefix =
+				fixedSuffixNativeAppendPreservesRasterLease && fixedSuffixScrollRegionRasterLease !== undefined
+					? ""
+					: "\x1b[2K";
 			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
 				const suffixRow = regionBottom + suffixIndex + 1;
 				const suffixLine = newLines[nextTranscriptLineCount + suffixIndex] ?? "";
@@ -5012,7 +5021,7 @@ export class TUI extends Container {
 						this.#manualSuffixLineCount = nextSuffixLineCount;
 						this.#refreshPaintedLiveViewportObservation(height);
 					},
-					fixedSuffixScrollRegionRasterLease !== undefined,
+					fixedSuffixNativeAppendPreservesRasterLease,
 				)
 			)
 				return;
@@ -5057,6 +5066,7 @@ export class TUI extends Container {
 		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
+			!fixedSuffixScrollbackFallback &&
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
@@ -5103,6 +5113,7 @@ export class TUI extends Container {
 		// Only render changed lines (firstChanged to lastChanged), not all lines to end.
 		// This reduces flicker when only a single line changes (e.g., spinner animation).
 		const preserveRasterLeases =
+			!fixedSuffixScrollbackFallback &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			moveTargetRow <= prevViewportBottom &&
