@@ -25,7 +25,11 @@ import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-image-loading";
-import { formatPastedImageReference, parsePastedImagePaths } from "../../utils/pasted-image-path";
+import {
+	decodePastedPathCandidate,
+	formatPastedImageReference,
+	parsePastedImagePaths,
+} from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -51,6 +55,11 @@ export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
+const ITERM_PET_DRAG_PATH_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T\/iTerm2\.[A-Za-z0-9]+\.gajae-pet\.gif$/;
+
+function isItermPetDragPaste(text: string): boolean {
+	return ITERM_PET_DRAG_PATH_PATTERN.test(decodePastedPathCandidate(text) ?? "");
+}
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
 interface InputControllerDependencies {
@@ -1611,6 +1620,10 @@ export class InputController {
 
 	handleTextPaste(text: string, context: PasteTextContext): boolean | Promise<boolean> {
 		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
+		if (isItermPetDragPaste(text)) {
+			this.ctx.showStatus("Ignored dragged Gajae Pet image.", { dim: true });
+			return true;
+		}
 		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
 		if (!parsed) return false;
 		if (parsed.kind === "too-many") {

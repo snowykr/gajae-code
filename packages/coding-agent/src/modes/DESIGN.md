@@ -16,6 +16,126 @@ Source material:
 - `../theme/theme.ts` and `../shared.ts`
 - `packages/tui/src/components/tab-bar.ts`, `settings-list.ts`, `select-list.ts`,
   and `input.ts`
+- `components/gajae-pet-widget.ts`, `components/iterm-pet-transport.ts`, and
+  `components/pet-capability.ts`
+- `packages/tui/src/components/gajae-pet.ts` and the terminal capability
+  transport APIs
+- `test/gajae-pet-widget.test.ts` for focused placement and cleanup invariants
+
+## Corrective iTerm Pet guidance
+
+This section is **corrective first-party design documentation** for the selected
+workflow branch. It records the contract that the iTerm Pet surface must satisfy;
+it is not evidence that this guidance preceded implementation, and it is not a
+live-terminal, independent-review, or capture-provenance claim.
+
+The Pet is a 16×16 real-pixel sprite presented in a two-terminal-row footprint
+beside the composer. Its component anatomy is:
+
+1. `PetFramedEditor` wraps the existing composer and reserves only the Pet's
+   measured cell width plus a one-cell right inset. It narrows the editor; it
+   does not add a floor row or replace the editor's input behavior.
+2. `GajaePetWidget` owns the mode, skin/frame timeline, cell-metric rebuild,
+   composer-bottom calculation, and overlay lifecycle.
+3. The post-render overlay emitter re-applies the absolute-positioned raster
+   after ordinary TUI writes, while animation frame swaps go through the TUI
+   output queue. The overlay must not move the hardware/IME cursor.
+4. A raster lease owns the iTerm placement rectangle. Disable, disposal,
+   capability loss, topology loss, and resize invalidate that lease before a
+   replacement can be submitted. Cleanup authority is retained until erase or
+   image deletion is actually delivered.
+
+### iTerm transport states and failure copy
+
+Direct transport is allowed only for a TTY identified as iTerm.app 3.5 or
+newer. It drains input, sends the iTerm `Capabilities` query, and accepts the
+Pet only after a complete `f` capability reply. Managed transport is a separate
+state: all managed-session, pane, and owner-run identifiers must be present;
+the single-client topology and expected pane/client must match; tmux
+`allow-passthrough` is enabled from a saved value and restored during cleanup.
+Managed records are wrapped for tmux and refresh the managed cursor before
+submission. A tmux/screen/zellij context that is not an eligible managed
+session must not silently use direct transport.
+
+Availability is explicit and recoverable rather than inferred from an ANSI
+string. Pending probe, available direct, available managed, revoked, and
+disposed/cleaned-up are distinct lifecycle states. User-facing status names a
+safe next action and never exposes credentials. Capability errors include
+`not-iterm2`, `tty-unavailable`, `missing-f`, `invalid-f`, and `probe-timeout`.
+Topology errors include `topology-ineligible`, `topology-lost`, and
+`zero-client-recovery`; managed-option restoration failure is
+`cleanup-failed`. A failed probe or topology check suppresses raster submission,
+invalidates the owned lease, and leaves the saved Pet choice understandable as
+unavailable. Cleanup failure remains visible to the lifecycle owner and must
+not strand a stale image or leave managed passthrough enabled.
+
+### Placement, composer, and responsive behavior
+
+The Pet occupies exactly two terminal rows, uses terminal-cell measurements,
+and remains one cell inset from the right edge. The editor renders at
+`terminalColumns - (petColumns + 1)` only when it has more than the reserved
+area plus its minimum usable width; otherwise the normal full-width editor is
+used and no raster is submitted. The composer remains pinned to the bottom.
+Placement uses the composer bottom offset (including content below it), then
+clamps the two-row image to retain one safety row above the terminal scrolling
+edge. This one-row lift is an intentional iTerm safety trade-off: it prevents an
+inline-image cursor advance from scrolling the viewport. Unlike Kitty/Sixel,
+iTerm has no sub-cell placement or cursor-advance suppression; do not “fix” the
+trade-off by adding a permanent floor row or allowing placement to reach the
+unsafe last row.
+
+On a narrow transition, stop submitting new raster frames, erase the previous
+Sixel footprint or delete the Kitty placement, and retain cleanup authority
+until delivery is acknowledged. On resize or font/zoom cell-metric change,
+invalidate the old lease, rebuild the two-row presentation and reserve, and
+resume only after the new rectangle fits. Widening the terminal may place the
+Pet again; it must not reuse stale coordinates or image ownership.
+
+### Pet state and motion
+
+`off` removes the frame, reserve, emitter authority, and image/lease state.
+Active idle uses a discrete base/gaze-left/base/gaze-right/flicker loop.
+Working uses the shared para-para loop. A skin burst is a finite flex/show-off
+sequence; selector preview may schedule its deterministic introductory
+eye-roll and signature burst, while live automatic bursts remain time-spaced.
+Every state remains legible when animation is paused: mode, availability, and
+composer controls are textual/structural, not conveyed by motion alone.
+
+### Pet visual-QA matrix
+
+The Pet showcase must exercise the full terminal surface, not just a raster
+payload: direct and managed/tmux transport; RedGajae and BlueGajae in idle,
+working, burst, and selector-preview states; capability/probe failure,
+topology rejection/loss, cleanup failure, and unavailable/disabled states; and
+normal, narrow, resize, composer-bottom, scroll, and mixed-script layouts.
+The matrix must include the canonical wide terminal sizes and a deliberately
+narrow case (including `80x24` and `40x12` where the surrounding harness uses
+those sizes), plus normal-to-narrow and narrow-to-wide transitions.
+
+Each required capture is full-surface evidence with `terminal.txt`,
+`terminal-ansi.txt`, `terminal.html`, and `metadata.json`. The text must remain
+readable, ANSI/control semantics must be preserved for replay, and metadata must
+describe the source, terminal size, font/render assumptions, timestamp, tool
+version, and wrapping policy.
+The matrix is a requirement for future capture/review, not a claim that any
+capture, live origin, or independent review exists in this corrective change.
+
+### Evidence, provenance, and localized text
+
+ANSI output, terminal-cell rectangles, protocol records, and local validator
+results are implementation artifacts. They can establish deterministic
+payload/placement invariants, but they cannot establish that a live iTerm
+terminal rendered the Pet, that the source was iTerm rather than a replay or
+stub, or that an independent reviewer inspected a capture. Live capture,
+terminal-origin metadata, and independent review must remain separately
+identified evidence; never relabel ANSI evidence as any of those.
+
+The Pet reserve is measured with ANSI-aware terminal-cell width helpers and
+must not change composer wrapping semantics. Mixed CJK/Latin text wraps at
+semantic phrase or action boundaries, never through an action label, status
+name, masked-secret marker, or short code/config identifier. Narrow CJK
+fixtures must prove both cell alignment and semantic wrapping; a visually
+aligned but semantically split line fails this contract.
 
 ## Existing visual grammar
 

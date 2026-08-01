@@ -12,6 +12,7 @@
 
 - Notification settings now expose first-class Telegram, Discord, and Slack configuration, desired-intent toggles, provider-local quarantine and repair guidance, explicit `keep | replace | remove` secret actions, provider-specific health/test diagnostics, and truthful saved-but-runtime-degraded outcomes. The global master preserves provider credentials and intent, `GJC_NOTIFICATIONS=0` suppresses only automatic generic-session admission, and blocked Telegram ownership uses an isolated chat-only endpoint so verified Discord or Slack siblings can continue without exposing the shared endpoint.
 
+- Added capability-gated iTerm2 Pet GIF rendering with managed tmux transport, manual-history suspension, and lifecycle-safe raster cleanup.
 ### Fixed
 
 - Windows automatic tmux resolution now selects `psmux` then `pmux` by canonical command order without rejecting distinct lower-priority aliases; it probes `tmux` only when neither named provider is available (#3725).

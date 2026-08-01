@@ -113,9 +113,15 @@ export interface Terminal {
 	 * @param idleMs - Exit early if no input arrives within this time (default: 50ms)
 	 */
 	drainInput(maxMs?: number, idleMs?: number): Promise<void>;
+	/**
+	 * Drain stale input without changing active keyboard-enhancement modes.
+	 * Capability probes use this while the interactive terminal remains live.
+	 */
+	drainPendingInput?(maxMs?: number, idleMs?: number): Promise<void>;
 
 	// Write output to terminal
 	write(data: string): void;
+	flush?(): Promise<boolean>;
 
 	// Whether terminal output is still writable
 	get available(): boolean;
@@ -768,6 +774,9 @@ export class ProcessTerminal implements Terminal {
 			this.#modifyOtherKeysActive = false;
 		}
 
+		await this.drainPendingInput(maxMs, idleMs);
+	}
+	async drainPendingInput(maxMs = 1000, idleMs = 50): Promise<void> {
 		const previousHandler = this.#inputHandler;
 		this.#inputHandler = undefined;
 
@@ -785,7 +794,7 @@ export class ProcessTerminal implements Terminal {
 				const timeLeft = endTime - now;
 				if (timeLeft <= 0) break;
 				if (now - lastDataTime >= idleMs) break;
-				await new Promise(resolve => setTimeout(resolve, Math.min(idleMs, timeLeft)));
+				await Bun.sleep(Math.min(idleMs, timeLeft));
 			}
 		} finally {
 			process.stdin.removeListener("data", onData);
@@ -898,6 +907,20 @@ export class ProcessTerminal implements Terminal {
 				// Ignore logging errors
 			}
 		}
+	}
+
+	async flush(): Promise<boolean> {
+		if (this.#dead) return false;
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		try {
+			process.stdout.write("", () => {
+				resolve(!this.#dead);
+			});
+		} catch (err) {
+			this.#markUnavailable(err, "flush");
+			resolve(false);
+		}
+		return await promise;
 	}
 
 	#safeWrite(data: string): void {
