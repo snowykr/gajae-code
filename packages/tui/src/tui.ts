@@ -1023,6 +1023,7 @@ export class TUI extends Container {
 	#fixedSuffixScrollRegionGeneration = 0;
 	#fixedSuffixScrollRegionOwners = new Map<string, FixedSuffixScrollRegionToken>();
 	#armedFixedSuffixScrollRegionToken: FixedSuffixScrollRegionToken | undefined;
+	#armedFixedSuffixScrollRegionRasterLease: RasterLeaseToken | undefined;
 	#fixedSuffixScrollRegionResetPending = false;
 
 	#unsubscribeTabWidthChange?: () => void;
@@ -1294,28 +1295,34 @@ export class TUI extends Container {
 		this.#fixedSuffixScrollRegionOwners.delete(token.ownerId);
 		if (this.#armedFixedSuffixScrollRegionToken === token) {
 			this.#armedFixedSuffixScrollRegionToken = undefined;
+			this.#armedFixedSuffixScrollRegionRasterLease = undefined;
 		}
 	}
 
 	/**
 	 * Keep a current owner armed for eligible transcript appends. Every DECSTBM
-	 * transaction still establishes and resets its own terminal state.
+	 * transaction still establishes and resets its own terminal state. A supplied
+	 * raster lease must be current for the same owner and is preserved only when
+	 * it is the sole active lease.
 	 */
-	armFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken): number | undefined {
+	armFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken, rasterLease?: RasterLeaseToken): number | undefined {
 		if (
 			this.#fixedSuffixScrollRegionOwners.get(token.ownerId) !== token ||
 			!this.terminalAvailable ||
 			this.#stopped ||
 			this.manualViewportActive ||
-			this.#bottomPinnedComponent === null
+			this.#bottomPinnedComponent === null ||
+			(rasterLease !== undefined && this.#rasterLeases.get(token.ownerId)?.token !== rasterLease)
 		)
 			return undefined;
 		this.#armedFixedSuffixScrollRegionToken = token;
+		this.#armedFixedSuffixScrollRegionRasterLease = rasterLease;
 		return this.requestRenderWithGeneration(false, "fixed-suffix-scroll-region");
 	}
 
 	#resetFixedSuffixScrollRegions(): void {
 		this.#armedFixedSuffixScrollRegionToken = undefined;
+		this.#armedFixedSuffixScrollRegionRasterLease = undefined;
 		this.#fixedSuffixScrollRegionOwners.clear();
 	}
 
@@ -3990,6 +3997,7 @@ export class TUI extends Container {
 
 	#doRender(): void {
 		const fixedSuffixScrollRegionToken = this.#armedFixedSuffixScrollRegionToken;
+		const fixedSuffixScrollRegionRasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
 		if (this.#stopped || !this.terminalAvailable) return;
 		const transcriptIdentityReplaced = this.#transcriptIdentityReplaced;
 		const restartViewportRepaintPending = this.#restartViewportRepaintPending;
@@ -4725,7 +4733,43 @@ export class TUI extends Container {
 		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
+		const fixedSuffixNativeAppend =
+			fixedSuffixScrollRegionToken !== undefined &&
+			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+				fixedSuffixScrollRegionToken &&
+			appendedLines &&
+			hasStickySuffix &&
+			!widthChanged &&
+			!heightChanged &&
+			!transcriptIdentityReplaced &&
+			!restartViewportRepaintPending &&
+			!resizeRenderMutationQueued &&
+			!widthSettleRenderQueued &&
+			!tabWidthRepairPending &&
+			!forcedRenderQueued &&
+			!anchorRenderFailed &&
+			this.overlayStack.length === 0 &&
+			previousKittyPlacementSpans.length === 0 &&
+			nextKittyPlacementSpans.length === 0 &&
+			this.#scrollbackResumeViewportTop === undefined &&
+			previousSuffixLineCount > 0 &&
+			previousSuffixLineCount === nextSuffixLineCount &&
+			nextSuffixLineCount < height &&
+			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
+			nextTranscriptLineCount > previousTranscriptLineCount &&
+			firstChanged === previousTranscriptLineCount &&
+			newLines.slice(0, previousTranscriptLineCount).every((line, index) => line === previousLogicalFrame[index]);
+		const fixedSuffixNativeAppendPreservesRasterLease =
+			fixedSuffixNativeAppend &&
+			this.#rasterCleanup.size === 0 &&
+			(this.#rasterLeases.size === 0 ||
+				(this.#rasterLeases.size === 1 &&
+					fixedSuffixScrollRegionToken !== undefined &&
+					fixedSuffixScrollRegionRasterLease !== undefined &&
+					this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId)?.token ===
+						fixedSuffixScrollRegionRasterLease));
 		if (
+			!fixedSuffixNativeAppendPreservesRasterLease &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
@@ -4932,33 +4976,7 @@ export class TUI extends Container {
 			}
 			return;
 		}
-		const fixedSuffixNativeAppend =
-			fixedSuffixScrollRegionToken !== undefined &&
-			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
-				fixedSuffixScrollRegionToken &&
-			appendedLines &&
-			hasStickySuffix &&
-			!widthChanged &&
-			!heightChanged &&
-			!transcriptIdentityReplaced &&
-			!restartViewportRepaintPending &&
-			!resizeRenderMutationQueued &&
-			!widthSettleRenderQueued &&
-			!tabWidthRepairPending &&
-			!forcedRenderQueued &&
-			!anchorRenderFailed &&
-			this.overlayStack.length === 0 &&
-			previousKittyPlacementSpans.length === 0 &&
-			nextKittyPlacementSpans.length === 0 &&
-			this.#scrollbackResumeViewportTop === undefined &&
-			previousSuffixLineCount > 0 &&
-			previousSuffixLineCount === nextSuffixLineCount &&
-			nextSuffixLineCount < height &&
-			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
-			nextTranscriptLineCount > previousTranscriptLineCount &&
-			firstChanged === previousTranscriptLineCount &&
-			newLines.slice(0, previousTranscriptLineCount).every((line, index) => line === previousLogicalFrame[index]);
-		if (fixedSuffixNativeAppend) {
+		if (fixedSuffixNativeAppendPreservesRasterLease) {
 			const regionBottom = height - nextSuffixLineCount;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
 			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
@@ -4976,19 +4994,25 @@ export class TUI extends Container {
 			fixedSuffixBuffer += `\x1b8\x1b[r\x1b[?6l${seq}\x1b[?2026l`;
 			this.#fixedSuffixScrollRegionResetPending = true;
 			if (
-				!this.#writeRenderBufferAndReanchorImeCursor(fixedSuffixBuffer, cursorPos, newLines.length, () => {
-					this.#hardwareCursorRow = toRow;
-					this.#cursorRow = Math.max(0, newLines.length - 1);
-					this.#maxLinesRendered = newLines.length;
-					this.#viewportTopRow = Math.max(0, newLines.length - height);
-					this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-					this.#previousLines = newLines;
-					this.#previousWidth = width;
-					this.#previousHeight = height;
-					this.#manualTranscriptLineCount = nextTranscriptLineCount;
-					this.#manualSuffixLineCount = nextSuffixLineCount;
-					this.#refreshPaintedLiveViewportObservation(height);
-				})
+				!this.#writeRenderBufferAndReanchorImeCursor(
+					fixedSuffixBuffer,
+					cursorPos,
+					newLines.length,
+					() => {
+						this.#hardwareCursorRow = toRow;
+						this.#cursorRow = Math.max(0, newLines.length - 1);
+						this.#maxLinesRendered = newLines.length;
+						this.#viewportTopRow = Math.max(0, newLines.length - height);
+						this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+						this.#previousLines = newLines;
+						this.#previousWidth = width;
+						this.#previousHeight = height;
+						this.#manualTranscriptLineCount = nextTranscriptLineCount;
+						this.#manualSuffixLineCount = nextSuffixLineCount;
+						this.#refreshPaintedLiveViewportObservation(height);
+					},
+					fixedSuffixScrollRegionRasterLease !== undefined,
+				)
 			)
 				return;
 			this.#fixedSuffixScrollRegionResetPending = false;
@@ -5031,6 +5055,7 @@ export class TUI extends Container {
 					: firstChanged;
 		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
 		if (
+			!fixedSuffixNativeAppendPreservesRasterLease &&
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&

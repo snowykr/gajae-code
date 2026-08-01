@@ -80,6 +80,53 @@ describe("TUI fixed suffix scroll region", () => {
 		}
 	});
 
+	it("preserves a bound raster lease while advancing native scrollback", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			term.clearWriteLog();
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).toContain("\x1b[1;3r");
+			expect(output).toContain("\x1bD\r\x1b[2Kline-4");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-1");
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const streamingOutput = term.getWriteLog().join("");
+			expect(streamingOutput).toContain("\x1b[1;3r");
+			expect(streamingOutput).toContain("\x1bD\r\x1b[2Kline-5");
+			expect(streamingOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(scrollback.filter(line => line === "line-1")).toHaveLength(1);
+			expect(scrollback.filter(line => line === "line-2")).toHaveLength(1);
+		} finally {
+			tui.stop();
+		}
+	});
 	it("uses the existing renderer unless a current owner arms the fixed suffix region", async () => {
 		const { term, transcript, tui } = createPinnedTui();
 		try {

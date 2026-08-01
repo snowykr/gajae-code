@@ -5,6 +5,7 @@ import {
 	type CellRect,
 	type Component,
 	type Container,
+	type FixedSuffixScrollRegionToken,
 	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
@@ -187,6 +188,7 @@ export class GajaePetWidget {
 	/** Shared-emitter epoch from the last time this widget owned its TUI. */
 	#ownedOverlayEpoch = 0;
 	#itermLease: RasterLeaseToken | undefined;
+	#fixedSuffixScrollRegionToken: FixedSuffixScrollRegionToken | undefined;
 	#disposePromise: Promise<void> | undefined;
 	/** Raster invalidation must settle before disposeAsync starts lifecycle recovery. */
 	#disposeRasterBarrier: Promise<void> = Promise.resolve();
@@ -249,9 +251,9 @@ export class GajaePetWidget {
 	async suspendItermCapability(): Promise<void> {
 		if (!this.#isActiveOwner()) return;
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		const lease = this.#itermLease;
 		this.#itermLease = undefined;
-
 		this.#itermLastSemantic = "";
 		if (lease) await this.#ui.invalidateRasterLease({ token: lease, cause: "capability-loss" });
 		this.#ui.requestRender(true);
@@ -277,6 +279,7 @@ export class GajaePetWidget {
 		if (mode === "off") {
 			if (!this.#canMutateSharedUi()) return;
 			this.#itermGeneration++;
+			this.#releaseFixedSuffixScrollRegion();
 			if (this.#itermLease) {
 				void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "mode-off" });
 				this.#itermLease = undefined;
@@ -303,6 +306,7 @@ export class GajaePetWidget {
 		const predecessor = petOverlayEmitterOwners.get(this.#ui);
 		if (predecessor && predecessor !== this) predecessor.#retireForSuccessor();
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		if (this.#itermLease) {
 			void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "explicit" });
 			this.#itermLease = undefined;
@@ -390,6 +394,7 @@ export class GajaePetWidget {
 		this.#disposeNeedsLifecycle = canMutateSharedUi;
 		this.#disposed = true;
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		const lease = this.#itermLease;
 		this.#itermLease = undefined;
 		if (lease)
@@ -439,6 +444,12 @@ export class GajaePetWidget {
 		}
 	}
 
+	#releaseFixedSuffixScrollRegion(): void {
+		const token = this.#fixedSuffixScrollRegionToken;
+		this.#fixedSuffixScrollRegionToken = undefined;
+		if (token) this.#ui.releaseFixedSuffixScrollRegion(token);
+	}
+
 	#mountEditor(framed: boolean): void {
 		this.#editorContainer.clear();
 		this.#editorContainer.addChild(framed ? this.#framedEditor : this.#editor);
@@ -477,7 +488,10 @@ export class GajaePetWidget {
 	}
 
 	#tickIterm(now: number): void {
-		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) return;
+		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) {
+			this.#releaseFixedSuffixScrollRegion();
+			return;
+		}
 		const cell = getCellDimensions();
 		const pixelColumns = Math.max(1, Math.ceil((PET_ART_ROWS * cell.heightPx) / cell.widthPx));
 		const pixelRows = ITERM_CANVAS_ROWS;
@@ -485,6 +499,7 @@ export class GajaePetWidget {
 		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
 			metricsChanged = true;
 			this.#itermGeneration++;
+			this.#releaseFixedSuffixScrollRegion();
 			const lease = this.#itermLease;
 			this.#itermLease = undefined;
 
@@ -499,6 +514,7 @@ export class GajaePetWidget {
 		if (!this.#framedEditor.canFit(this.#ui.terminal.columns)) {
 			if (!metricsChanged) {
 				this.#itermGeneration++;
+				this.#releaseFixedSuffixScrollRegion();
 				const lease = this.#itermLease;
 				this.#itermLease = undefined;
 
@@ -513,6 +529,7 @@ export class GajaePetWidget {
 		if (terminalRows < ITERM_CANVAS_ROWS + PET_RAISE_ROWS) {
 			if (!metricsChanged) {
 				this.#itermGeneration++;
+				this.#releaseFixedSuffixScrollRegion();
 				const lease = this.#itermLease;
 				this.#itermLease = undefined;
 
@@ -537,7 +554,10 @@ export class GajaePetWidget {
 			height: pixelRows,
 		};
 		const availability = getVerifiedItermPetAvailability();
-		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) return;
+		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) {
+			this.#releaseFixedSuffixScrollRegion();
+			return;
+		}
 		const working = this.#isWorking();
 		const flexing = this.#flexUntil > now;
 		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
@@ -618,6 +638,7 @@ export class GajaePetWidget {
 				token.rect.width !== rect.width ||
 				token.rect.height !== rect.height)
 		) {
+			this.#releaseFixedSuffixScrollRegion();
 			await this.#ui.invalidateRasterLease({ token, cause: "resize" });
 			if (this.#itermLease === token) {
 				this.#itermLease = undefined;
@@ -640,13 +661,14 @@ export class GajaePetWidget {
 				},
 				onInvalidated: notice => {
 					if (this.#itermLease === notice.token) {
+						this.#releaseFixedSuffixScrollRegion();
 						this.#itermLease = undefined;
-
 						this.#itermLastSemantic = "";
 					}
 				},
 			});
 			if (!current() || acquired.status !== "acquired") {
+				this.#releaseFixedSuffixScrollRegion();
 				if (acquired.status === "acquired")
 					await this.#ui.invalidateRasterLease({
 						token: acquired.token,
@@ -709,12 +731,22 @@ export class GajaePetWidget {
 			},
 		});
 		if (!current() || submit.status !== "written") {
+			this.#releaseFixedSuffixScrollRegion();
 			await this.#ui.invalidateRasterLease({ token, cause: "capability-loss" });
 			if (this.#itermLease === token) {
 				this.#itermLease = undefined;
 			}
 			return;
 		}
+		this.#releaseFixedSuffixScrollRegion();
+		const fixedSuffixScrollRegionToken = this.#ui.acquireFixedSuffixScrollRegion(this.#itermOwner);
+		if (!fixedSuffixScrollRegionToken || !current() || this.#itermLease !== token) {
+			if (fixedSuffixScrollRegionToken) this.#ui.releaseFixedSuffixScrollRegion(fixedSuffixScrollRegionToken);
+			return;
+		}
+		this.#fixedSuffixScrollRegionToken = fixedSuffixScrollRegionToken;
+		if (this.#ui.armFixedSuffixScrollRegion(fixedSuffixScrollRegionToken, token) === undefined)
+			this.#releaseFixedSuffixScrollRegion();
 	}
 	#scheduleAutoFlex(now: number): void {
 		if (!this.#autoFlexGapMs) return;

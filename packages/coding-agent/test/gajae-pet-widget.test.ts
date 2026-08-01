@@ -31,6 +31,8 @@ function makeStubs(columns = 80, rows = 30) {
 	let failWrites = false;
 	let manualViewportActive = false;
 	let rasterToken = 0;
+	let fixedSuffixScrollRegionToken = 0;
+	const fixedSuffixScrollRegionOwners = new Map<string, { ownerId: string; generation: number }>();
 	const rasterOutputs: Uint8Array[] = [];
 	const rasterCursorVisibilityRestores: Array<boolean | undefined> = [];
 	const invalidatedRasterLeases: Array<{ token: unknown; cause?: string }> = [];
@@ -85,6 +87,19 @@ function makeStubs(columns = 80, rows = 30) {
 			return manualViewportActive;
 		},
 		terminal,
+		acquireFixedSuffixScrollRegion: (ownerId: string) => {
+			const token = { ownerId, generation: ++fixedSuffixScrollRegionToken };
+			fixedSuffixScrollRegionOwners.set(ownerId, token);
+			return token;
+		},
+		releaseFixedSuffixScrollRegion: (token: { ownerId: string; generation: number }) => {
+			if (fixedSuffixScrollRegionOwners.get(token.ownerId) === token)
+				fixedSuffixScrollRegionOwners.delete(token.ownerId);
+		},
+		armFixedSuffixScrollRegion: (token: { ownerId: string; generation: number }) => {
+			if (fixedSuffixScrollRegionOwners.get(token.ownerId) !== token) return undefined;
+			return ++renderRequests;
+		},
 		acquireRasterLease: async (request: {
 			ownerId: string;
 			rect: { column: number; row: number; width: number; height: number };
@@ -162,6 +177,7 @@ function makeStubs(columns = 80, rows = 30) {
 		getInvalidatedRasterLeases: () => invalidatedRasterLeases,
 		getRasterLeaseRequests: () => rasterLeaseRequests,
 		getRasterCursorVisibilityRestores: () => rasterCursorVisibilityRestores,
+		getFixedSuffixScrollRegionOwnerCount: () => fixedSuffixScrollRegionOwners.size,
 		getPendingRasterAcquireCount: () => rasterAcquireWaiters.length,
 		setRasterAcquireDelayed: (value: boolean) => {
 			delayRasterAcquire = value;
@@ -1196,6 +1212,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.setMode("red");
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
 
 			// composerBottom = 28; the three-row canvas starts at zero-based row 25.
 			// Its transparent half-cell insets center the two-row sprite in that canvas.
@@ -1524,6 +1541,7 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(160);
 			await flushAsyncChain();
 			expect(stubs.getRasterOutputs()).toHaveLength(0);
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(0);
 
 			stubs.setManualViewportActive(false);
 			vi.advanceTimersByTime(80);
@@ -1534,6 +1552,7 @@ describe("GajaePetWidget", () => {
 					.map(record => new TextDecoder().decode(record))
 					.some(record => record.includes("MultipartFile=")),
 			).toBe(true);
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
