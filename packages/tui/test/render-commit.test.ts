@@ -96,6 +96,47 @@ describe("generation-scoped render commits", () => {
 		expect(events).toEqual(["written", "ack"]);
 		tui.stop();
 	});
+	it("commits a render generation after a queued raster write finishes", async () => {
+		const terminal = new VirtualTerminal(40, 8);
+		const tui = new TUI(terminal);
+		const releaseBarrier = Promise.withResolvers<boolean>();
+		const prefixEntered = Promise.withResolvers<void>();
+		const text = new Text("queued-raster-frame", 1, 0);
+		tui.addChild(text);
+		tui.start();
+		await terminal.waitForRender();
+
+		const lease = await tui.acquireRasterLease({
+			ownerId: "render-commit",
+			rect: { column: 38, row: 7, width: 2, height: 1 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("ERASE") },
+		});
+		if (lease.status !== "acquired") throw new Error("expected lease");
+		const raster = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode("PREFIX"),
+				afterPrefix: async () => {
+					prefixEntered.resolve();
+					return releaseBarrier.promise;
+				},
+				records: [new TextEncoder().encode("PAYLOAD")],
+				abortSuffix: new TextEncoder().encode("ABORT"),
+			},
+		});
+		await prefixEntered.promise;
+		text.setText("queued-raster-frame-updated");
+
+		const generation = tui.requestRenderWithGeneration(false, "test.queued-raster");
+		const committed = tui.waitForRenderCommit(generation);
+		releaseBarrier.resolve(true);
+
+		expect(await raster).toMatchObject({ status: "written" });
+		expect(await committed).toBe(true);
+		expect(terminal.getWriteLog().join(" ")).toContain("queued-raster-frame");
+		tui.stop();
+	});
 
 	it("fails open immediately after the renderer is stopped", async () => {
 		const terminal = new VirtualTerminal(40, 8);
