@@ -738,6 +738,17 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(output).toContain("\x1b[r\x1b[?6l");
 			expect(output).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
+			const rearmed = tui.acquireFixedSuffixScrollRegion("test-owner");
+			expect(rearmed).toBeDefined();
+			if (rearmed === undefined) throw new Error("Expected rearmed fixed suffix token");
+			expect(tui.armFixedSuffixScrollRegion(rearmed, lease.token)).toBeGreaterThan(0);
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5", "line-6"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			expect(term.getWriteLog().join("")).toContain("\x1b[1;2r");
+			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
 		} finally {
 			tui.stop();
 		}
