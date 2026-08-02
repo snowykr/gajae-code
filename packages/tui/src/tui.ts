@@ -5544,7 +5544,7 @@ export class TUI extends Container {
 			: (bytes: string) => this.#writeProtectedRenderIngress(bytes);
 		const renderGeneration = this.#renderGenerationInProgress;
 		const write = () => {
-			const needsFixedSuffixReset = this.#fixedSuffixScrollRegionResetPending && !preserveRasterLeases;
+			const needsFixedSuffixReset = this.#fixedSuffixScrollRegionResetPending;
 			const bytes = needsFixedSuffixReset ? `\x1b[r\x1b[?6l${buffer}` : buffer;
 			if (!writeIngress(bytes)) return false;
 			if (needsFixedSuffixReset) this.#fixedSuffixScrollRegionResetPending = false;
