@@ -910,8 +910,10 @@ export function encodeITerm2Multipart(
 	const height = validate(options.height ?? "auto", "height");
 	const size = Buffer.from(base64Data, "base64").byteLength;
 	const name = Buffer.from("gajae-pet.gif").toString("base64");
+	// MultipartFile carries arguments only; unlike File it has neither a
+	// leading argument separator nor a colon payload delimiter.
 	const records = [
-		`\x1b]1337;MultipartFile=;name=${name};size=${size};width=${width};height=${height};inline=1;preserveAspectRatio=0:\x07`,
+		`\x1b]1337;MultipartFile=name=${name};size=${size};width=${width};height=${height};inline=1;preserveAspectRatio=0\x07`,
 	];
 	for (let i = 0; i < base64Data.length; i += 200) {
 		records.push(`\x1b]1337;FilePart=${base64Data.slice(i, i + 200)}\x07`);

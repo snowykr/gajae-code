@@ -20,7 +20,7 @@ describe("iTerm2 multipart protocol", () => {
 		const data = "ABCD".repeat(151);
 		const records = encodeITerm2Multipart(data, { width: 80, height: "auto" });
 		expect(records[0]).toBe(
-			"\x1b]1337;MultipartFile=;name=Z2FqYWUtcGV0LmdpZg==;size=453;width=80;height=auto;inline=1;preserveAspectRatio=0:\x07",
+			"\x1b]1337;MultipartFile=name=Z2FqYWUtcGV0LmdpZg==;size=453;width=80;height=auto;inline=1;preserveAspectRatio=0\x07",
 		);
 		expect(records.at(-1)).toBe("\x1b]1337;FileEnd\x07");
 		const parts = records.slice(1, -1).map(record => record.slice("\x1b]1337;FilePart=".length, -1));
@@ -53,7 +53,7 @@ describe("iTerm2 multipart protocol", () => {
 			expect(TERMINAL.isImageLine(sequence)).toBe(true);
 			expect(sequence.endsWith("\x07")).toBe(true);
 			expect(sequence.endsWith("\x1b[K")).toBe(false);
-			expect(TERMINAL.isImageLine("\x1b]1337;MultipartFile=;name=pet;size=1;width=1;height=1;inline=1:\x07")).toBe(
+			expect(TERMINAL.isImageLine("\x1b]1337;MultipartFile=name=pet;size=1;width=1;height=1;inline=1\x07")).toBe(
 				true,
 			);
 		} finally {

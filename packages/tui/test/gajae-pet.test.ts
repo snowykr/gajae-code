@@ -199,7 +199,7 @@ describe("GIF artifacts and helpers", () => {
 		expect(red.multipart.slice(1)).toEqual(encodeITerm2Multipart(red.base64).slice(1));
 		expect(red.tmuxDcs).toEqual(wrapITerm2RecordsForTmux(red.multipart));
 		expect(red.multipart[0]).toBe(
-			`\x1b]1337;MultipartFile=;name=Z2FqYWUtcGV0LmdpZg==;size=${red.bytes.byteLength};width=${red.width}px;height=${red.height}px;inline=1;preserveAspectRatio=0:\x07`,
+			`\x1b]1337;MultipartFile=name=Z2FqYWUtcGV0LmdpZg==;size=${red.bytes.byteLength};width=${red.width}px;height=${red.height}px;inline=1;preserveAspectRatio=0\x07`,
 		);
 		expect(red.multipart.at(-1)).toBe("\x1b]1337;FileEnd\x07");
 		expect(red.multipart.slice(1, -1).every(record => record.length <= 220)).toBe(true);

@@ -610,7 +610,7 @@ describe("TUI fixed suffix scroll region", () => {
 				"line-2",
 				"line-3",
 				"line-4",
-				"\x1b]1337;MultipartFile=;name=test;size=1;width=1;height=1;inline=1:\x07",
+				"\x1b]1337;MultipartFile=name=test;size=1;width=1;height=1;inline=1\x07",
 			]);
 			term.clearWriteLog();
 			tui.requestRender();
@@ -658,7 +658,7 @@ describe("TUI fixed suffix scroll region", () => {
 			transcript.setLines([
 				"line-1",
 				"line-2",
-				"\x1b]1337;MultipartFile=;name=test;size=1;width=1;height=1;inline=1:\x07",
+				"\x1b]1337;MultipartFile=name=test;size=1;width=1;height=1;inline=1\x07",
 			]);
 			term.clearWriteLog();
 			tui.requestRender();
