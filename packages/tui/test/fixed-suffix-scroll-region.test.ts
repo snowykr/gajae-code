@@ -104,7 +104,7 @@ describe("TUI fixed suffix scroll region", () => {
 			await term.waitForRender();
 
 			const output = term.getWriteLog().join("");
-			expect(output).toContain("\x1b[1;3r");
+			expect(output).toContain("\x1b[1;2r");
 			expect(output).toContain("\x1bD\r\x1b[2Kline-4");
 			expect(output).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
@@ -116,6 +116,7 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(output).toContain("\x1b[5;40H\x1b[1X");
 			expect(output).not.toContain("\x1b[4;37H");
 			expect(output).not.toContain("\x1b[5;37H");
+			expect(output).not.toContain("\x1b[3;1H\x1bD");
 			await term.flush();
 			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-1");
 			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5"]);
@@ -123,7 +124,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const streamingOutput = term.getWriteLog().join("");
-			expect(streamingOutput).toContain("\x1b[1;3r");
+			expect(streamingOutput).toContain("\x1b[1;2r");
 			expect(streamingOutput).toContain("\x1bD\r\x1b[2Kline-5");
 			expect(streamingOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
@@ -135,6 +136,7 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(streamingOutput).toContain("\x1b[5;40H\x1b[1X");
 			expect(streamingOutput).not.toContain("\x1b[4;37H");
 			expect(streamingOutput).not.toContain("\x1b[5;37H");
+			expect(streamingOutput).not.toContain("\x1b[3;1H\x1bD");
 			await term.flush();
 			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
 			expect(scrollback.filter(line => line === "line-1")).toHaveLength(1);

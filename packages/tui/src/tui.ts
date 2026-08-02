@@ -4763,6 +4763,10 @@ export class TUI extends Container {
 			nextTranscriptLineCount > previousTranscriptLineCount &&
 			firstChanged === previousTranscriptLineCount &&
 			newLines.slice(0, previousTranscriptLineCount).every((line, index) => line === previousLogicalFrame[index]);
+		const fixedSuffixRasterLease =
+			fixedSuffixScrollRegionToken === undefined
+				? undefined
+				: this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId);
 		const fixedSuffixNativeAppendPreservesRasterLease =
 			fixedSuffixNativeAppend &&
 			this.#rasterCleanup.size === 0 &&
@@ -4770,8 +4774,8 @@ export class TUI extends Container {
 				(this.#rasterLeases.size === 1 &&
 					fixedSuffixScrollRegionToken !== undefined &&
 					fixedSuffixScrollRegionRasterLease !== undefined &&
-					this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId)?.token ===
-						fixedSuffixScrollRegionRasterLease));
+					fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+					fixedSuffixRasterLease.token.rect.row > 0));
 		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
 		// A verified iTerm lease must yield before an overflow can overwrite a row
 		// that native history has not received. The fixed token covers an armed
@@ -4993,7 +4997,14 @@ export class TUI extends Container {
 			return;
 		}
 		if (fixedSuffixNativeAppend) {
-			const regionBottom = height - nextSuffixLineCount;
+			const suffixRegionBottom = height - nextSuffixLineCount;
+			// iTerm raster cells are not ordinary text cells. Keep the entire lease
+			// outside DECSTBM even when its transparent canvas reaches above the
+			// rendered suffix, so IND cannot scroll a Pet row.
+			const regionBottom =
+				fixedSuffixNativeAppendPreservesRasterLease && fixedSuffixRasterLease !== undefined
+					? Math.min(suffixRegionBottom, fixedSuffixRasterLease.token.rect.row)
+					: suffixRegionBottom;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
 			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
 				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
@@ -5002,7 +5013,7 @@ export class TUI extends Container {
 			const preserveFixedSuffixRaster =
 				fixedSuffixNativeAppendPreservesRasterLease && fixedSuffixScrollRegionRasterLease !== undefined;
 			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
-				const suffixRow = regionBottom + suffixIndex + 1;
+				const suffixRow = suffixRegionBottom + suffixIndex + 1;
 				const suffixLine = newLines[nextTranscriptLineCount + suffixIndex] ?? "";
 				if (preserveFixedSuffixRaster) {
 					for (const segment of this.#unleasedRowSegments(suffixRow - 1, width)) {
