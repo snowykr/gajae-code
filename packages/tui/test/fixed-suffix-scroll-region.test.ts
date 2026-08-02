@@ -663,7 +663,9 @@ describe("TUI fixed suffix scroll region", () => {
 			term.clearWriteLog();
 			tui.requestRender();
 			await term.waitForRender();
-			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
+			const output = term.getWriteLog().join("");
+			expect(output).not.toContain("\x1b[1;2r");
+			expect(output).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
 		} finally {
 			tui.stop();
