@@ -1295,11 +1295,20 @@ export class TUI extends Container {
 		this.#fixedSuffixScrollRegionOwners.set(ownerId, token);
 		return token;
 	}
+	/** Whether a fixed-suffix owner token still belongs to the current TUI generation. */
+	isFixedSuffixScrollRegionCurrent(token: FixedSuffixScrollRegionToken): boolean {
+		return this.#fixedSuffixScrollRegionOwners.get(token.ownerId) === token;
+	}
 
 	releaseFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken): void {
 		if (this.#fixedSuffixScrollRegionOwners.get(token.ownerId) !== token) return;
 		this.#fixedSuffixScrollRegionOwners.delete(token.ownerId);
 		if (this.#armedFixedSuffixScrollRegionToken === token) {
+			const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+			if (rasterLease !== undefined) {
+				const lease = this.#rasterLeases.get(rasterLease.ownerId);
+				if (lease?.token === rasterLease) lease.nativeScrollbackArmed = false;
+			}
 			this.#armedFixedSuffixScrollRegionToken = undefined;
 			this.#armedFixedSuffixScrollRegionRasterLease = undefined;
 		}
@@ -1327,7 +1336,7 @@ export class TUI extends Container {
 			return undefined;
 		const lease = rasterLease === undefined ? undefined : this.#rasterLeases.get(token.ownerId);
 		if (rasterLease !== undefined && (!lease || lease.token !== rasterLease)) return undefined;
-		if (lease?.nativeScrollbackEligible) lease.nativeScrollbackArmed = true;
+		if (lease?.nativeScrollbackEligible && lease.token.rect.row > 0) lease.nativeScrollbackArmed = true;
 		this.#armedFixedSuffixScrollRegionToken = token;
 		this.#armedFixedSuffixScrollRegionRasterLease = rasterLease;
 		return this.requestRenderWithGeneration(false, "fixed-suffix-scroll-region");
@@ -1335,6 +1344,11 @@ export class TUI extends Container {
 
 	#resetFixedSuffixScrollRegions(): void {
 		if (this.#fixedSuffixScrollPlane !== undefined) this.#fixedSuffixScrollRegionResetPending = true;
+		const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+		if (rasterLease !== undefined) {
+			const lease = this.#rasterLeases.get(rasterLease.ownerId);
+			if (lease?.token === rasterLease) lease.nativeScrollbackArmed = false;
+		}
 		this.#fixedSuffixScrollPlane = undefined;
 		this.#armedFixedSuffixScrollRegionToken = undefined;
 		this.#armedFixedSuffixScrollRegionRasterLease = undefined;
@@ -4349,6 +4363,27 @@ export class TUI extends Container {
 			allowPastLiveBottom?: boolean,
 		) => boolean;
 		const fullRender = (clear: boolean, reason = "full render", forceScrollbackClear = false): void => {
+			const fixedSuffixLease =
+				fixedSuffixScrollRegionToken === undefined
+					? undefined
+					: this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId);
+			const preserveArmedFixedSuffixLease =
+				fixedSuffixScrollRegionToken !== undefined &&
+				this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+					fixedSuffixScrollRegionToken &&
+				fixedSuffixScrollRegionRasterLease !== undefined &&
+				fixedSuffixLease?.token === fixedSuffixScrollRegionRasterLease &&
+				fixedSuffixLease.nativeScrollbackEligible &&
+				fixedSuffixLease.nativeScrollbackArmed &&
+				fixedSuffixLease.token.rect.row > 0 &&
+				this.#rasterLeases.size === 1 &&
+				this.#rasterCleanup.size === 0;
+			if (preserveArmedFixedSuffixLease) {
+				this.#fixedSuffixScrollPlane = undefined;
+				this.#fixedSuffixScrollRegionResetPending = true;
+				viewportRepaint(`armed fixed suffix lease blocked full render: ${reason}`);
+				return;
+			}
 			if (
 				clear &&
 				!forceScrollbackClear &&
@@ -4829,9 +4864,9 @@ export class TUI extends Container {
 					fixedSuffixScrollRegionToken !== undefined &&
 					fixedSuffixScrollRegionRasterLease !== undefined &&
 					fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+					fixedSuffixRasterLease.nativeScrollbackEligible &&
 					fixedSuffixRasterLease.nativeScrollbackArmed &&
 					fixedSuffixRasterLease.token.rect.row > 0));
-		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
 		const fixedPlaneRequestedUpperBottom =
 			fixedSuffixRasterLease === undefined
 				? 0
@@ -4854,6 +4889,7 @@ export class TUI extends Container {
 				fixedSuffixScrollRegionToken &&
 			fixedSuffixScrollRegionRasterLease !== undefined &&
 			fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+			fixedSuffixRasterLease.nativeScrollbackEligible &&
 			fixedSuffixRasterLease.nativeScrollbackArmed &&
 			this.#rasterLeases.size === 1 &&
 			this.#rasterCleanup.size === 0 &&
@@ -4875,7 +4911,6 @@ export class TUI extends Container {
 			nextKittyPlacementSpans.length === 0 &&
 			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#scrollbackResumeViewportTop === undefined &&
-			!this.#nativeScrollbackAdmissionPending &&
 			// Rows above the physical plane already belong to host scrollback. A
 			// historical Markdown rewrite cannot update that immutable history, but
 			// it must not force a generic raster erase. The departing plane row is
@@ -4968,19 +5003,34 @@ export class TUI extends Container {
 			this.#transcriptIdentityReplaced = false;
 			return;
 		}
-		// Only an armed iTerm lease yields for native admission. Before the GIF
-		// upload commits and arms the lease, preserve its raster rather than
-		// repeatedly erasing and re-uploading it under streaming output.
-		const rasterMustYieldForNativeAdmission =
-			appendedLines &&
-			nextLiveViewportTop > prevViewportTop &&
+		const activeArmedFixedSuffixLease =
+			fixedSuffixScrollRegionToken !== undefined &&
+			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+				fixedSuffixScrollRegionToken &&
+			fixedSuffixScrollRegionRasterLease !== undefined &&
+			fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+			fixedSuffixRasterLease.nativeScrollbackEligible &&
+			fixedSuffixRasterLease.nativeScrollbackArmed &&
+			fixedSuffixRasterLease.token.rect.row > 0 &&
+			this.#rasterLeases.size === 1 &&
+			this.#rasterCleanup.size === 0;
+		if (
+			activeArmedFixedSuffixLease &&
 			!fixedSuffixNativeAppendPreservesRasterLease &&
-			this.#rasterLeases.size > 0 &&
-			this.#rasterCleanup.size === 0 &&
-			(fixedSuffixRasterLease?.nativeScrollbackArmed === true || soleRasterLease?.nativeScrollbackArmed === true);
+			!fixedPlaneEligible &&
+			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
+		) {
+			if (appendedLines && nextLiveViewportTop > prevViewportTop) {
+				// The clipped repaint keeps the resident iTerm raster intact while this
+				// transient frame cannot safely form a DECSTBM transaction. The next
+				// eligible append uses its painted live viewport as the physical frontier.
+				this.#nativeScrollbackAdmissionPending = true;
+			}
+			viewportRepaint("armed fixed suffix lease awaiting a safe native append");
+			return;
+		}
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
-			!rasterMustYieldForNativeAdmission &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
@@ -5290,7 +5340,6 @@ export class TUI extends Container {
 		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
-			!rasterMustYieldForNativeAdmission &&
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
@@ -5337,7 +5386,6 @@ export class TUI extends Container {
 		// Only render changed lines (firstChanged to lastChanged), not all lines to end.
 		// This reduces flicker when only a single line changes (e.g., spinner animation).
 		const preserveRasterLeases =
-			!rasterMustYieldForNativeAdmission &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			moveTargetRow <= prevViewportBottom &&

@@ -448,6 +448,10 @@ export class GajaePetWidget {
 		if (token) this.#ui.releaseFixedSuffixScrollRegion(token);
 	}
 	#armFixedSuffixScrollRegion(lease: RasterLeaseToken): void {
+		const existing = this.#fixedSuffixScrollRegionToken;
+		if (existing && !this.#ui.isFixedSuffixScrollRegionCurrent(existing)) {
+			this.#fixedSuffixScrollRegionToken = undefined;
+		}
 		if (this.#fixedSuffixScrollRegionToken || this.#itermLease !== lease) return;
 		const token = this.#ui.acquireFixedSuffixScrollRegion(this.#itermOwner);
 		if (!token) return;

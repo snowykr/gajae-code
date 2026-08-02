@@ -99,6 +99,8 @@ function makeStubs(columns = 80, rows = 30) {
 			if (fixedSuffixScrollRegionOwners.get(token.ownerId) === token)
 				fixedSuffixScrollRegionOwners.delete(token.ownerId);
 		},
+		isFixedSuffixScrollRegionCurrent: (token: { ownerId: string; generation: number }) =>
+			fixedSuffixScrollRegionOwners.get(token.ownerId) === token,
 		armFixedSuffixScrollRegion: (token: { ownerId: string; generation: number }) => {
 			if (fixedSuffixScrollRegionOwners.get(token.ownerId) !== token) return undefined;
 			return ++renderRequests;
@@ -186,6 +188,7 @@ function makeStubs(columns = 80, rows = 30) {
 		getRasterLeaseRequests: () => rasterLeaseRequests,
 		getRasterCursorVisibilityRestores: () => rasterCursorVisibilityRestores,
 		getFixedSuffixScrollRegionOwnerCount: () => fixedSuffixScrollRegionOwners.size,
+		resetFixedSuffixScrollRegions: () => fixedSuffixScrollRegionOwners.clear(),
 		getPendingRasterAcquireCount: () => rasterAcquireWaiters.length,
 		setRasterAcquireDelayed: (value: boolean) => {
 			delayRasterAcquire = value;
@@ -1418,6 +1421,38 @@ describe("GajaePetWidget", () => {
 				.filter(record => record.includes("MultipartFile="));
 			expect(headers).toHaveLength(1);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("rearms a reset fixed suffix owner without re-uploading the iTerm GIF", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
+
+			stubs.resetFixedSuffixScrollRegions();
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();

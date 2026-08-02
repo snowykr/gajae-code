@@ -168,6 +168,77 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
+	it("keeps an armed iTerm lease through a multipart barrier reflow", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			const prefixEntered = Promise.withResolvers<void>();
+			const releaseBarrier = Promise.withResolvers<boolean>();
+			term.clearWriteLog();
+			const multipart = tui.submitTerminalOutput({
+				token: lease.token,
+				operation: {
+					type: "raster-multipart-batch",
+					prefix: new TextEncoder().encode("MULTIPART_PREFIX"),
+					afterPrefix: async () => {
+						prefixEntered.resolve();
+						return releaseBarrier.promise;
+					},
+					records: [new TextEncoder().encode("MULTIPART_GIF")],
+					suffix: new TextEncoder().encode("MULTIPART_SUFFIX"),
+				},
+			});
+			await prefixEntered.promise;
+
+			transcript.setLines(["line-1 revised", "line-2", "line-3", "line-4", "line-5"]);
+			tui.requestRender();
+			await Bun.sleep(20);
+			expect(term.getWriteLog().join("")).toBe("MULTIPART_PREFIX");
+			releaseBarrier.resolve(true);
+			expect((await multipart).status).toBe("written");
+			await term.waitForRender();
+
+			const fallbackOutput = term.getWriteLog().join("");
+			expect(fallbackOutput).toContain("MULTIPART_PREFIXMULTIPART_GIFMULTIPART_SUFFIX");
+			expect(fallbackOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+
+			transcript.setLines(["line-1 revised", "line-2", "line-3", "line-4", "line-5", "line-6"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+
+			const resumedOutput = term.getWriteLog().join("");
+			expect(resumedOutput).toContain("\x1b[1;2r");
+			expect(resumedOutput).toContain("\x1bD\r\x1b[2Kline-6");
+			expect(resumedOutput).not.toContain("ITERM_ERASE");
+			await term.flush();
+			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(scrollback.filter(line => line === "line-3")).toHaveLength(1);
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
 	it("preserves a bound raster lease while advancing native scrollback", async () => {
 		const { term, transcript, suffix, tui } = createPinnedTui();
 		let invalidated = 0;
@@ -442,6 +513,71 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
+	it("keeps a row-zero native lease on the clipped renderer path", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 0, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			term.clearWriteLog();
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(output).not.toContain("\x1b[1;2r");
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
+	it("keeps an armed fixed-suffix lease across a forced render", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			term.clearWriteLog();
+			tui.requestRender(true, "test armed fixed suffix render");
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
 	it("uses the existing renderer unless a current owner arms the fixed suffix region", async () => {
 		const { term, transcript, tui } = createPinnedTui();
 		try {
@@ -518,6 +654,42 @@ describe("TUI fixed suffix scroll region", () => {
 		expect(term.getWriteLog().join("")).toContain("\x1b[r\x1b[?6l");
 		expect(tui.acquireFixedSuffixScrollRegion("new-owner")).toBeUndefined();
 		expect(tui.armFixedSuffixScrollRegion(token)).toBeUndefined();
+	});
+	it("keeps a released fixed-plane lease on the clipped renderer path", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "test-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("test-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			tui.releaseFixedSuffixScrollRegion(token);
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).toContain("\x1b[r\x1b[?6l");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+		}
 	});
 	it("resets a released fixed plane before queued terminal output", async () => {
 		const { term, transcript, tui } = createPinnedTui();
