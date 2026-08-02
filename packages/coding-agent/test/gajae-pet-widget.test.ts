@@ -1248,7 +1248,7 @@ describe("GajaePetWidget", () => {
 			expect(directRecords[1]).toContain("\x1b]1337;MultipartFile=");
 			expect(directRecords[1]).toContain("width=4;height=3;");
 			expect(directRecords[1]).toContain("size=");
-			expect(directRecords[1]).toContain("inline=1;preserveAspectRatio=0:");
+			expect(directRecords[1]).toContain("inline=1;preserveAspectRatio=0\x07");
 			expect(directRecords.slice(1).filter(record => record.includes("\x1b[28;76H")).length).toBe(0);
 			expect(directRecords.slice(1).every(record => !record.includes("\x1b[28;76H"))).toBe(true);
 			expect(directRecords.at(-2)).toBe("\x1b]1337;FileEnd\x07");
