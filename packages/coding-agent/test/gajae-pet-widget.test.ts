@@ -1563,6 +1563,37 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
+	it("rearms the fixed suffix after manual history without reuploading the iTerm GIF", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			const headers = () =>
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile="));
+			expect(headers()).toHaveLength(1);
+
+			stubs.setManualViewportActive(true);
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(0);
+
+			stubs.setManualViewportActive(false);
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(headers()).toHaveLength(1);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
 	it("drops an iTerm lease acquired after manual history begins", async () => {
 		vi.useFakeTimers();
 		const stubs = makeWidget(80, 30, { protocol: null });

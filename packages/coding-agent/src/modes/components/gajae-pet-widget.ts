@@ -449,6 +449,13 @@ export class GajaePetWidget {
 		this.#fixedSuffixScrollRegionToken = undefined;
 		if (token) this.#ui.releaseFixedSuffixScrollRegion(token);
 	}
+	#armFixedSuffixScrollRegion(lease: RasterLeaseToken): void {
+		if (this.#fixedSuffixScrollRegionToken || this.#itermLease !== lease) return;
+		const token = this.#ui.acquireFixedSuffixScrollRegion(this.#itermOwner);
+		if (!token) return;
+		this.#fixedSuffixScrollRegionToken = token;
+		if (this.#ui.armFixedSuffixScrollRegion(token, lease) === undefined) this.#releaseFixedSuffixScrollRegion();
+	}
 
 	#mountEditor(framed: boolean): void {
 		this.#editorContainer.clear();
@@ -565,7 +572,11 @@ export class GajaePetWidget {
 		// transparent canvas, so an armed iTerm lease keeps its initial timeline
 		// until a real placement or geometry change requires a new submission.
 		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
-		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
+		if (this.#itermSubmitPending) return;
+		if (semantic === this.#itermLastSemantic && this.#itermLease) {
+			this.#armFixedSuffixScrollRegion(this.#itermLease);
+			return;
+		}
 		this.#itermLastSemantic = semantic;
 		this.#itermSubmitPending = true;
 		const generation = this.#itermGeneration;
@@ -741,14 +752,7 @@ export class GajaePetWidget {
 			return;
 		}
 		this.#releaseFixedSuffixScrollRegion();
-		const fixedSuffixScrollRegionToken = this.#ui.acquireFixedSuffixScrollRegion(this.#itermOwner);
-		if (!fixedSuffixScrollRegionToken || !current() || this.#itermLease !== token) {
-			if (fixedSuffixScrollRegionToken) this.#ui.releaseFixedSuffixScrollRegion(fixedSuffixScrollRegionToken);
-			return;
-		}
-		this.#fixedSuffixScrollRegionToken = fixedSuffixScrollRegionToken;
-		if (this.#ui.armFixedSuffixScrollRegion(fixedSuffixScrollRegionToken, token) === undefined)
-			this.#releaseFixedSuffixScrollRegion();
+		this.#armFixedSuffixScrollRegion(token);
 	}
 	#scheduleAutoFlex(now: number): void {
 		if (!this.#autoFlexGapMs) return;
