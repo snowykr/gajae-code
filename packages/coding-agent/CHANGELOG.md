@@ -10,6 +10,7 @@
 - Notification settings now expose first-class Telegram, Discord, and Slack configuration, desired-intent toggles, provider-local quarantine and repair guidance, explicit `keep | replace | remove` secret actions, provider-specific health/test diagnostics, and truthful saved-but-runtime-degraded outcomes. The global master preserves provider credentials and intent, `GJC_NOTIFICATIONS=0` suppresses only automatic generic-session admission, and blocked Telegram ownership uses an isolated chat-only endpoint so verified Discord or Slack siblings can continue without exposing the shared endpoint.
 - `/import-session codex [session-id ...]` imports selected Codex histories, or every Codex history bound to the current workspace when IDs are omitted, into resumable native v5 sessions. Imports stream through bounded sanitization and quarantine, preserve source provenance, publish atomically and idempotently, support transcripts above 64 MiB through memory-guard checkpointing, and remain unavailable to ACP/remote clients.
 
+- Added capability-gated iTerm2 Pet GIF rendering with managed tmux transport, manual-history suspension, and lifecycle-safe raster cleanup.
 ### Fixed
 
 - Ordinary `ask` selectors now bound long question premises and page through every premise row without skipping rows hidden by overflow indicators (#3675).
