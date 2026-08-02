@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ## [0.12.8] - 2026-08-02
+### Added
+
+- Added an opt-in fixed-suffix DECSTBM transaction API for terminal-native transcript scrollback while a bottom-pinned suffix remains stable.
 ### Fixed
 
 - Fixed a tool block being rendered two or three times in the transcript (a pending `⏳` copy stranded above its own completed `✓` copy, with the rows between duplicated). When a block above the live viewport top grows in place — the bash tool's compact call render becoming a partial box and then a final box, with the editor/status chrome keeping it off-screen — the "commit only the changed visible suffix" path emitted rows by index even though the growth had shifted committed content down across the native-scrollback frontier, so rows already in scrollback were appended a second time under their new content. The suffix commit is now taken only when the last committed row is unchanged (a same-length off-screen substitution, such as a streaming status line); growth that shifts the committed boundary repaints the live viewport instead.
@@ -10,6 +13,7 @@
 - Restored the `isProcessTerminal`/`shouldUseViewportRepaintForHost` gate on the width-change viewport-repaint intercept so plain terminals (non-multiplexer, non-process-terminal) use `fullRender` for width changes instead of an unconditional viewport repaint. The #3684 chain removed this gate, causing lossless Korean/CJK prose wrapping to break at narrow widths because the viewport repaint only painted the visible rows without committing the full transcript to scrollback (#1979).
 - Restored the `fullRender` fallback for the `firstChanged < viewportTop` branch on non-viewport-repaint hosts, so above-viewport mutations replay the full frame instead of silently viewport-repainting.
 - Propagated IME cursor write failure from `#writeRenderBufferAndReanchorImeCursor` so callers detect terminal detach when the deferred cursor write fails after the shared frame commits.
+- Added leased iTerm2 inline-GIF rendering support with protected renderer clipping, lifecycle cleanup, and cell-metric refresh on resize.
 
 ## [0.12.7] - 2026-07-31
 
