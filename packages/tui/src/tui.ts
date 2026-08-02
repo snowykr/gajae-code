@@ -1920,11 +1920,9 @@ export class TUI extends Container {
 			)
 				return { queueId: id, operation: op.type, status: "stale-token" };
 			if (
-				this.#fixedSuffixScrollRegionResetPending &&
-				!this.#guardTerminalOperation(() => this.terminal.write("\x1b[r\x1b[?6l"))
+				!this.#writeFixedSuffixResetBefore(bytes => this.#guardTerminalOperation(() => this.terminal.write(bytes)))
 			)
 				return failed();
-			this.#fixedSuffixScrollRegionResetPending = false;
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
@@ -1996,7 +1994,7 @@ export class TUI extends Container {
 			lease.revoked = true;
 			this.#rasterLeases.delete(request.token.ownerId);
 			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
-			const ok = this.#guardTerminalOperation(() => this.terminal.write(erase));
+			const ok = this.#writeTerminal(erase);
 			if (!ok)
 				this.#rasterCleanup.set(request.token.ownerId, {
 					token: lease.token,
@@ -2347,8 +2345,17 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 	}
 
+	#writeFixedSuffixResetBefore(write: (data: string) => boolean): boolean {
+		if (!this.#fixedSuffixScrollRegionResetPending) return true;
+		if (!write("\x1b[r\x1b[?6l")) return false;
+		this.#fixedSuffixScrollRegionResetPending = false;
+		return true;
+	}
 	#writeTerminal(data: string, deferRenderFailure = false): boolean {
-		return this.#guardTerminalOperation(() => this.terminal.write(data), !deferRenderFailure);
+		const write = (bytes: string) =>
+			this.#guardTerminalOperation(() => this.terminal.write(bytes), !deferRenderFailure);
+		if (data !== "\x1b[r\x1b[?6l" && !this.#writeFixedSuffixResetBefore(write)) return false;
+		return write(data);
 	}
 
 	#hideCursor(): boolean {
@@ -2378,22 +2385,26 @@ export class TUI extends Container {
 	}
 
 	#writeLifecycleCleanup(data: string): boolean {
-		if (!this.terminal.available) {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		try {
-			this.terminal.write(data);
-		} catch {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		if (!this.terminal.available) {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		this.#terminalUnavailable = false;
-		return true;
+		const write = (bytes: string): boolean => {
+			if (!this.terminal.available) {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			try {
+				this.terminal.write(bytes);
+			} catch {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			if (!this.terminal.available) {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			this.#terminalUnavailable = false;
+			return true;
+		};
+		if (!this.#writeFixedSuffixResetBefore(write)) return false;
+		return write(data);
 	}
 
 	addInputListener(listener: InputListener): () => void {

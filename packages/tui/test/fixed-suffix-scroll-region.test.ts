@@ -377,4 +377,33 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
+	it("resets a released fixed plane before queued terminal cleanup", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "test-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("test-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			tui.releaseFixedSuffixScrollRegion(token);
+			term.clearWriteLog();
+			await tui.queueTerminalCleanup("after-release");
+			expect(term.getWriteLog().join("")).toContain("\x1b[r\x1b[?6lafter-release");
+			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
+		} finally {
+			tui.stop();
+		}
+	});
 });
