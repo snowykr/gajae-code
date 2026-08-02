@@ -1560,16 +1560,36 @@ describe("GajaePetWidget", () => {
 				.map(record => new TextDecoder().decode(record))
 				.filter(record => record.includes("MultipartFile="));
 			expect(headers).toHaveLength(1);
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const gifOptions = {
+				skin: "red" as const,
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			};
+			const workingGif = getGajaePetGifCached({
+				...gifOptions,
+				timeline: [...workingTimeline(), { name: "base", delayMs: 700 }],
+				disposal: "restore-previous",
+			});
+			const idleGif = getGajaePetGifCached({
+				...gifOptions,
+				timeline: [...idleTimeline(), { name: "base", delayMs: 700 }],
+			});
+			const firstRecords = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			expect(firstRecords.slice(1, -1)).toEqual([...workingGif.multipart]);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			expect(
-				stubs
-					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(2);
+			const records = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			const firstSubmissionLength = workingGif.multipart.length + 2;
+			expect(records.slice(firstSubmissionLength + 1, -1)).toEqual([...idleGif.multipart]);
+			expect(records.filter(record => record.includes("MultipartFile="))).toHaveLength(2);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
