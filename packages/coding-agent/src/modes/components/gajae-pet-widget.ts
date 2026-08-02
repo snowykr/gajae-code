@@ -1,7 +1,6 @@
 import {
 	type AnimationRegistration,
 	buildGajaePixelFrames,
-	burstTimeline,
 	type CellRect,
 	type Component,
 	type Container,
@@ -20,7 +19,6 @@ import {
 	type RasterLeaseToken,
 	registerAnimationCallback,
 	type TUI,
-	workingTimeline,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
@@ -494,7 +492,7 @@ export class GajaePetWidget {
 		return "base";
 	}
 
-	#tickIterm(now: number): void {
+	#tickIterm(_now: number): void {
 		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) {
 			this.#releaseFixedSuffixScrollRegion();
 			return;
@@ -565,12 +563,11 @@ export class GajaePetWidget {
 			this.#releaseFixedSuffixScrollRegion();
 			return;
 		}
-		const working = this.#isWorking();
-		const flexing = this.#flexUntil > now;
 		// OSC 1337 has no image-frame replacement primitive. Re-uploading a GIF
 		// for ordinary working/idle or auto-flex transitions visibly flashes its
-		// transparent canvas, so an armed iTerm lease keeps its initial timeline
-		// until a real placement or geometry change requires a new submission.
+		// transparent canvas, so an armed iTerm lease keeps one stable idle loop.
+		// A working or burst GIF can end on an opaque intermediate frame and leave
+		// an idle Pet as a solid box.
 		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
 		if (this.#itermSubmitPending) return;
 		if (semantic === this.#itermLastSemantic && this.#itermLease) {
@@ -586,8 +583,6 @@ export class GajaePetWidget {
 			availability.epoch,
 			availability.mode,
 			semantic,
-			working,
-			flexing,
 			{
 				columns: this.#ui.terminal.columns,
 				rows: terminalRows,
@@ -606,8 +601,6 @@ export class GajaePetWidget {
 		epoch: number,
 		mode: "direct" | "managed",
 		semantic: string,
-		working: boolean,
-		flexing: boolean,
 		geometry: Readonly<{ columns: number; rows: number; cellWidthPx: number; cellHeightPx: number }>,
 		composerBottomOffset: number,
 	): Promise<void> {
@@ -693,11 +686,7 @@ export class GajaePetWidget {
 			this.#itermLease = token;
 		}
 		this.#itermLastSemantic = semantic;
-		const frames = flexing
-			? burstTimeline(this.#mode === "off" ? "red" : this.#mode)
-			: working
-				? workingTimeline()
-				: idleTimeline();
+		const frames = idleTimeline();
 		const cell = getCellDimensions();
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
