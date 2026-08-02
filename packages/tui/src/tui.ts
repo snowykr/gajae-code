@@ -4729,9 +4729,21 @@ export class TUI extends Container {
 			if (firstChanged !== changedTop) appendStart = false;
 		}
 
-		// No changes - but still need to update hardware cursor position if it moved
+		// No changes - but still need to update hardware cursor position if it moved.
+		// A multipart raster prefix owns the terminal cursor until its records and
+		// restore suffix are delivered; queue a no-op cursor update behind it rather
+		// than moving the GIF placement between prefix and records.
 		if (firstChanged === -1) {
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			if (this.#rasterPending > 0) {
+				void this.#enqueueRaster(() => {
+					if (this.#stopped || !this.terminalAvailable) return false;
+					const written = this.#writeCursorPosition(cursorPos, newLines.length);
+					if (written) this.#refreshPaintedLiveViewportObservation(height);
+					return written;
+				});
+				return;
+			}
 			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}

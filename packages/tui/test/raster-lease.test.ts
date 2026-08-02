@@ -202,6 +202,47 @@ describe("TUI raster lease public boundary", () => {
 		expect(output).not.toContain("\x1b[1;1H");
 		expect(output).toEndWith("\x1b[?25h");
 	});
+	it("queues a no-op cursor move behind a multipart placement barrier", async () => {
+		const { tui, terminal } = await setup(true);
+		let cursorColumn = 0;
+		const component: Component = {
+			render: () => (cursorColumn === 0 ? [`${CURSOR_MARKER}x`] : [`x${CURSOR_MARKER}`]),
+			invalidate() {},
+		};
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease(request("multipart-cursor", rect(8, 3, 2, 1)));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const prefixEntered = Promise.withResolvers<void>();
+		const releaseBarrier = Promise.withResolvers<boolean>();
+		terminal.clearWriteLog();
+		const multipart = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("PREFIX"),
+				afterPrefix: async () => {
+					prefixEntered.resolve();
+					return releaseBarrier.promise;
+				},
+				records: [bytes("RECORD")],
+				suffix: bytes("RESTORE"),
+			},
+		});
+		await prefixEntered.promise;
+		cursorColumn = 1;
+		tui.requestRender();
+		await Bun.sleep(20);
+		expect(terminal.getWriteLog().join("")).toBe("PREFIX");
+		releaseBarrier.resolve(true);
+		expect((await multipart).status).toBe("written");
+		await Bun.sleep(20);
+		const output = terminal.getWriteLog().join("");
+		expect(output).toContain("PREFIXRECORDRESTORE");
+		expect(output.indexOf("PREFIXRECORDRESTORE")).toBeLessThan(output.indexOf("\x1b[2G"));
+		tui.stop();
+	});
 	it("guards raster invalidation so erase placement cannot steal an active cursor", async () => {
 		const { tui, terminal } = await setup(true);
 		const component: Component = { render: () => [`input${CURSOR_MARKER}`], invalidate() {} };
