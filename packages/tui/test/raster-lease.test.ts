@@ -202,6 +202,47 @@ describe("TUI raster lease public boundary", () => {
 		expect(output).not.toContain("\x1b[1;1H");
 		expect(output).toEndWith("\x1b[?25h");
 	});
+	it("queues a no-op cursor move behind a multipart placement barrier", async () => {
+		const { tui, terminal } = await setup(true);
+		let cursorColumn = 0;
+		const component: Component = {
+			render: () => (cursorColumn === 0 ? [`${CURSOR_MARKER}x`] : [`x${CURSOR_MARKER}`]),
+			invalidate() {},
+		};
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		const lease = await tui.acquireRasterLease(request("multipart-cursor", rect(8, 3, 2, 1)));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const prefixEntered = Promise.withResolvers<void>();
+		const releaseBarrier = Promise.withResolvers<boolean>();
+		terminal.clearWriteLog();
+		const multipart = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("PREFIX"),
+				afterPrefix: async () => {
+					prefixEntered.resolve();
+					return releaseBarrier.promise;
+				},
+				records: [bytes("RECORD")],
+				suffix: bytes("RESTORE"),
+			},
+		});
+		await prefixEntered.promise;
+		cursorColumn = 1;
+		tui.requestRender();
+		await Bun.sleep(20);
+		expect(terminal.getWriteLog().join("")).toBe("PREFIX");
+		releaseBarrier.resolve(true);
+		expect((await multipart).status).toBe("written");
+		await Bun.sleep(20);
+		const output = terminal.getWriteLog().join("");
+		expect(output).toContain("PREFIXRECORDRESTORE");
+		expect(output.indexOf("PREFIXRECORDRESTORE")).toBeLessThan(output.indexOf("\x1b[2G"));
+		tui.stop();
+	});
 	it("guards raster invalidation so erase placement cannot steal an active cursor", async () => {
 		const { tui, terminal } = await setup(true);
 		const component: Component = { render: () => [`input${CURSOR_MARKER}`], invalidate() {} };
@@ -442,6 +483,41 @@ describe("TUI raster lease public boundary", () => {
 		expect(output).toContain("\x1b[1G\x1b[8X");
 		expect(output).toContain("\x1b[1;1H");
 		expect(output).toContain("\x1b[4;1H");
+		expect(calls).toBe(0);
+		tui.stop();
+	});
+	it("preserves an eligible pre-arm lease until its fixed suffix owner arms native admission", async () => {
+		const { tui, terminal } = await setup();
+		let lines = ["one", "two", "three", "four"];
+		let calls = 0;
+		const component: Component = { render: () => lines, invalidate() {} };
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		const initialScrollbackLength = terminal.getScrollBuffer().length;
+
+		const lease = await tui.acquireRasterLease({
+			...request("iterm-pre-arm", rect(8, 3, 2, 1), "ERASE", () => calls++),
+			nativeScrollbackEligible: true,
+		});
+		expect(lease.status).toBe("acquired");
+		terminal.clearWriteLog();
+		lines = [...lines, "five"];
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const output = terminal.getWriteLog().join("");
+		expect(output).not.toContain("ERASE");
+		expect(output).not.toContain("\r\n");
+		expect(calls).toBe(0);
+		await terminal.flush();
+		expect(terminal.getScrollBuffer()).toHaveLength(initialScrollbackLength);
+
+		lines = [...lines, "six"];
+		terminal.clearWriteLog();
+		tui.requestRender();
+		await terminal.waitForRender();
+		expect(terminal.getWriteLog().join("")).not.toContain("ERASE");
 		expect(calls).toBe(0);
 		tui.stop();
 	});

@@ -1,10 +1,10 @@
 import {
 	type AnimationRegistration,
 	buildGajaePixelFrames,
-	burstTimeline,
 	type CellRect,
 	type Component,
 	type Container,
+	type FixedSuffixScrollRegionToken,
 	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
@@ -187,6 +187,7 @@ export class GajaePetWidget {
 	/** Shared-emitter epoch from the last time this widget owned its TUI. */
 	#ownedOverlayEpoch = 0;
 	#itermLease: RasterLeaseToken | undefined;
+	#fixedSuffixScrollRegionToken: FixedSuffixScrollRegionToken | undefined;
 	#disposePromise: Promise<void> | undefined;
 	/** Raster invalidation must settle before disposeAsync starts lifecycle recovery. */
 	#disposeRasterBarrier: Promise<void> = Promise.resolve();
@@ -249,9 +250,9 @@ export class GajaePetWidget {
 	async suspendItermCapability(): Promise<void> {
 		if (!this.#isActiveOwner()) return;
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		const lease = this.#itermLease;
 		this.#itermLease = undefined;
-
 		this.#itermLastSemantic = "";
 		if (lease) await this.#ui.invalidateRasterLease({ token: lease, cause: "capability-loss" });
 		this.#ui.requestRender(true);
@@ -277,6 +278,7 @@ export class GajaePetWidget {
 		if (mode === "off") {
 			if (!this.#canMutateSharedUi()) return;
 			this.#itermGeneration++;
+			this.#releaseFixedSuffixScrollRegion();
 			if (this.#itermLease) {
 				void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "mode-off" });
 				this.#itermLease = undefined;
@@ -303,6 +305,7 @@ export class GajaePetWidget {
 		const predecessor = petOverlayEmitterOwners.get(this.#ui);
 		if (predecessor && predecessor !== this) predecessor.#retireForSuccessor();
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		if (this.#itermLease) {
 			void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "explicit" });
 			this.#itermLease = undefined;
@@ -390,6 +393,7 @@ export class GajaePetWidget {
 		this.#disposeNeedsLifecycle = canMutateSharedUi;
 		this.#disposed = true;
 		this.#itermGeneration++;
+		this.#releaseFixedSuffixScrollRegion();
 		const lease = this.#itermLease;
 		this.#itermLease = undefined;
 		if (lease)
@@ -439,6 +443,23 @@ export class GajaePetWidget {
 		}
 	}
 
+	#releaseFixedSuffixScrollRegion(): void {
+		const token = this.#fixedSuffixScrollRegionToken;
+		this.#fixedSuffixScrollRegionToken = undefined;
+		if (token) this.#ui.releaseFixedSuffixScrollRegion(token);
+	}
+	#armFixedSuffixScrollRegion(lease: RasterLeaseToken): void {
+		const existing = this.#fixedSuffixScrollRegionToken;
+		if (existing && !this.#ui.isFixedSuffixScrollRegionCurrent(existing)) {
+			this.#fixedSuffixScrollRegionToken = undefined;
+		}
+		if (this.#fixedSuffixScrollRegionToken || this.#itermLease !== lease) return;
+		const token = this.#ui.acquireFixedSuffixScrollRegion(this.#itermOwner);
+		if (!token) return;
+		this.#fixedSuffixScrollRegionToken = token;
+		if (this.#ui.armFixedSuffixScrollRegion(token, lease) === undefined) this.#releaseFixedSuffixScrollRegion();
+	}
+
 	#mountEditor(framed: boolean): void {
 		this.#editorContainer.clear();
 		this.#editorContainer.addChild(framed ? this.#framedEditor : this.#editor);
@@ -476,8 +497,11 @@ export class GajaePetWidget {
 		return "base";
 	}
 
-	#tickIterm(now: number): void {
-		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) return;
+	#tickIterm(_now: number, working: boolean): void {
+		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) {
+			this.#releaseFixedSuffixScrollRegion();
+			return;
+		}
 		const cell = getCellDimensions();
 		const pixelColumns = Math.max(1, Math.ceil((PET_ART_ROWS * cell.heightPx) / cell.widthPx));
 		const pixelRows = ITERM_CANVAS_ROWS;
@@ -485,6 +509,7 @@ export class GajaePetWidget {
 		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
 			metricsChanged = true;
 			this.#itermGeneration++;
+			this.#releaseFixedSuffixScrollRegion();
 			const lease = this.#itermLease;
 			this.#itermLease = undefined;
 
@@ -499,6 +524,7 @@ export class GajaePetWidget {
 		if (!this.#framedEditor.canFit(this.#ui.terminal.columns)) {
 			if (!metricsChanged) {
 				this.#itermGeneration++;
+				this.#releaseFixedSuffixScrollRegion();
 				const lease = this.#itermLease;
 				this.#itermLease = undefined;
 
@@ -513,6 +539,7 @@ export class GajaePetWidget {
 		if (terminalRows < ITERM_CANVAS_ROWS + PET_RAISE_ROWS) {
 			if (!metricsChanged) {
 				this.#itermGeneration++;
+				this.#releaseFixedSuffixScrollRegion();
 				const lease = this.#itermLease;
 				this.#itermLease = undefined;
 
@@ -537,11 +564,20 @@ export class GajaePetWidget {
 			height: pixelRows,
 		};
 		const availability = getVerifiedItermPetAvailability();
-		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) return;
-		const working = this.#isWorking();
-		const flexing = this.#flexUntil > now;
-		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
-		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
+		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) {
+			this.#releaseFixedSuffixScrollRegion();
+			return;
+		}
+		// iTerm replaces a resident GIF only through another MultipartFile transfer.
+		// Include the activity phase so it changes exactly once per work boundary;
+		// steady ticks retain the existing lease and image.
+		const animationPhase = working ? "working" : "idle";
+		const semantic = `${this.#mode}:${animationPhase}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		if (this.#itermSubmitPending) return;
+		if (semantic === this.#itermLastSemantic && this.#itermLease) {
+			this.#armFixedSuffixScrollRegion(this.#itermLease);
+			return;
+		}
 		this.#itermLastSemantic = semantic;
 		this.#itermSubmitPending = true;
 		const generation = this.#itermGeneration;
@@ -551,8 +587,7 @@ export class GajaePetWidget {
 			availability.epoch,
 			availability.mode,
 			semantic,
-			working,
-			flexing,
+			animationPhase,
 			{
 				columns: this.#ui.terminal.columns,
 				rows: terminalRows,
@@ -571,14 +606,12 @@ export class GajaePetWidget {
 		epoch: number,
 		mode: "direct" | "managed",
 		semantic: string,
-		working: boolean,
-		flexing: boolean,
+		animationPhase: "idle" | "working",
 		geometry: Readonly<{ columns: number; rows: number; cellWidthPx: number; cellHeightPx: number }>,
 		composerBottomOffset: number,
 	): Promise<void> {
-		const current = () => {
+		const currentGeometry = () => {
 			const availability = getVerifiedItermPetAvailability();
-			const flexingNow = this.#flexUntil > performance.now();
 			const terminal = this.#ui.terminal;
 			const cell = getCellDimensions();
 			const liveComposerBottomOffset = this.#getComposerBottomOffset();
@@ -596,8 +629,6 @@ export class GajaePetWidget {
 				availability.epoch === epoch &&
 				availability.mode === mode &&
 				!this.#ui.manualViewportActive &&
-				this.#isWorking() === working &&
-				flexingNow === flexing &&
 				this.#framedEditor.canFit(terminal.columns) &&
 				terminal.columns === geometry.columns &&
 				terminal.rows === geometry.rows &&
@@ -618,13 +649,14 @@ export class GajaePetWidget {
 				token.rect.width !== rect.width ||
 				token.rect.height !== rect.height)
 		) {
+			this.#releaseFixedSuffixScrollRegion();
 			await this.#ui.invalidateRasterLease({ token, cause: "resize" });
 			if (this.#itermLease === token) {
 				this.#itermLease = undefined;
 			}
 			token = undefined;
 		}
-		if (!current()) return;
+		if (!currentGeometry()) return;
 		if (!token) {
 			const acquired = await this.#ui.acquireRasterLease({
 				ownerId: this.#itermOwner,
@@ -638,15 +670,17 @@ export class GajaePetWidget {
 						).join("")}`,
 					),
 				},
+				nativeScrollbackEligible: true,
 				onInvalidated: notice => {
 					if (this.#itermLease === notice.token) {
+						this.#releaseFixedSuffixScrollRegion();
 						this.#itermLease = undefined;
-
 						this.#itermLastSemantic = "";
 					}
 				},
 			});
-			if (!current() || acquired.status !== "acquired") {
+			if (!currentGeometry() || acquired.status !== "acquired") {
+				this.#releaseFixedSuffixScrollRegion();
 				if (acquired.status === "acquired")
 					await this.#ui.invalidateRasterLease({
 						token: acquired.token,
@@ -658,15 +692,15 @@ export class GajaePetWidget {
 			this.#itermLease = token;
 		}
 		this.#itermLastSemantic = semantic;
-		const frames = flexing
-			? burstTimeline(this.#mode === "off" ? "red" : this.#mode)
-			: working
-				? workingTimeline()
-				: idleTimeline();
+		const frames =
+			animationPhase === "working"
+				? [...workingTimeline(), { name: "base" as const, delayMs: 700 }]
+				: [...idleTimeline(), { name: "base" as const, delayMs: 700 }];
 		const cell = getCellDimensions();
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
 			timeline: frames,
+			disposal: animationPhase === "working" ? "restore-previous" : "restore-background",
 			targetRows: PET_ART_ROWS,
 			rectangle: { width: rect.width * cell.widthPx, height: rect.height * cell.heightPx },
 			// Reserve a three-cell canvas but keep the two-cell sprite vertically centered:
@@ -698,23 +732,26 @@ export class GajaePetWidget {
 				),
 				afterPrefix:
 					mode === "managed"
-						? async () => (current() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
+						? async () => (currentGeometry() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
 						: undefined,
 				replayPrefix: mode === "managed" ? new TextEncoder().encode(cursorPosition) : undefined,
 				records: encodedRecords,
 				suffix: new TextEncoder().encode(cursorRestore),
 				abortSuffix: mode === "managed" ? new TextEncoder().encode(cursorRestore) : undefined,
 				restoreCursorVisibility: true,
-				shouldWrite: current,
+				shouldWrite: currentGeometry,
 			},
 		});
-		if (!current() || submit.status !== "written") {
+		if (!currentGeometry() || submit.status !== "written") {
+			this.#releaseFixedSuffixScrollRegion();
 			await this.#ui.invalidateRasterLease({ token, cause: "capability-loss" });
 			if (this.#itermLease === token) {
 				this.#itermLease = undefined;
 			}
 			return;
 		}
+		this.#releaseFixedSuffixScrollRegion();
+		this.#armFixedSuffixScrollRegion(token);
 	}
 	#scheduleAutoFlex(now: number): void {
 		if (!this.#autoFlexGapMs) return;
@@ -755,7 +792,7 @@ export class GajaePetWidget {
 			}
 		}
 		if (this.#itermProtocol) {
-			this.#tickIterm(now);
+			this.#tickIterm(now, working);
 			return;
 		}
 		if (this.#mode === "off" || !this.#pixel) return;

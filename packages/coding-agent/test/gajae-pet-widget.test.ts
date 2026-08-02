@@ -3,8 +3,11 @@ import {
 	__animationSchedulerTestHooks,
 	Container,
 	getCellDimensions,
+	getGajaePetGifCached,
+	idleTimeline,
 	setCellDimensions,
 	type TUI,
+	workingTimeline,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "../src/modes/components/custom-editor";
@@ -31,12 +34,15 @@ function makeStubs(columns = 80, rows = 30) {
 	let failWrites = false;
 	let manualViewportActive = false;
 	let rasterToken = 0;
+	let fixedSuffixScrollRegionToken = 0;
+	const fixedSuffixScrollRegionOwners = new Map<string, { ownerId: string; generation: number }>();
 	const rasterOutputs: Uint8Array[] = [];
 	const rasterCursorVisibilityRestores: Array<boolean | undefined> = [];
 	const invalidatedRasterLeases: Array<{ token: unknown; cause?: string }> = [];
 	const rasterLeaseRequests: Array<{
 		rect: { column: number; row: number; width: number; height: number };
 		erase: { type: string; bytes: Uint8Array };
+		nativeScrollbackEligible?: boolean;
 	}> = [];
 	let delayRasterAcquire = false;
 	const rasterAcquireWaiters: Array<() => void> = [];
@@ -85,12 +91,32 @@ function makeStubs(columns = 80, rows = 30) {
 			return manualViewportActive;
 		},
 		terminal,
+		acquireFixedSuffixScrollRegion: (ownerId: string) => {
+			const token = { ownerId, generation: ++fixedSuffixScrollRegionToken };
+			fixedSuffixScrollRegionOwners.set(ownerId, token);
+			return token;
+		},
+		releaseFixedSuffixScrollRegion: (token: { ownerId: string; generation: number }) => {
+			if (fixedSuffixScrollRegionOwners.get(token.ownerId) === token)
+				fixedSuffixScrollRegionOwners.delete(token.ownerId);
+		},
+		isFixedSuffixScrollRegionCurrent: (token: { ownerId: string; generation: number }) =>
+			fixedSuffixScrollRegionOwners.get(token.ownerId) === token,
+		armFixedSuffixScrollRegion: (token: { ownerId: string; generation: number }) => {
+			if (fixedSuffixScrollRegionOwners.get(token.ownerId) !== token) return undefined;
+			return ++renderRequests;
+		},
 		acquireRasterLease: async (request: {
 			ownerId: string;
 			rect: { column: number; row: number; width: number; height: number };
 			erase: { type: string; bytes: Uint8Array };
+			nativeScrollbackEligible?: boolean;
 		}) => {
-			rasterLeaseRequests.push({ rect: request.rect, erase: request.erase });
+			rasterLeaseRequests.push({
+				rect: request.rect,
+				erase: request.erase,
+				nativeScrollbackEligible: request.nativeScrollbackEligible,
+			});
 			const result = {
 				status: "acquired",
 				token: { ownerId: request.ownerId, generation: ++rasterToken, rect: request.rect },
@@ -162,6 +188,8 @@ function makeStubs(columns = 80, rows = 30) {
 		getInvalidatedRasterLeases: () => invalidatedRasterLeases,
 		getRasterLeaseRequests: () => rasterLeaseRequests,
 		getRasterCursorVisibilityRestores: () => rasterCursorVisibilityRestores,
+		getFixedSuffixScrollRegionOwnerCount: () => fixedSuffixScrollRegionOwners.size,
+		resetFixedSuffixScrollRegions: () => fixedSuffixScrollRegionOwners.clear(),
 		getPendingRasterAcquireCount: () => rasterAcquireWaiters.length,
 		setRasterAcquireDelayed: (value: boolean) => {
 			delayRasterAcquire = value;
@@ -1196,6 +1224,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.setMode("red");
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
 
 			// composerBottom = 28; the three-row canvas starts at zero-based row 25.
 			// Its transparent half-cell insets center the two-row sprite in that canvas.
@@ -1220,7 +1249,7 @@ describe("GajaePetWidget", () => {
 			expect(directRecords[1]).toContain("\x1b]1337;MultipartFile=");
 			expect(directRecords[1]).toContain("width=4;height=3;");
 			expect(directRecords[1]).toContain("size=");
-			expect(directRecords[1]).toContain("inline=1;preserveAspectRatio=0:");
+			expect(directRecords[1]).toContain("inline=1;preserveAspectRatio=0\x07");
 			expect(directRecords.slice(1).filter(record => record.includes("\x1b[28;76H")).length).toBe(0);
 			expect(directRecords.slice(1).every(record => !record.includes("\x1b[28;76H"))).toBe(true);
 			expect(directRecords.at(-2)).toBe("\x1b]1337;FileEnd\x07");
@@ -1302,6 +1331,7 @@ describe("GajaePetWidget", () => {
 			expect(new TextDecoder().decode(lease?.erase.bytes)).toBe(
 				"\x1b[0m\x1b[1;76H\x1b[4X\x1b[2;76H\x1b[4X\x1b[3;76H\x1b[4X",
 			);
+			expect(lease?.nativeScrollbackEligible).toBe(true);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1397,7 +1427,39 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("runs scheduled auto-flex bursts on the iTerm raster path", async () => {
+	it("rearms a reset fixed suffix owner without re-uploading the iTerm GIF", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
+
+			stubs.resetFixedSuffixScrollRegions();
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("keeps the initial iTerm GIF during scheduled auto-flex bursts", async () => {
 		vi.useFakeTimers();
 		const stubs = makeWidget(80, 30, {
 			protocol: null,
@@ -1415,19 +1477,32 @@ describe("GajaePetWidget", () => {
 			await flushAsyncChain();
 
 			expect(stubs.widget.isFlexing).toBe(true);
-			const headers = stubs
-				.getRasterOutputs()
-				.map(record => new TextDecoder().decode(record))
-				.filter(record => record.includes("MultipartFile="));
-			expect(headers).toHaveLength(2);
-			const sizes = headers.map(header => Number(/;size=(\d+);/u.exec(header)?.[1]));
-			expect(sizes[1]).toBeGreaterThan(sizes[0]);
+			const records = stubs.getRasterOutputs();
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const expectedGif = getGajaePetGifCached({
+				skin: "red",
+				timeline: [...workingTimeline(), { name: "base", delayMs: 700 }],
+				disposal: "restore-previous",
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			});
+			expect(records.slice(1, -1).map(record => new TextDecoder().decode(record))).toEqual([
+				...expectedGif.multipart,
+			]);
+			expect(
+				records.map(record => new TextDecoder().decode(record)).filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("keeps the iTerm GIF on its idle timeline while inactive", async () => {
+	it("uploads an idle iTerm GIF while inactive", async () => {
 		vi.useFakeTimers();
 		const stubs = makeWidget(80, 30, { protocol: null, autoFlexGapMs: [500, 500] });
 		try {
@@ -1439,18 +1514,30 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(700);
 			await flushAsyncChain();
 			expect(stubs.widget.isFlexing).toBe(false);
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const expectedGif = getGajaePetGifCached({
+				skin: "blue",
+				timeline: [...idleTimeline(), { name: "base", delayMs: 700 }],
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			});
 			expect(
 				stubs
 					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(1);
+					.slice(1, -1)
+					.map(record => new TextDecoder().decode(record)),
+			).toEqual([...expectedGif.multipart]);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("drops a stale iTerm worker GIF when activity ends during lease acquisition", async () => {
+	it("keeps an iTerm upload current when activity changes during lease acquisition", async () => {
 		vi.useFakeTimers();
 		let working = true;
 		const stubs = makeWidget(80, 30, {
@@ -1468,21 +1555,41 @@ describe("GajaePetWidget", () => {
 			working = false;
 			stubs.setRasterAcquireDelayed(false);
 			await flushAsyncChain();
-			expect(
-				stubs
-					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.some(record => record.includes("MultipartFile=")),
-			).toBe(false);
+			const headers = stubs
+				.getRasterOutputs()
+				.map(record => new TextDecoder().decode(record))
+				.filter(record => record.includes("MultipartFile="));
+			expect(headers).toHaveLength(1);
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const gifOptions = {
+				skin: "red" as const,
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			};
+			const workingGif = getGajaePetGifCached({
+				...gifOptions,
+				timeline: [...workingTimeline(), { name: "base", delayMs: 700 }],
+				disposal: "restore-previous",
+			});
+			const idleGif = getGajaePetGifCached({
+				...gifOptions,
+				timeline: [...idleTimeline(), { name: "base", delayMs: 700 }],
+			});
+			const firstRecords = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			expect(firstRecords.slice(1, -1)).toEqual([...workingGif.multipart]);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			expect(
-				stubs
-					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(1);
+			const records = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			const firstSubmissionLength = workingGif.multipart.length + 2;
+			expect(records.slice(firstSubmissionLength + 1, -1)).toEqual([...idleGif.multipart]);
+			expect(records.filter(record => record.includes("MultipartFile="))).toHaveLength(2);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1524,6 +1631,7 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(160);
 			await flushAsyncChain();
 			expect(stubs.getRasterOutputs()).toHaveLength(0);
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(0);
 
 			stubs.setManualViewportActive(false);
 			vi.advanceTimersByTime(80);
@@ -1534,6 +1642,38 @@ describe("GajaePetWidget", () => {
 					.map(record => new TextDecoder().decode(record))
 					.some(record => record.includes("MultipartFile=")),
 			).toBe(true);
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("rearms the fixed suffix after manual history without reuploading the iTerm GIF", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			const headers = () =>
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile="));
+			expect(headers()).toHaveLength(1);
+
+			stubs.setManualViewportActive(true);
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(0);
+
+			stubs.setManualViewportActive(false);
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getFixedSuffixScrollRegionOwnerCount()).toBe(1);
+			expect(headers()).toHaveLength(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1575,7 +1715,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("reuses one raster lease and applies cursor visibility for idle-working-idle transitions", async () => {
+	it("changes the resident iTerm GIF once per idle-working-idle boundary", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1594,24 +1734,31 @@ describe("GajaePetWidget", () => {
 			working = true;
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			const replacementPrefix = stubs
-				.getRasterOutputs()
-				.map(record => new TextDecoder().decode(record))
-				.find(record => record === "\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H");
-			expect(replacementPrefix).toBe("\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H");
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(2);
 			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true]);
 
 			working = false;
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
 			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true, true]);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(3);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("replaces the managed iTerm GIF without blanking its footprint", async () => {
+	it("replaces the managed iTerm GIF once when work starts", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1638,7 +1785,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("settles after replacing the idle raster with the working raster", async () => {
+	it("replaces an idle iTerm GIF when work starts without invalidating its lease", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });

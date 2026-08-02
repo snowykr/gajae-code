@@ -322,6 +322,8 @@ export interface GajaePetGifArtifact {
 	readonly multipart: readonly string[];
 	readonly tmuxDcs: readonly string[];
 }
+export type GajaeGifDisposal = "restore-background" | "restore-previous";
+
 export interface GajaePetGifOptions {
 	readonly skin?: PetSkinId;
 	readonly timeline?: GajaeGifTimeline;
@@ -331,6 +333,8 @@ export interface GajaePetGifOptions {
 	readonly rectangle?: GajaeGifRectangle;
 	readonly displaySize?: GajaeGifDisplaySize;
 	readonly contentInset?: GajaeGifContentInset;
+	/** Controls how a transparent animated frame is removed before its successor. */
+	readonly disposal?: GajaeGifDisposal;
 }
 const GIF_CLEAR = 256,
 	GIF_END = 257;
@@ -383,14 +387,21 @@ function isGifTimeline(input: GajaePetGifOptions | GajaeGifTimeline): input is G
 	return Array.isArray(input);
 }
 function gifOptions(input: GajaePetGifOptions | GajaeGifTimeline): Required<
-	Pick<GajaePetGifOptions, "skin" | "timeline" | "cellWidthPx" | "cellHeightPx" | "targetRows">
+	Pick<GajaePetGifOptions, "skin" | "timeline" | "cellWidthPx" | "cellHeightPx" | "targetRows" | "disposal">
 > & {
 	rectangle?: GajaeGifRectangle;
 	displaySize?: GajaeGifDisplaySize;
 	contentInset?: GajaeGifContentInset;
 } {
 	if (isGifTimeline(input)) {
-		return { skin: "red", timeline: input, cellWidthPx: 1, cellHeightPx: 1, targetRows: 16 };
+		return {
+			skin: "red",
+			timeline: input,
+			cellWidthPx: 1,
+			cellHeightPx: 1,
+			targetRows: 16,
+			disposal: "restore-background",
+		};
 	}
 	return {
 		skin: input.skin ?? "red",
@@ -401,6 +412,7 @@ function gifOptions(input: GajaePetGifOptions | GajaeGifTimeline): Required<
 		rectangle: input.rectangle,
 		displaySize: input.displaySize,
 		contentInset: input.contentInset,
+		disposal: input.disposal ?? "restore-background",
 	};
 }
 export function encodeGajaePetGif(input: GajaePetGifOptions | GajaeGifTimeline = {}): GajaePetGifArtifact {
@@ -467,11 +479,12 @@ export function encodeGajaePetGif(input: GajaePetGifOptions | GajaeGifTimeline =
 				pixels.push(ch === "." ? 0 : Math.max(1, paletteKeys.indexOf(ch) + 1));
 			}
 		const delay = Math.round(frame.delayMs / 10);
+		const graphicsControlPacked = o.disposal === "restore-previous" ? 0x0d : 0x09;
 		chunks.push(
 			33,
 			249,
 			4,
-			0x09,
+			graphicsControlPacked,
 			delay & 255,
 			delay >> 8,
 			0,
@@ -529,6 +542,7 @@ export function getGajaePetGifCached(input: GajaePetGifOptions | GajaeGifTimelin
 			o.rectangle,
 			o.displaySize,
 			o.contentInset,
+			o.disposal,
 		]),
 		hit = gifCache.get(key);
 	if (hit) {

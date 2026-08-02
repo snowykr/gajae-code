@@ -6,6 +6,7 @@
 ### Added
 
 - Added an opt-in fixed-suffix DECSTBM transaction API for terminal-native transcript scrollback while a bottom-pinned suffix remains stable.
+- The fixed-suffix scroll-region API can bind its current sole raster lease, preserving inline iTerm Pet cells while transcript rows enter native scrollback.
 ### Fixed
 
 - Fixed a tool block being rendered two or three times in the transcript (a pending `⏳` copy stranded above its own completed `✓` copy, with the rows between duplicated). When a block above the live viewport top grows in place — the bash tool's compact call render becoming a partial box and then a final box, with the editor/status chrome keeping it off-screen — the "commit only the changed visible suffix" path emitted rows by index even though the growth had shifted committed content down across the native-scrollback frontier, so rows already in scrollback were appended a second time under their new content. The suffix commit is now taken only when the last committed row is unchanged (a same-length off-screen substitution, such as a streaming status line); growth that shifts the committed boundary repaints the live viewport instead.

@@ -55,6 +55,7 @@ export type RasterLeaseRequest = Readonly<{
 	rect: CellRect;
 	erase: Readonly<{ type: "raster-erase"; bytes: Uint8Array }>;
 	onInvalidated?: (notice: RasterLeaseInvalidatedNotification) => void;
+	nativeScrollbackEligible?: boolean;
 }>;
 export type TerminalOutputOperation =
 	| Readonly<{ type: "generic-render"; rect: CellRect; bytes: Uint8Array }>
@@ -1002,6 +1003,8 @@ export class TUI extends Container {
 			token: RasterLeaseToken;
 			erase: Uint8Array;
 			callback?: (n: RasterLeaseInvalidatedNotification) => void;
+			nativeScrollbackEligible: boolean;
+			nativeScrollbackArmed: boolean;
 			revoked: boolean;
 		}
 	>();
@@ -1023,7 +1026,11 @@ export class TUI extends Container {
 	#fixedSuffixScrollRegionGeneration = 0;
 	#fixedSuffixScrollRegionOwners = new Map<string, FixedSuffixScrollRegionToken>();
 	#armedFixedSuffixScrollRegionToken: FixedSuffixScrollRegionToken | undefined;
+	#armedFixedSuffixScrollRegionRasterLease: RasterLeaseToken | undefined;
 	#fixedSuffixScrollRegionResetPending = false;
+	#fixedSuffixScrollPlane:
+		| Readonly<{ token: FixedSuffixScrollRegionToken; upperBottom: number; transcriptTop: number }>
+		| undefined;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -1288,37 +1295,87 @@ export class TUI extends Container {
 		this.#fixedSuffixScrollRegionOwners.set(ownerId, token);
 		return token;
 	}
+	/** Whether a fixed-suffix owner token still belongs to the current TUI generation. */
+	isFixedSuffixScrollRegionCurrent(token: FixedSuffixScrollRegionToken): boolean {
+		return this.#fixedSuffixScrollRegionOwners.get(token.ownerId) === token;
+	}
 
 	releaseFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken): void {
 		if (this.#fixedSuffixScrollRegionOwners.get(token.ownerId) !== token) return;
 		this.#fixedSuffixScrollRegionOwners.delete(token.ownerId);
 		if (this.#armedFixedSuffixScrollRegionToken === token) {
+			const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+			if (rasterLease !== undefined) {
+				const lease = this.#rasterLeases.get(rasterLease.ownerId);
+				if (lease?.token === rasterLease) lease.nativeScrollbackArmed = false;
+			}
 			this.#armedFixedSuffixScrollRegionToken = undefined;
+			this.#armedFixedSuffixScrollRegionRasterLease = undefined;
+		}
+		if (this.#fixedSuffixScrollPlane?.token === token) {
+			this.#fixedSuffixScrollPlane = undefined;
+			this.#fixedSuffixScrollRegionResetPending = true;
 		}
 	}
 
 	/**
 	 * Keep a current owner armed for eligible transcript appends. Every DECSTBM
-	 * transaction still establishes and resets its own terminal state.
+	 * transaction still establishes and resets its own terminal state. A supplied
+	 * raster lease must be current for the same owner and is preserved only when
+	 * it is the sole active lease.
 	 */
-	armFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken): number | undefined {
+	armFixedSuffixScrollRegion(token: FixedSuffixScrollRegionToken, rasterLease?: RasterLeaseToken): number | undefined {
 		if (
 			this.#fixedSuffixScrollRegionOwners.get(token.ownerId) !== token ||
 			!this.terminalAvailable ||
 			this.#stopped ||
 			this.manualViewportActive ||
-			this.#bottomPinnedComponent === null
+			this.#bottomPinnedComponent === null ||
+			(rasterLease !== undefined && this.#rasterLeases.get(token.ownerId)?.token !== rasterLease)
 		)
 			return undefined;
+		const lease = rasterLease === undefined ? undefined : this.#rasterLeases.get(token.ownerId);
+		if (rasterLease !== undefined && (!lease || lease.token !== rasterLease)) return undefined;
+		if (lease?.nativeScrollbackEligible && lease.token.rect.row === 0) return undefined;
+		const previousRasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+		if (previousRasterLease !== rasterLease && previousRasterLease !== undefined) {
+			const previousLease = this.#rasterLeases.get(previousRasterLease.ownerId);
+			if (previousLease?.token === previousRasterLease) previousLease.nativeScrollbackArmed = false;
+		}
+		if (lease?.nativeScrollbackEligible) lease.nativeScrollbackArmed = true;
 		this.#armedFixedSuffixScrollRegionToken = token;
+		this.#armedFixedSuffixScrollRegionRasterLease = rasterLease;
 		return this.requestRenderWithGeneration(false, "fixed-suffix-scroll-region");
 	}
 
 	#resetFixedSuffixScrollRegions(): void {
+		if (this.#fixedSuffixScrollPlane !== undefined) this.#fixedSuffixScrollRegionResetPending = true;
+		const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+		if (rasterLease !== undefined) {
+			const lease = this.#rasterLeases.get(rasterLease.ownerId);
+			if (lease?.token === rasterLease) lease.nativeScrollbackArmed = false;
+		}
+		this.#fixedSuffixScrollPlane = undefined;
 		this.#armedFixedSuffixScrollRegionToken = undefined;
+		this.#armedFixedSuffixScrollRegionRasterLease = undefined;
 		this.#fixedSuffixScrollRegionOwners.clear();
 	}
+	#hasCurrentArmedFixedSuffixRasterLease(): boolean {
+		const token = this.#armedFixedSuffixScrollRegionToken;
+		const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+		if (token === undefined || rasterLease === undefined || this.#rasterLeases.size !== 1) return false;
+		const lease = this.#rasterLeases.get(token.ownerId);
+		return (
+			this.#fixedSuffixScrollRegionOwners.get(token.ownerId) === token &&
+			rasterLease.ownerId === token.ownerId &&
+			lease?.token === rasterLease &&
+			lease.nativeScrollbackEligible &&
+			lease.nativeScrollbackArmed &&
+			lease.token.rect.row > 0
+		);
+	}
 
+	/** Report the logical output producer revision without coupling TUI to message types. */
 	/** Report the logical output producer revision without coupling TUI to message types. */
 	setViewportOutputSource(source: ViewportOutputSource | null): void {
 		const previous = this.#viewportOutputSource;
@@ -1802,7 +1859,8 @@ export class TUI extends Container {
 				typeof request.erase !== "object" ||
 				request.erase.type !== "raster-erase" ||
 				!(request.erase.bytes instanceof Uint8Array) ||
-				(request.onInvalidated !== undefined && typeof request.onInvalidated !== "function")
+				(request.onInvalidated !== undefined && typeof request.onInvalidated !== "function") ||
+				(request.nativeScrollbackEligible !== undefined && typeof request.nativeScrollbackEligible !== "boolean")
 			)
 				return { status: "rejected", reason: "invalid-geometry" };
 			if (!this.#validRect(request.rect)) return { status: "rejected", reason: "invalid-geometry" };
@@ -1824,6 +1882,8 @@ export class TUI extends Container {
 				token,
 				erase: new Uint8Array(request.erase.bytes),
 				callback: request.onInvalidated,
+				nativeScrollbackEligible: request.nativeScrollbackEligible === true,
+				nativeScrollbackArmed: false,
 				revoked: false,
 			});
 			return { status: "acquired", token };
@@ -1899,6 +1959,10 @@ export class TUI extends Container {
 				!op.shouldWrite()
 			)
 				return { queueId: id, operation: op.type, status: "stale-token" };
+			if (
+				!this.#writeFixedSuffixResetBefore(bytes => this.#guardTerminalOperation(() => this.terminal.write(bytes)))
+			)
+				return failed();
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
@@ -1970,7 +2034,7 @@ export class TUI extends Container {
 			lease.revoked = true;
 			this.#rasterLeases.delete(request.token.ownerId);
 			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
-			const ok = this.#guardTerminalOperation(() => this.terminal.write(erase));
+			const ok = this.#writeTerminal(erase);
 			if (!ok)
 				this.#rasterCleanup.set(request.token.ownerId, {
 					token: lease.token,
@@ -2129,7 +2193,7 @@ export class TUI extends Container {
 			)
 		)
 			return false;
-		return this.#guardTerminalOperation(() => this.terminal.write(buffer));
+		return this.#writeTerminal(buffer);
 	}
 	#writeProtectedRenderIngress(buffer: string): boolean {
 		const affected = [...this.#rasterLeases.values()];
@@ -2321,8 +2385,17 @@ export class TUI extends Container {
 		this.#clearSixelProbeState();
 	}
 
+	#writeFixedSuffixResetBefore(write: (data: string) => boolean): boolean {
+		if (!this.#fixedSuffixScrollRegionResetPending) return true;
+		if (!write("\x1b[r\x1b[?6l")) return false;
+		this.#fixedSuffixScrollRegionResetPending = false;
+		return true;
+	}
 	#writeTerminal(data: string, deferRenderFailure = false): boolean {
-		return this.#guardTerminalOperation(() => this.terminal.write(data), !deferRenderFailure);
+		const write = (bytes: string) =>
+			this.#guardTerminalOperation(() => this.terminal.write(bytes), !deferRenderFailure);
+		if (data !== "\x1b[r\x1b[?6l" && !this.#writeFixedSuffixResetBefore(write)) return false;
+		return write(data);
 	}
 
 	#hideCursor(): boolean {
@@ -2352,22 +2425,26 @@ export class TUI extends Container {
 	}
 
 	#writeLifecycleCleanup(data: string): boolean {
-		if (!this.terminal.available) {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		try {
-			this.terminal.write(data);
-		} catch {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		if (!this.terminal.available) {
-			this.#markTerminalUnavailable();
-			return false;
-		}
-		this.#terminalUnavailable = false;
-		return true;
+		const write = (bytes: string): boolean => {
+			if (!this.terminal.available) {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			try {
+				this.terminal.write(bytes);
+			} catch {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			if (!this.terminal.available) {
+				this.#markTerminalUnavailable();
+				return false;
+			}
+			this.#terminalUnavailable = false;
+			return true;
+		};
+		if (!this.#writeFixedSuffixResetBefore(write)) return false;
+		return write(data);
 	}
 
 	addInputListener(listener: InputListener): () => void {
@@ -2539,6 +2616,8 @@ export class TUI extends Container {
 
 	stop(): void {
 		this.#resetFixedSuffixScrollRegions();
+		if (this.#fixedSuffixScrollRegionResetPending && this.#writeTerminal("\x1b[r\x1b[?6l"))
+			this.#fixedSuffixScrollRegionResetPending = false;
 		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		this.flushTerminalCleanup();
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
@@ -3847,10 +3926,13 @@ export class TUI extends Container {
 						: (lines[lineIndex] ?? "");
 		};
 		const visibleLines = Array.from({ length: height }, (_, screenRow) => lineForScreenRow(screenRow));
+		const containsVisibleImage = visibleLines.some(line => TERMINAL.isImageLine(line));
+		// A fixed iTerm raster and another terminal image protocol cannot share an
+		// unleased viewport repaint. Leave the resident raster in place until a
+		// later frame can render without protected-ingress lease invalidation.
+		if (containsVisibleImage && this.#hasCurrentArmedFixedSuffixRasterLease()) return false;
 		const preserveRasterLeases =
-			this.#rasterLeases.size > 0 &&
-			this.#rasterCleanup.size === 0 &&
-			!visibleLines.some(line => TERMINAL.isImageLine(line));
+			this.#rasterLeases.size > 0 && this.#rasterCleanup.size === 0 && !containsVisibleImage;
 		let buffer = `\x1b[?2026h${deletePlan.output}${preserveRasterLeases ? "\x1b[?25l" : ""}`;
 		if (!preserveRasterLeases) buffer += "\x1b[H";
 		const committedTranscriptRows: Array<number | null> = [];
@@ -3990,6 +4072,7 @@ export class TUI extends Container {
 
 	#doRender(): void {
 		const fixedSuffixScrollRegionToken = this.#armedFixedSuffixScrollRegionToken;
+		const fixedSuffixScrollRegionRasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
 		if (this.#stopped || !this.terminalAvailable) return;
 		const transcriptIdentityReplaced = this.#transcriptIdentityReplaced;
 		const restartViewportRepaintPending = this.#restartViewportRepaintPending;
@@ -4304,6 +4387,33 @@ export class TUI extends Container {
 			allowPastLiveBottom?: boolean,
 		) => boolean;
 		const fullRender = (clear: boolean, reason = "full render", forceScrollbackClear = false): void => {
+			const fixedSuffixLease =
+				fixedSuffixScrollRegionToken === undefined
+					? undefined
+					: this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId);
+			const preserveArmedFixedSuffixLease =
+				fixedSuffixScrollRegionToken !== undefined &&
+				this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+					fixedSuffixScrollRegionToken &&
+				fixedSuffixScrollRegionRasterLease !== undefined &&
+				fixedSuffixLease?.token === fixedSuffixScrollRegionRasterLease &&
+				fixedSuffixLease.nativeScrollbackEligible &&
+				fixedSuffixLease.nativeScrollbackArmed &&
+				fixedSuffixLease.token.rect.row > 0 &&
+				this.#rasterLeases.size === 1;
+			if (preserveArmedFixedSuffixLease) {
+				if (this.#rasterCleanup.size > 0) {
+					void this.#rasterIngress.then(() => {
+						if (!this.#stopped && this.terminalAvailable) this.requestRender();
+					});
+					return;
+				}
+				if (newLines.some(line => TERMINAL.isImageLine(line))) return;
+				this.#fixedSuffixScrollPlane = undefined;
+				this.#fixedSuffixScrollRegionResetPending = true;
+				viewportRepaint(`armed fixed suffix lease blocked full render: ${reason}`);
+				return;
+			}
 			if (
 				clear &&
 				!forceScrollbackClear &&
@@ -4717,14 +4827,246 @@ export class TUI extends Container {
 			if (firstChanged !== changedTop) appendStart = false;
 		}
 
-		// No changes - but still need to update hardware cursor position if it moved
+		// No changes - but still need to update hardware cursor position if it moved.
+		// A multipart raster prefix owns the terminal cursor until its records and
+		// restore suffix are delivered; queue a no-op cursor update behind it rather
+		// than moving the GIF placement between prefix and records.
 		if (firstChanged === -1) {
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+			if (this.#rasterPending > 0) {
+				void this.#enqueueRaster(() => {
+					if (this.#stopped || !this.terminalAvailable) return false;
+					const written = this.#writeCursorPosition(cursorPos, newLines.length);
+					if (written) this.#refreshPaintedLiveViewportObservation(height);
+					return written;
+				});
+				return;
+			}
 			if (this.#writeCursorPosition(cursorPos, newLines.length)) this.#refreshPaintedLiveViewportObservation(height);
 			return;
 		}
+
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
+		const fixedSuffixTailRewrite =
+			previousTranscriptLineCount > 0 &&
+			firstChanged === previousTranscriptLineCount - 1 &&
+			newLines
+				.slice(0, previousTranscriptLineCount - 1)
+				.every((line, index) => line === previousLogicalFrame[index]);
+		const fixedSuffixNativeAppend =
+			fixedSuffixScrollRegionToken !== undefined &&
+			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+				fixedSuffixScrollRegionToken &&
+			appendedLines &&
+			hasStickySuffix &&
+			!widthChanged &&
+			!heightChanged &&
+			!transcriptIdentityReplaced &&
+			!restartViewportRepaintPending &&
+			!resizeRenderMutationQueued &&
+			!widthSettleRenderQueued &&
+			!tabWidthRepairPending &&
+			!forcedRenderQueued &&
+			!anchorRenderFailed &&
+			this.overlayStack.length === 0 &&
+			previousKittyPlacementSpans.length === 0 &&
+			nextKittyPlacementSpans.length === 0 &&
+			this.#scrollbackResumeViewportTop === undefined &&
+			previousSuffixLineCount > 0 &&
+			previousSuffixLineCount === nextSuffixLineCount &&
+			nextSuffixLineCount < height &&
+			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
+			nextTranscriptLineCount > previousTranscriptLineCount &&
+			(firstChanged === previousTranscriptLineCount || fixedSuffixTailRewrite) &&
+			newLines
+				.slice(0, fixedSuffixTailRewrite ? previousTranscriptLineCount - 1 : previousTranscriptLineCount)
+				.every((line, index) => line === previousLogicalFrame[index]);
+		const fixedSuffixRasterLease =
+			fixedSuffixScrollRegionToken === undefined
+				? undefined
+				: this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId);
+		const fixedSuffixNativeAppendPreservesRasterLease =
+			fixedSuffixNativeAppend &&
+			!newLines.some(line => TERMINAL.isImageLine(line)) &&
+			this.#rasterCleanup.size === 0 &&
+			!this.#fixedSuffixScrollRegionResetPending &&
+			(this.#rasterLeases.size === 0 ||
+				(this.#rasterLeases.size === 1 &&
+					fixedSuffixScrollRegionToken !== undefined &&
+					fixedSuffixScrollRegionRasterLease !== undefined &&
+					fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+					fixedSuffixRasterLease.nativeScrollbackEligible &&
+					fixedSuffixRasterLease.nativeScrollbackArmed &&
+					fixedSuffixRasterLease.token.rect.row > 0));
+		const fixedPlaneRequestedUpperBottom =
+			fixedSuffixRasterLease === undefined
+				? 0
+				: Math.min(height - nextSuffixLineCount, fixedSuffixRasterLease.token.rect.row);
+		const previousFixedPlane =
+			this.#fixedSuffixScrollPlane?.token === fixedSuffixScrollRegionToken
+				? this.#fixedSuffixScrollPlane
+				: undefined;
+		// A live plane may shrink as the composer grows, but never expands until
+		// it is re-armed. Expanding would require replaying rows already admitted
+		// to host history.
+		const fixedPlaneUpperBottom =
+			previousFixedPlane === undefined
+				? fixedPlaneRequestedUpperBottom
+				: Math.min(previousFixedPlane.upperBottom, fixedPlaneRequestedUpperBottom);
+		const fixedPlanePhysicalTop = previousFixedPlane?.transcriptTop ?? prevViewportTop;
+		const fixedPlaneEligible =
+			fixedSuffixScrollRegionToken !== undefined &&
+			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+				fixedSuffixScrollRegionToken &&
+			fixedSuffixScrollRegionRasterLease !== undefined &&
+			fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+			fixedSuffixRasterLease.nativeScrollbackEligible &&
+			fixedSuffixRasterLease.nativeScrollbackArmed &&
+			this.#rasterLeases.size === 1 &&
+			this.#rasterCleanup.size === 0 &&
+			this.#rasterPending === 0 &&
+			fixedPlaneUpperBottom > 0 &&
+			appendedLines &&
+			hasStickySuffix &&
+			!widthChanged &&
+			!heightChanged &&
+			!transcriptIdentityReplaced &&
+			!restartViewportRepaintPending &&
+			!resizeRenderMutationQueued &&
+			!widthSettleRenderQueued &&
+			!tabWidthRepairPending &&
+			!forcedRenderQueued &&
+			!anchorRenderFailed &&
+			this.overlayStack.length === 0 &&
+			previousKittyPlacementSpans.length === 0 &&
+			nextKittyPlacementSpans.length === 0 &&
+			!newLines.some(line => TERMINAL.isImageLine(line)) &&
+			this.#scrollbackResumeViewportTop === undefined &&
+			// Rows above the physical plane already belong to host scrollback. A
+			// historical Markdown rewrite cannot update that immutable history, but
+			// it must not force a generic raster erase. The departing plane row is
+			// repaired immediately before its IND below, so native admission stays
+			// correct for every newly displaced live row.
+			nextTranscriptLineCount >= previousTranscriptLineCount &&
+			nextSuffixLineCount < height;
+		if (!fixedPlaneEligible && this.#fixedSuffixScrollPlane !== undefined) {
+			this.#fixedSuffixScrollPlane = undefined;
+			this.#fixedSuffixScrollRegionResetPending = true;
+		}
+		if (fixedPlaneEligible) {
+			const plane = previousFixedPlane;
+			const physicalTop = fixedPlanePhysicalTop;
+			const desiredTop = Math.max(0, nextTranscriptLineCount - fixedPlaneUpperBottom);
+			if (physicalTop > desiredTop) {
+				this.#fixedSuffixScrollPlane = undefined;
+				this.#fixedSuffixScrollRegionResetPending = true;
+				fullRender(true, "fixed scroll plane contraction");
+				return;
+			}
+
+			const previousUpperBottom = plane?.upperBottom ?? fixedPlaneUpperBottom;
+			let fixedPlaneBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${previousUpperBottom}r`;
+			for (let scrollIndex = 0; scrollIndex < desiredTop - physicalTop; scrollIndex += 1) {
+				const displacedLineIndex = physicalTop + scrollIndex;
+				if (newLines[displacedLineIndex] !== previousLogicalFrame[displacedLineIndex]) {
+					fixedPlaneBuffer += `\x1b[1;1H\x1b[2K${this.#padLineToWidth(newLines[displacedLineIndex] ?? "", width)}`;
+				}
+				const lineIndex = physicalTop + previousUpperBottom + scrollIndex;
+				fixedPlaneBuffer += `\x1b[${previousUpperBottom};1H\x1bD\r\x1b[2K${this.#padLineToWidth(
+					newLines[lineIndex] ?? "",
+					width,
+				)}`;
+			}
+			if (previousUpperBottom !== fixedPlaneUpperBottom) fixedPlaneBuffer += `\x1b[1;${fixedPlaneUpperBottom}r`;
+			for (let row = 0; row < fixedPlaneUpperBottom; row += 1) {
+				fixedPlaneBuffer += `\x1b[${row + 1};1H\x1b[2K${this.#padLineToWidth(
+					newLines[desiredTop + row] ?? "",
+					width,
+				)}`;
+			}
+			// Keep DECSTBM scoped to transcript admission and repaint. Post-render
+			// emitters (including iTerm multipart GIF records) and lower suffix
+			// writes must always observe the normal full-screen margin.
+			fixedPlaneBuffer += "\x1b[r\x1b[?6l";
+			const suffixRegionBottom = height - nextSuffixLineCount;
+			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
+				const suffixRow = suffixRegionBottom + suffixIndex + 1;
+				const suffixLine = newLines[nextTranscriptLineCount + suffixIndex] ?? "";
+				for (const segment of this.#unleasedRowSegments(suffixRow - 1, width)) {
+					fixedPlaneBuffer += `\x1b[${suffixRow};${segment.column + 1}H\x1b[${segment.width}X`;
+					fixedPlaneBuffer += `${sliceByColumn(suffixLine, segment.column, segment.width, true)}${SEGMENT_RESET}`;
+				}
+			}
+			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, this.#hardwareCursorRow);
+			fixedPlaneBuffer += `\x1b8\x1b[r\x1b[?6l${seq}\x1b[?2026l`;
+			if (
+				!this.#writeRenderBufferAndReanchorImeCursor(
+					fixedPlaneBuffer,
+					cursorPos,
+					newLines.length,
+					() => {
+						this.#fixedSuffixScrollPlane = {
+							token: fixedSuffixScrollRegionToken,
+							upperBottom: fixedPlaneUpperBottom,
+							transcriptTop: desiredTop,
+						};
+						this.#hardwareCursorRow = toRow;
+						this.#cursorRow = Math.max(0, newLines.length - 1);
+						this.#maxLinesRendered = newLines.length;
+						this.#viewportTopRow = Math.max(0, newLines.length - height);
+						this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, desiredTop);
+						this.#previousLines = newLines;
+						this.#previousWidth = width;
+						this.#previousHeight = height;
+						this.#manualTranscriptLineCount = nextTranscriptLineCount;
+						this.#manualSuffixLineCount = nextSuffixLineCount;
+						this.#refreshPaintedLiveViewportObservation(height);
+					},
+					true,
+				)
+			)
+				return;
+			this.#latestRenderedLines = newLines;
+			if (this.#virtualViewport) this.#latestRaw = rawLines;
+			this.#durableLineCount = Math.max(this.#durableLineCount, newLines.length);
+			this.#recordDurableLines(newLines, rawLines, physicalTop, newLines.length - 1);
+			this.#nativeScrollbackAdmissionPending = false;
+			this.#transcriptIdentityReplaced = false;
+			return;
+		}
+		const activeArmedFixedSuffixLease =
+			fixedSuffixScrollRegionToken !== undefined &&
+			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
+				fixedSuffixScrollRegionToken &&
+			fixedSuffixScrollRegionRasterLease !== undefined &&
+			fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+			fixedSuffixRasterLease.nativeScrollbackEligible &&
+			fixedSuffixRasterLease.nativeScrollbackArmed &&
+			fixedSuffixRasterLease.token.rect.row > 0 &&
+			this.#rasterLeases.size === 1;
+		if (activeArmedFixedSuffixLease && !fixedSuffixNativeAppendPreservesRasterLease && !fixedPlaneEligible) {
+			if (this.#rasterCleanup.size > 0) {
+				void this.#rasterIngress.then(() => {
+					if (!this.#stopped && this.terminalAvailable) this.requestRender();
+				});
+				return;
+			}
+			if (newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))) {
+				// A competing image protocol cannot be clipped safely around the iTerm
+				// raster. Preserve the current frame rather than erasing the resident GIF.
+				return;
+			}
+			if (appendedLines && nextLiveViewportTop > prevViewportTop) {
+				// The clipped repaint keeps the resident iTerm raster intact while this
+				// transient frame cannot safely form a DECSTBM transaction. The next
+				// eligible append uses its painted live viewport as the physical frontier.
+				this.#nativeScrollbackAdmissionPending = true;
+			}
+			viewportRepaint("armed fixed suffix lease awaiting a safe native append");
+			return;
+		}
 		if (
+			!fixedSuffixNativeAppendPreservesRasterLease &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
@@ -4931,42 +5273,34 @@ export class TUI extends Container {
 			}
 			return;
 		}
-		const fixedSuffixNativeAppend =
-			fixedSuffixScrollRegionToken !== undefined &&
-			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
-				fixedSuffixScrollRegionToken &&
-			appendedLines &&
-			hasStickySuffix &&
-			!widthChanged &&
-			!heightChanged &&
-			!transcriptIdentityReplaced &&
-			!restartViewportRepaintPending &&
-			!resizeRenderMutationQueued &&
-			!widthSettleRenderQueued &&
-			!tabWidthRepairPending &&
-			!forcedRenderQueued &&
-			!anchorRenderFailed &&
-			this.overlayStack.length === 0 &&
-			previousKittyPlacementSpans.length === 0 &&
-			nextKittyPlacementSpans.length === 0 &&
-			this.#scrollbackResumeViewportTop === undefined &&
-			previousSuffixLineCount > 0 &&
-			previousSuffixLineCount === nextSuffixLineCount &&
-			nextSuffixLineCount < height &&
-			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
-			nextTranscriptLineCount > previousTranscriptLineCount &&
-			firstChanged === previousTranscriptLineCount &&
-			newLines.slice(0, previousTranscriptLineCount).every((line, index) => line === previousLogicalFrame[index]);
-		if (fixedSuffixNativeAppend) {
-			const regionBottom = height - nextSuffixLineCount;
+		if (fixedSuffixNativeAppend && (this.#rasterLeases.size === 0 || fixedSuffixNativeAppendPreservesRasterLease)) {
+			const suffixRegionBottom = height - nextSuffixLineCount;
+			// iTerm raster cells are not ordinary text cells. Keep the entire lease
+			// outside DECSTBM even when its transparent canvas reaches above the
+			// rendered suffix, so IND cannot scroll a Pet row.
+			const regionBottom =
+				fixedSuffixNativeAppendPreservesRasterLease && fixedSuffixRasterLease !== undefined
+					? Math.min(suffixRegionBottom, fixedSuffixRasterLease.token.rect.row)
+					: suffixRegionBottom;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
+			if (fixedSuffixTailRewrite)
+				fixedSuffixBuffer += `\r\x1b[2K${this.#padLineToWidth(newLines[previousTranscriptLineCount - 1]!, width)}`;
 			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
 				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
 			}
 			fixedSuffixBuffer += "\x1b[r\x1b[?6l";
+			const preserveFixedSuffixRaster =
+				fixedSuffixNativeAppendPreservesRasterLease && fixedSuffixScrollRegionRasterLease !== undefined;
 			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
-				const suffixRow = regionBottom + suffixIndex + 1;
+				const suffixRow = suffixRegionBottom + suffixIndex + 1;
 				const suffixLine = newLines[nextTranscriptLineCount + suffixIndex] ?? "";
+				if (preserveFixedSuffixRaster) {
+					for (const segment of this.#unleasedRowSegments(suffixRow - 1, width)) {
+						fixedSuffixBuffer += `\x1b[${suffixRow};${segment.column + 1}H\x1b[${segment.width}X`;
+						fixedSuffixBuffer += `${sliceByColumn(suffixLine, segment.column, segment.width, true)}${SEGMENT_RESET}`;
+					}
+					continue;
+				}
 				fixedSuffixBuffer += `\x1b[${suffixRow};1H\x1b[2K${this.#padLineToWidth(suffixLine, width)}`;
 			}
 			const transcriptDelta = nextTranscriptLineCount - previousTranscriptLineCount;
@@ -4975,26 +5309,37 @@ export class TUI extends Container {
 			fixedSuffixBuffer += `\x1b8\x1b[r\x1b[?6l${seq}\x1b[?2026l`;
 			this.#fixedSuffixScrollRegionResetPending = true;
 			if (
-				!this.#writeRenderBufferAndReanchorImeCursor(fixedSuffixBuffer, cursorPos, newLines.length, () => {
-					this.#hardwareCursorRow = toRow;
-					this.#cursorRow = Math.max(0, newLines.length - 1);
-					this.#maxLinesRendered = newLines.length;
-					this.#viewportTopRow = Math.max(0, newLines.length - height);
-					this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
-					this.#previousLines = newLines;
-					this.#previousWidth = width;
-					this.#previousHeight = height;
-					this.#manualTranscriptLineCount = nextTranscriptLineCount;
-					this.#manualSuffixLineCount = nextSuffixLineCount;
-					this.#refreshPaintedLiveViewportObservation(height);
-				})
+				!this.#writeRenderBufferAndReanchorImeCursor(
+					fixedSuffixBuffer,
+					cursorPos,
+					newLines.length,
+					() => {
+						this.#hardwareCursorRow = toRow;
+						this.#cursorRow = Math.max(0, newLines.length - 1);
+						this.#maxLinesRendered = newLines.length;
+						this.#viewportTopRow = Math.max(0, newLines.length - height);
+						this.#nativeScrollbackViewportTop = Math.max(this.#nativeScrollbackViewportTop, this.#viewportTopRow);
+						this.#previousLines = newLines;
+						this.#previousWidth = width;
+						this.#previousHeight = height;
+						this.#manualTranscriptLineCount = nextTranscriptLineCount;
+						this.#manualSuffixLineCount = nextSuffixLineCount;
+						this.#refreshPaintedLiveViewportObservation(height);
+					},
+					fixedSuffixNativeAppendPreservesRasterLease,
+				)
 			)
 				return;
 			this.#fixedSuffixScrollRegionResetPending = false;
 			this.#latestRenderedLines = newLines;
 			if (this.#virtualViewport) this.#latestRaw = rawLines;
 			this.#durableLineCount = Math.max(this.#durableLineCount, newLines.length);
-			this.#recordDurableLines(newLines, rawLines, previousTranscriptLineCount, newLines.length - 1);
+			this.#recordDurableLines(
+				newLines,
+				rawLines,
+				previousTranscriptLineCount - (fixedSuffixTailRewrite ? 1 : 0),
+				newLines.length - 1,
+			);
 			this.#nativeScrollbackAdmissionPending = false;
 			this.#transcriptIdentityReplaced = false;
 			return;
@@ -5030,6 +5375,7 @@ export class TUI extends Container {
 					: firstChanged;
 		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
 		if (
+			!fixedSuffixNativeAppendPreservesRasterLease &&
 			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
@@ -5325,7 +5671,10 @@ export class TUI extends Container {
 			: (bytes: string) => this.#writeProtectedRenderIngress(bytes);
 		const renderGeneration = this.#renderGenerationInProgress;
 		const write = () => {
-			if (!writeIngress(buffer)) return false;
+			const needsFixedSuffixReset = this.#fixedSuffixScrollRegionResetPending;
+			const bytes = needsFixedSuffixReset ? `\x1b[r\x1b[?6l${buffer}` : buffer;
+			if (!writeIngress(bytes)) return false;
+			if (needsFixedSuffixReset) this.#fixedSuffixScrollRegionResetPending = false;
 			onBufferWritten?.();
 			this.#lastRenderWriteSucceeded = true;
 			if (renderGeneration > 0) this.#settleRenderCommitWaiters(true, renderGeneration);
@@ -5360,15 +5709,21 @@ export class TUI extends Container {
 		deferRenderFailure = false,
 	): boolean {
 		if (!cursorPos || totalLines <= 0) {
+			const reset = this.#fixedSuffixScrollRegionResetPending ? "\x1b[r\x1b[?6l" : "";
+			const resetWritten = reset.length === 0 || this.#writeTerminal(reset, deferRenderFailure);
+			if (resetWritten) this.#fixedSuffixScrollRegionResetPending = false;
+			if (!resetWritten) return false;
 			return deferRenderFailure
 				? this.#guardTerminalOperation(() => this.terminal.hideCursor(), false)
 				: this.#hideCursor();
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
-		if (!this.#writeTerminal(seq, deferRenderFailure)) {
+		const reset = this.#fixedSuffixScrollRegionResetPending ? "\x1b[r\x1b[?6l" : "";
+		if (!this.#writeTerminal(`${reset}${seq}`, deferRenderFailure)) {
 			return false;
 		}
+		if (reset.length > 0) this.#fixedSuffixScrollRegionResetPending = false;
 		this.#hardwareCursorRow = toRow;
 		return true;
 	}

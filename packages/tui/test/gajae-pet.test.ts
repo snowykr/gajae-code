@@ -199,11 +199,26 @@ describe("GIF artifacts and helpers", () => {
 		expect(red.multipart.slice(1)).toEqual(encodeITerm2Multipart(red.base64).slice(1));
 		expect(red.tmuxDcs).toEqual(wrapITerm2RecordsForTmux(red.multipart));
 		expect(red.multipart[0]).toBe(
-			`\x1b]1337;MultipartFile=;name=Z2FqYWUtcGV0LmdpZg==;size=${red.bytes.byteLength};width=${red.width}px;height=${red.height}px;inline=1;preserveAspectRatio=0:\x07`,
+			`\x1b]1337;MultipartFile=name=Z2FqYWUtcGV0LmdpZg==;size=${red.bytes.byteLength};width=${red.width}px;height=${red.height}px;inline=1;preserveAspectRatio=0\x07`,
 		);
 		expect(red.multipart.at(-1)).toBe("\x1b]1337;FileEnd\x07");
 		expect(red.multipart.slice(1, -1).every(record => record.length <= 220)).toBe(true);
 		expect(red.tmuxDcs.every(record => Buffer.byteLength(record, "utf8") <= 256)).toBe(true);
+	});
+	it("uses restore-previous disposal for transparent animated frame compatibility", () => {
+		const artifact = encodeGajaePetGif({
+			timeline: [
+				{ name: "danceL", delayMs: 300 },
+				{ name: "danceR", delayMs: 300 },
+			],
+			disposal: "restore-previous",
+		});
+		const graphicsControlPacked = Array.from(artifact.bytes).flatMap((value, index) =>
+			value === 0x21 && artifact.bytes[index + 1] === 0xf9 && artifact.bytes[index + 2] === 0x04
+				? [artifact.bytes[index + 3]!]
+				: [],
+		);
+		expect(graphicsControlPacked).toEqual([0x0d, 0x0d]);
 	});
 
 	it("supports rectangle geometry and all public timeline helpers", () => {
