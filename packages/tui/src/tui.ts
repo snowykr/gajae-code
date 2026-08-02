@@ -5575,15 +5575,21 @@ export class TUI extends Container {
 		deferRenderFailure = false,
 	): boolean {
 		if (!cursorPos || totalLines <= 0) {
+			const reset = this.#fixedSuffixScrollRegionResetPending ? "\x1b[r\x1b[?6l" : "";
+			const resetWritten = reset.length === 0 || this.#writeTerminal(reset, deferRenderFailure);
+			if (resetWritten) this.#fixedSuffixScrollRegionResetPending = false;
+			if (!resetWritten) return false;
 			return deferRenderFailure
 				? this.#guardTerminalOperation(() => this.terminal.hideCursor(), false)
 				: this.#hideCursor();
 		}
 		const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
 		// No \x1b[?2026h/l wrapper: synchronized output flushes terminal state and discards macOS IME composition.
-		if (!this.#writeTerminal(seq, deferRenderFailure)) {
+		const reset = this.#fixedSuffixScrollRegionResetPending ? "\x1b[r\x1b[?6l" : "";
+		if (!this.#writeTerminal(`${reset}${seq}`, deferRenderFailure)) {
 			return false;
 		}
+		if (reset.length > 0) this.#fixedSuffixScrollRegionResetPending = false;
 		this.#hardwareCursorRow = toRow;
 		return true;
 	}
