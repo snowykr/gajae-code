@@ -196,7 +196,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
-	it("releases an ineligible raster lease before admitting a fixed-suffix append", async () => {
+	it("keeps an ineligible raster lease on its generic renderer path", async () => {
 		const { term, transcript, tui } = createPinnedTui();
 		let invalidated = 0;
 		try {
@@ -219,12 +219,10 @@ describe("TUI fixed suffix scroll region", () => {
 			await term.waitForRender();
 
 			const output = term.getWriteLog().join("");
-			expect(output).toContain("ITERM_ERASE");
-			expect(output).toContain("\x1b[1;3r");
-			expect(output).toContain("\x1bD\r\x1b[2Kline-4");
-			expect(invalidated).toBe(1);
-			await term.flush();
-			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-1");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(output).not.toContain("\x1b[1;3r");
+			expect(output).not.toContain("\x1bD\r\x1b[2Kline-4");
+			expect(invalidated).toBe(0);
 		} finally {
 			tui.stop();
 		}

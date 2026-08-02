@@ -4804,6 +4804,7 @@ export class TUI extends Container {
 					fixedSuffixScrollRegionToken !== undefined &&
 					fixedSuffixScrollRegionRasterLease !== undefined &&
 					fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
+					fixedSuffixRasterLease.nativeScrollbackEligible &&
 					fixedSuffixRasterLease.token.rect.row > 0));
 		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
 		const fixedPlaneUpperBottom =
@@ -4928,7 +4929,8 @@ export class TUI extends Container {
 			!fixedSuffixNativeAppendPreservesRasterLease &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
-			(fixedSuffixScrollRegionToken !== undefined || soleRasterLease?.nativeScrollbackEligible === true);
+			(fixedSuffixRasterLease?.nativeScrollbackEligible === true ||
+				soleRasterLease?.nativeScrollbackEligible === true);
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
 			!rasterMustYieldForNativeAdmission &&
