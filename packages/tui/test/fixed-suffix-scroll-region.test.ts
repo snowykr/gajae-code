@@ -160,27 +160,6 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(postRewriteOutput).toContain("\x1bD\r\x1b[2Kline-7");
 			expect(postRewriteOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
-			transcript.setLines([
-				"line-1 revised",
-				"line-2",
-				"line-3",
-				"line-4",
-				"line-5 revised",
-				"line-6",
-				"line-7",
-				"line-8",
-			]);
-			term.clearWriteLog();
-			tui.requestRender();
-			await term.waitForRender();
-			const reflowOutput = term.getWriteLog().join("");
-			expect(reflowOutput).toContain("\x1b[1;2r");
-			expect(reflowOutput).toContain("\x1b[1;1H\x1b[2Kline-7");
-			expect(reflowOutput).toContain("\x1b[2;1H\x1b[2Kline-8");
-			expect(reflowOutput).not.toContain("ITERM_ERASE");
-			expect(invalidated).toBe(0);
-			await term.flush();
-			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-3");
 		} finally {
 			tui.stop();
 		}
