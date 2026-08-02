@@ -79,6 +79,52 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
+	it("resets the fixed plane before iTerm post-render and queued multipart bytes", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			tui.setPostRenderEmitter(() => "POST_RENDER_GIF");
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			term.clearWriteLog();
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			const rendered = term.getWriteLog().join("");
+			const restore = "\x1b8\x1b[r\x1b[?6l";
+			expect(rendered.indexOf(restore)).toBeGreaterThanOrEqual(0);
+			expect(rendered.indexOf(restore)).toBeLessThan(rendered.indexOf("POST_RENDER_GIF"));
+			expect(rendered).not.toContain("ITERM_ERASE");
+
+			tui.releaseFixedSuffixScrollRegion(token);
+			term.clearWriteLog();
+			const multipart = await tui.submitTerminalOutput({
+				token: lease.token,
+				operation: {
+					type: "raster-multipart-batch",
+					prefix: new TextEncoder().encode("MULTIPART_PREFIX"),
+					records: [new TextEncoder().encode("MULTIPART_GIF")],
+					suffix: new TextEncoder().encode("MULTIPART_SUFFIX"),
+				},
+			});
+			expect(multipart.status).toBe("written");
+			expect(term.getWriteLog().join("")).toBe("\x1b[r\x1b[?6lMULTIPART_PREFIXMULTIPART_GIFMULTIPART_SUFFIX");
+		} finally {
+			tui.stop();
+		}
+	});
 
 	it("preserves a bound raster lease while advancing native scrollback", async () => {
 		const { term, transcript, suffix, tui } = createPinnedTui();
