@@ -4972,7 +4972,7 @@ export class TUI extends Container {
 			const transcriptDelta = nextTranscriptLineCount - previousTranscriptLineCount;
 			const restoredHardwareCursorRow = this.#hardwareCursorRow + transcriptDelta;
 			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, restoredHardwareCursorRow);
-			fixedSuffixBuffer += `\x1b8${seq}\x1b[?2026l`;
+			fixedSuffixBuffer += `\x1b8\x1b[r\x1b[?6l${seq}\x1b[?2026l`;
 			this.#fixedSuffixScrollRegionResetPending = true;
 			if (
 				!this.#writeRenderBufferAndReanchorImeCursor(fixedSuffixBuffer, cursorPos, newLines.length, () => {

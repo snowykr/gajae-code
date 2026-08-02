@@ -50,6 +50,7 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(output).toContain("\x1b[r\x1b[?6l\x1b[4;1H\x1b[2Kstatus");
 			expect(output).toContain("\x1b[5;1H\x1b[2Kcomposer");
 			expect(output).toContain("\x1b8");
+			expect(output).toContain("\x1b8\x1b[r\x1b[?6l");
 			expect(output).toContain("\x1b[?2026l");
 			expect(output).toContain("\x1b[1A");
 			expect(output).not.toContain("\r\nline-4");
