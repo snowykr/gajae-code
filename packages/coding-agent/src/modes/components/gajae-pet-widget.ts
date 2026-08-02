@@ -9,7 +9,6 @@ import {
 	type GajaePixelFrames,
 	getCellDimensions,
 	getGajaePetGifCached,
-	idleTimeline,
 	PARA_PARA_STEPS,
 	PET_SKINS,
 	type PetMode,
@@ -19,6 +18,7 @@ import {
 	type RasterLeaseToken,
 	registerAnimationCallback,
 	type TUI,
+	workingTimeline,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
@@ -565,9 +565,8 @@ export class GajaePetWidget {
 		}
 		// OSC 1337 has no image-frame replacement primitive. Re-uploading a GIF
 		// for ordinary working/idle or auto-flex transitions visibly flashes its
-		// transparent canvas, so an armed iTerm lease keeps one stable idle loop.
-		// A working or burst GIF can end on an opaque intermediate frame and leave
-		// an idle Pet as a solid box.
+		// transparent canvas. Keep one loop resident; its final base frame remains
+		// safe when iTerm ignores the GIF loop extension.
 		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
 		if (this.#itermSubmitPending) return;
 		if (semantic === this.#itermLastSemantic && this.#itermLease) {
@@ -686,7 +685,7 @@ export class GajaePetWidget {
 			this.#itermLease = token;
 		}
 		this.#itermLastSemantic = semantic;
-		const frames = idleTimeline();
+		const frames = [...workingTimeline(), { name: "base" as const, delayMs: 700 }];
 		const cell = getCellDimensions();
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
