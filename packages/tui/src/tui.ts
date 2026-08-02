@@ -4836,6 +4836,7 @@ export class TUI extends Container {
 			nextKittyPlacementSpans.length === 0 &&
 			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#scrollbackResumeViewportTop === undefined &&
+			!this.#nativeScrollbackAdmissionPending &&
 			previousSuffixLineCount === nextSuffixLineCount &&
 			nextSuffixLineCount < height;
 		if (fixedPlaneEligible) {
