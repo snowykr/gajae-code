@@ -4737,6 +4737,12 @@ export class TUI extends Container {
 		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
+		const fixedSuffixTailRewrite =
+			previousTranscriptLineCount > 0 &&
+			firstChanged === previousTranscriptLineCount - 1 &&
+			newLines
+				.slice(0, previousTranscriptLineCount - 1)
+				.every((line, index) => line === previousLogicalFrame[index]);
 		const fixedSuffixNativeAppend =
 			fixedSuffixScrollRegionToken !== undefined &&
 			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
@@ -4761,8 +4767,10 @@ export class TUI extends Container {
 			nextSuffixLineCount < height &&
 			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
 			nextTranscriptLineCount > previousTranscriptLineCount &&
-			firstChanged === previousTranscriptLineCount &&
-			newLines.slice(0, previousTranscriptLineCount).every((line, index) => line === previousLogicalFrame[index]);
+			(firstChanged === previousTranscriptLineCount || fixedSuffixTailRewrite) &&
+			newLines
+				.slice(0, fixedSuffixTailRewrite ? previousTranscriptLineCount - 1 : previousTranscriptLineCount)
+				.every((line, index) => line === previousLogicalFrame[index]);
 		const fixedSuffixRasterLease =
 			fixedSuffixScrollRegionToken === undefined
 				? undefined
@@ -5006,6 +5014,8 @@ export class TUI extends Container {
 					? Math.min(suffixRegionBottom, fixedSuffixRasterLease.token.rect.row)
 					: suffixRegionBottom;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
+			if (fixedSuffixTailRewrite)
+				fixedSuffixBuffer += `\r\x1b[2K${this.#padLineToWidth(newLines[previousTranscriptLineCount - 1]!, width)}`;
 			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
 				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
 			}

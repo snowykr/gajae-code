@@ -141,6 +141,16 @@ describe("TUI fixed suffix scroll region", () => {
 			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
 			expect(scrollback.filter(line => line === "line-1")).toHaveLength(1);
 			expect(scrollback.filter(line => line === "line-2")).toHaveLength(1);
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5 revised", "line-6"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const tailRewriteOutput = term.getWriteLog().join("");
+			expect(tailRewriteOutput).toContain("\x1b[1;2r");
+			expect(tailRewriteOutput).toContain("\r\x1b[2Kline-5 revised");
+			expect(tailRewriteOutput).toContain("\x1bD\r\x1b[2Kline-6");
+			expect(tailRewriteOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
 		} finally {
 			tui.stop();
 		}
