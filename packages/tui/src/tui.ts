@@ -4879,11 +4879,7 @@ export class TUI extends Container {
 					fixedPlaneBuffer += `${sliceByColumn(suffixLine, segment.column, segment.width, true)}${SEGMENT_RESET}`;
 				}
 			}
-			const { seq, toRow } = this.#cursorControlSequence(
-				cursorPos,
-				newLines.length,
-				this.#hardwareCursorRow + desiredTop - physicalTop,
-			);
+			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, this.#hardwareCursorRow);
 			fixedPlaneBuffer += `\x1b8\x1b[?6l${seq}\x1b[?2026l`;
 			if (
 				!this.#writeRenderBufferAndReanchorImeCursor(
