@@ -1472,7 +1472,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("drops a stale iTerm worker GIF when activity ends during lease acquisition", async () => {
+	it("keeps an iTerm upload current when activity changes during lease acquisition", async () => {
 		vi.useFakeTimers();
 		let working = true;
 		const stubs = makeWidget(80, 30, {
@@ -1490,12 +1490,12 @@ describe("GajaePetWidget", () => {
 			working = false;
 			stubs.setRasterAcquireDelayed(false);
 			await flushAsyncChain();
-			expect(
-				stubs
-					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.some(record => record.includes("MultipartFile=")),
-			).toBe(false);
+			const headers = stubs
+				.getRasterOutputs()
+				.map(record => new TextDecoder().decode(record))
+				.filter(record => record.includes("MultipartFile="));
+			expect(headers).toHaveLength(1);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();

@@ -602,7 +602,6 @@ export class GajaePetWidget {
 	): Promise<void> {
 		const current = () => {
 			const availability = getVerifiedItermPetAvailability();
-			const flexingNow = this.#flexUntil > performance.now();
 			const terminal = this.#ui.terminal;
 			const cell = getCellDimensions();
 			const liveComposerBottomOffset = this.#getComposerBottomOffset();
@@ -620,8 +619,6 @@ export class GajaePetWidget {
 				availability.epoch === epoch &&
 				availability.mode === mode &&
 				!this.#ui.manualViewportActive &&
-				this.#isWorking() === working &&
-				flexingNow === flexing &&
 				this.#framedEditor.canFit(terminal.columns) &&
 				terminal.columns === geometry.columns &&
 				terminal.rows === geometry.rows &&
