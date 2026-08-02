@@ -4832,15 +4832,22 @@ export class TUI extends Container {
 					fixedSuffixRasterLease.nativeScrollbackArmed &&
 					fixedSuffixRasterLease.token.rect.row > 0));
 		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
-		const fixedPlaneUpperBottom =
+		const fixedPlaneRequestedUpperBottom =
 			fixedSuffixRasterLease === undefined
 				? 0
 				: Math.min(height - nextSuffixLineCount, fixedSuffixRasterLease.token.rect.row);
-		const fixedPlanePhysicalTop =
-			this.#fixedSuffixScrollPlane?.token === fixedSuffixScrollRegionToken &&
-			this.#fixedSuffixScrollPlane?.upperBottom === fixedPlaneUpperBottom
-				? this.#fixedSuffixScrollPlane.transcriptTop
-				: prevViewportTop;
+		const previousFixedPlane =
+			this.#fixedSuffixScrollPlane?.token === fixedSuffixScrollRegionToken
+				? this.#fixedSuffixScrollPlane
+				: undefined;
+		// A live plane may shrink as the composer grows, but never expands until
+		// it is re-armed. Expanding would require replaying rows already admitted
+		// to host history.
+		const fixedPlaneUpperBottom =
+			previousFixedPlane === undefined
+				? fixedPlaneRequestedUpperBottom
+				: Math.min(previousFixedPlane.upperBottom, fixedPlaneRequestedUpperBottom);
+		const fixedPlanePhysicalTop = previousFixedPlane?.transcriptTop ?? prevViewportTop;
 		const fixedPlaneEligible =
 			fixedSuffixScrollRegionToken !== undefined &&
 			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
@@ -4870,14 +4877,14 @@ export class TUI extends Container {
 			this.#scrollbackResumeViewportTop === undefined &&
 			!this.#nativeScrollbackAdmissionPending &&
 			newLines.slice(0, fixedPlanePhysicalTop).every((line, index) => line === previousLogicalFrame[index]) &&
-			previousSuffixLineCount === nextSuffixLineCount &&
+			nextTranscriptLineCount >= previousTranscriptLineCount &&
 			nextSuffixLineCount < height;
 		if (!fixedPlaneEligible && this.#fixedSuffixScrollPlane !== undefined) {
 			this.#fixedSuffixScrollPlane = undefined;
 			this.#fixedSuffixScrollRegionResetPending = true;
 		}
 		if (fixedPlaneEligible) {
-			const plane = this.#fixedSuffixScrollPlane;
+			const plane = previousFixedPlane;
 			const physicalTop = fixedPlanePhysicalTop;
 			const desiredTop = Math.max(0, nextTranscriptLineCount - fixedPlaneUpperBottom);
 			if (physicalTop > desiredTop) {
@@ -4887,26 +4894,30 @@ export class TUI extends Container {
 				return;
 			}
 
-			let fixedPlaneBuffer = "\x1b[?2026h\x1b7\x1b[?6l";
-			if (plane?.token !== fixedSuffixScrollRegionToken || plane.upperBottom !== fixedPlaneUpperBottom)
-				fixedPlaneBuffer += `\x1b[1;${fixedPlaneUpperBottom}r`;
+			const previousUpperBottom = plane?.upperBottom ?? fixedPlaneUpperBottom;
+			let fixedPlaneBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${previousUpperBottom}r`;
 			for (let scrollIndex = 0; scrollIndex < desiredTop - physicalTop; scrollIndex += 1) {
 				const displacedLineIndex = physicalTop + scrollIndex;
 				if (newLines[displacedLineIndex] !== previousLogicalFrame[displacedLineIndex]) {
 					fixedPlaneBuffer += `\x1b[1;1H\x1b[2K${this.#padLineToWidth(newLines[displacedLineIndex] ?? "", width)}`;
 				}
-				const lineIndex = physicalTop + fixedPlaneUpperBottom + scrollIndex;
-				fixedPlaneBuffer += `\x1b[${fixedPlaneUpperBottom};1H\x1bD\r\x1b[2K${this.#padLineToWidth(
+				const lineIndex = physicalTop + previousUpperBottom + scrollIndex;
+				fixedPlaneBuffer += `\x1b[${previousUpperBottom};1H\x1bD\r\x1b[2K${this.#padLineToWidth(
 					newLines[lineIndex] ?? "",
 					width,
 				)}`;
 			}
+			if (previousUpperBottom !== fixedPlaneUpperBottom) fixedPlaneBuffer += `\x1b[1;${fixedPlaneUpperBottom}r`;
 			for (let row = 0; row < fixedPlaneUpperBottom; row += 1) {
 				fixedPlaneBuffer += `\x1b[${row + 1};1H\x1b[2K${this.#padLineToWidth(
 					newLines[desiredTop + row] ?? "",
 					width,
 				)}`;
 			}
+			// Keep DECSTBM scoped to transcript admission and repaint. Post-render
+			// emitters (including iTerm multipart GIF records) and lower suffix
+			// writes must always observe the normal full-screen margin.
+			fixedPlaneBuffer += "\x1b[r\x1b[?6l";
 			const suffixRegionBottom = height - nextSuffixLineCount;
 			for (let suffixIndex = 0; suffixIndex < nextSuffixLineCount; suffixIndex += 1) {
 				const suffixRow = suffixRegionBottom + suffixIndex + 1;
@@ -4917,7 +4928,7 @@ export class TUI extends Container {
 				}
 			}
 			const { seq, toRow } = this.#cursorControlSequence(cursorPos, newLines.length, this.#hardwareCursorRow);
-			fixedPlaneBuffer += `\x1b8\x1b[?6l${seq}\x1b[?2026l`;
+			fixedPlaneBuffer += `\x1b8\x1b[r\x1b[?6l${seq}\x1b[?2026l`;
 			if (
 				!this.#writeRenderBufferAndReanchorImeCursor(
 					fixedPlaneBuffer,

@@ -3,8 +3,10 @@ import {
 	__animationSchedulerTestHooks,
 	Container,
 	getCellDimensions,
+	getGajaePetGifCached,
 	setCellDimensions,
 	type TUI,
+	workingTimeline,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "../src/modes/components/custom-editor";
@@ -1439,11 +1441,25 @@ describe("GajaePetWidget", () => {
 			await flushAsyncChain();
 
 			expect(stubs.widget.isFlexing).toBe(true);
-			const headers = stubs
-				.getRasterOutputs()
-				.map(record => new TextDecoder().decode(record))
-				.filter(record => record.includes("MultipartFile="));
-			expect(headers).toHaveLength(1);
+			const records = stubs.getRasterOutputs();
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const expectedGif = getGajaePetGifCached({
+				skin: "red",
+				timeline: [...workingTimeline(), { name: "base", delayMs: 700 }],
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			});
+			expect(records.slice(1, -1).map(record => new TextDecoder().decode(record))).toEqual([
+				...expectedGif.multipart,
+			]);
+			expect(
+				records.map(record => new TextDecoder().decode(record)).filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();

@@ -19,7 +19,7 @@ class LinesComponent implements Component {
 function createPinnedTui(
 	rows = 5,
 	transcriptLines = ["line-1", `line-2${CURSOR_MARKER}`, "line-3"],
-): { term: VirtualTerminal; transcript: LinesComponent; tui: TUI } {
+): { term: VirtualTerminal; transcript: LinesComponent; suffix: LinesComponent; tui: TUI } {
 	const term = new VirtualTerminal(40, rows);
 	const tui = new TUI(term);
 	const transcript = new LinesComponent(transcriptLines);
@@ -27,7 +27,7 @@ function createPinnedTui(
 	tui.addChild(transcript);
 	tui.addChild(suffix);
 	tui.setBottomPinnedComponent(suffix);
-	return { term, transcript, tui };
+	return { term, transcript, suffix, tui };
 }
 
 describe("TUI fixed suffix scroll region", () => {
@@ -81,7 +81,7 @@ describe("TUI fixed suffix scroll region", () => {
 	});
 
 	it("preserves a bound raster lease while advancing native scrollback", async () => {
-		const { term, transcript, tui } = createPinnedTui();
+		const { term, transcript, suffix, tui } = createPinnedTui();
 		let invalidated = 0;
 		try {
 			tui.start();
@@ -125,7 +125,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const streamingOutput = term.getWriteLog().join("");
-			expect(streamingOutput).not.toContain("\x1b[1;2r");
+			expect(streamingOutput).toContain("\x1b[1;2r");
 			expect(streamingOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-5");
 			expect(streamingOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
@@ -147,7 +147,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const tailRewriteOutput = term.getWriteLog().join("");
-			expect(tailRewriteOutput).not.toContain("\x1b[1;2r");
+			expect(tailRewriteOutput).toContain("\x1b[1;2r");
 			expect(tailRewriteOutput).toContain("\x1b[1;1H\x1b[2Kline-5 revised");
 			expect(tailRewriteOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-6");
 			expect(tailRewriteOutput).not.toContain("ITERM_ERASE");
@@ -157,7 +157,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const postRewriteOutput = term.getWriteLog().join("");
-			expect(postRewriteOutput).not.toContain("\x1b[1;2r");
+			expect(postRewriteOutput).toContain("\x1b[1;2r");
 			expect(postRewriteOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-7");
 			expect(postRewriteOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
@@ -177,7 +177,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const batchedOutput = term.getWriteLog().join("");
-			expect(batchedOutput).not.toContain("\x1b[1;2r");
+			expect(batchedOutput).toContain("\x1b[1;2r");
 			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-8");
 			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-9");
 			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-10");
@@ -231,11 +231,64 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(reflowOutput).toContain("\x1b[r\x1b[?6l");
 			expect(reflowOutput).not.toContain("\x1b[1;2r");
 			expect(reflowOutput).not.toContain("ITERM_ERASE");
+			suffix.setLines(["status", "progress", "composer"]);
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9 revised",
+				"line-10",
+				"line-11 revised",
+				"line-12",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const suffixGrowthOutput = term.getWriteLog().join("");
+			expect(suffixGrowthOutput).toContain("\x1b[1;2r");
+			expect(suffixGrowthOutput).toContain("\x1bD\r\x1b[2Kline-12");
+			expect(suffixGrowthOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			const suffixGrowthScrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(suffixGrowthScrollback.filter(line => line === "line-10")).toHaveLength(1);
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9 revised",
+				"line-10",
+				"line-11 revised",
+				"line-12",
+				"line-13",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const postSuffixGrowthOutput = term.getWriteLog().join("");
+			expect(postSuffixGrowthOutput).toContain("\x1b[1;2r");
+			expect(postSuffixGrowthOutput).toContain("\x1bD\r\x1b[2Kline-13");
+			expect(postSuffixGrowthOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			const postSuffixGrowthScrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(postSuffixGrowthScrollback.filter(line => line === "line-11 revised")).toHaveLength(1);
+			expect(postSuffixGrowthScrollback.filter(line => line === "line-12")).toHaveLength(1);
 			tui.releaseFixedSuffixScrollRegion(token);
 			term.clearWriteLog();
 			tui.requestRender();
 			await term.waitForRender();
-			expect(term.getWriteLog().join("")).not.toContain("\x1b[r\x1b[?6l");
+			expect(term.getWriteLog().join("")).toContain("\x1b[r\x1b[?6l");
 		} finally {
 			tui.stop();
 		}
