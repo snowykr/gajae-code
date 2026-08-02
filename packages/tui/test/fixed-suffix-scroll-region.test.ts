@@ -19,8 +19,9 @@ class LinesComponent implements Component {
 function createPinnedTui(
 	rows = 5,
 	transcriptLines = ["line-1", `line-2${CURSOR_MARKER}`, "line-3"],
+	processTerminal = false,
 ): { term: VirtualTerminal; transcript: LinesComponent; suffix: LinesComponent; tui: TUI } {
-	const term = new VirtualTerminal(40, rows);
+	const term = new VirtualTerminal(40, rows, { isProcessTerminal: processTerminal });
 	const tui = new TUI(term);
 	const transcript = new LinesComponent(transcriptLines);
 	const suffix = new LinesComponent(["status", "composer"]);
@@ -621,6 +622,46 @@ describe("TUI fixed suffix scroll region", () => {
 
 			term.clearWriteLog();
 			tui.requestRender(true, "test armed image render");
+			await term.waitForRender();
+			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+			setTerminalImageProtocol(previousImageProtocol);
+		}
+	});
+	it("preserves an armed iTerm lease when a viewport repaint frame contains an image", async () => {
+		const { term, transcript, tui } = createPinnedTui(5, ["line-1", "line-2", "line-3"], true);
+		let invalidated = 0;
+		const previousImageProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Iterm2);
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"\x1b]1337;MultipartFile=;name=test;size=1;width=1;height=1;inline=1:\x07",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
 			await term.waitForRender();
 			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);

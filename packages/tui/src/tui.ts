@@ -1360,7 +1360,22 @@ export class TUI extends Container {
 		this.#armedFixedSuffixScrollRegionRasterLease = undefined;
 		this.#fixedSuffixScrollRegionOwners.clear();
 	}
+	#hasCurrentArmedFixedSuffixRasterLease(): boolean {
+		const token = this.#armedFixedSuffixScrollRegionToken;
+		const rasterLease = this.#armedFixedSuffixScrollRegionRasterLease;
+		if (token === undefined || rasterLease === undefined || this.#rasterLeases.size !== 1) return false;
+		const lease = this.#rasterLeases.get(token.ownerId);
+		return (
+			this.#fixedSuffixScrollRegionOwners.get(token.ownerId) === token &&
+			rasterLease.ownerId === token.ownerId &&
+			lease?.token === rasterLease &&
+			lease.nativeScrollbackEligible &&
+			lease.nativeScrollbackArmed &&
+			lease.token.rect.row > 0
+		);
+	}
 
+	/** Report the logical output producer revision without coupling TUI to message types. */
 	/** Report the logical output producer revision without coupling TUI to message types. */
 	setViewportOutputSource(source: ViewportOutputSource | null): void {
 		const previous = this.#viewportOutputSource;
@@ -3911,10 +3926,13 @@ export class TUI extends Container {
 						: (lines[lineIndex] ?? "");
 		};
 		const visibleLines = Array.from({ length: height }, (_, screenRow) => lineForScreenRow(screenRow));
+		const containsVisibleImage = visibleLines.some(line => TERMINAL.isImageLine(line));
+		// A fixed iTerm raster and another terminal image protocol cannot share an
+		// unleased viewport repaint. Leave the resident raster in place until a
+		// later frame can render without protected-ingress lease invalidation.
+		if (containsVisibleImage && this.#hasCurrentArmedFixedSuffixRasterLease()) return false;
 		const preserveRasterLeases =
-			this.#rasterLeases.size > 0 &&
-			this.#rasterCleanup.size === 0 &&
-			!visibleLines.some(line => TERMINAL.isImageLine(line));
+			this.#rasterLeases.size > 0 && this.#rasterCleanup.size === 0 && !containsVisibleImage;
 		let buffer = `\x1b[?2026h${deletePlan.output}${preserveRasterLeases ? "\x1b[?25l" : ""}`;
 		if (!preserveRasterLeases) buffer += "\x1b[H";
 		const committedTranscriptRows: Array<number | null> = [];
