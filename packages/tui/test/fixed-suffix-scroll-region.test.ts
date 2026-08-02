@@ -110,6 +110,12 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(invalidated).toBe(0);
 			expect(output).not.toContain("\x1b[4;1H\x1b[2K");
 			expect(output).not.toContain("\x1b[5;1H\x1b[2K");
+			expect(output).toContain("\x1b[4;1H\x1b[36Xstatus");
+			expect(output).toContain("\x1b[4;40H\x1b[1X");
+			expect(output).toContain("\x1b[5;1H\x1b[36Xcomposer");
+			expect(output).toContain("\x1b[5;40H\x1b[1X");
+			expect(output).not.toContain("\x1b[4;37H");
+			expect(output).not.toContain("\x1b[5;37H");
 			await term.flush();
 			expect(term.getScrollBuffer().map(line => line.trimEnd())).toContain("line-1");
 			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5"]);
@@ -123,6 +129,12 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(invalidated).toBe(0);
 			expect(streamingOutput).not.toContain("\x1b[4;1H\x1b[2K");
 			expect(streamingOutput).not.toContain("\x1b[5;1H\x1b[2K");
+			expect(streamingOutput).toContain("\x1b[4;1H\x1b[36Xstatus");
+			expect(streamingOutput).toContain("\x1b[4;40H\x1b[1X");
+			expect(streamingOutput).toContain("\x1b[5;1H\x1b[36Xcomposer");
+			expect(streamingOutput).toContain("\x1b[5;40H\x1b[1X");
+			expect(streamingOutput).not.toContain("\x1b[4;37H");
+			expect(streamingOutput).not.toContain("\x1b[5;37H");
 			await term.flush();
 			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
 			expect(scrollback.filter(line => line === "line-1")).toHaveLength(1);
