@@ -4814,6 +4814,11 @@ export class TUI extends Container {
 			fixedSuffixRasterLease === undefined
 				? 0
 				: Math.min(height - nextSuffixLineCount, fixedSuffixRasterLease.token.rect.row);
+		const fixedPlanePhysicalTop =
+			this.#fixedSuffixScrollPlane?.token === fixedSuffixScrollRegionToken &&
+			this.#fixedSuffixScrollPlane?.upperBottom === fixedPlaneUpperBottom
+				? this.#fixedSuffixScrollPlane.transcriptTop
+				: prevViewportTop;
 		const fixedPlaneEligible =
 			fixedSuffixScrollRegionToken !== undefined &&
 			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
@@ -4842,6 +4847,7 @@ export class TUI extends Container {
 			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#scrollbackResumeViewportTop === undefined &&
 			!this.#nativeScrollbackAdmissionPending &&
+			newLines.slice(0, fixedPlanePhysicalTop).every((line, index) => line === previousLogicalFrame[index]) &&
 			previousSuffixLineCount === nextSuffixLineCount &&
 			nextSuffixLineCount < height;
 		if (!fixedPlaneEligible && this.#fixedSuffixScrollPlane !== undefined) {
@@ -4850,10 +4856,7 @@ export class TUI extends Container {
 		}
 		if (fixedPlaneEligible) {
 			const plane = this.#fixedSuffixScrollPlane;
-			const physicalTop =
-				plane?.token === fixedSuffixScrollRegionToken && plane.upperBottom === fixedPlaneUpperBottom
-					? plane.transcriptTop
-					: prevViewportTop;
+			const physicalTop = fixedPlanePhysicalTop;
 			const desiredTop = Math.max(0, nextTranscriptLineCount - fixedPlaneUpperBottom);
 			if (physicalTop > desiredTop) {
 				this.#fixedSuffixScrollPlane = undefined;
@@ -4866,6 +4869,10 @@ export class TUI extends Container {
 			if (plane?.token !== fixedSuffixScrollRegionToken || plane.upperBottom !== fixedPlaneUpperBottom)
 				fixedPlaneBuffer += `\x1b[1;${fixedPlaneUpperBottom}r`;
 			for (let scrollIndex = 0; scrollIndex < desiredTop - physicalTop; scrollIndex += 1) {
+				const displacedLineIndex = physicalTop + scrollIndex;
+				if (newLines[displacedLineIndex] !== previousLogicalFrame[displacedLineIndex]) {
+					fixedPlaneBuffer += `\x1b[1;1H\x1b[2K${this.#padLineToWidth(newLines[displacedLineIndex] ?? "", width)}`;
+				}
 				const lineIndex = physicalTop + fixedPlaneUpperBottom + scrollIndex;
 				fixedPlaneBuffer += `\x1b[${fixedPlaneUpperBottom};1H\x1bD\r\x1b[2K${this.#padLineToWidth(
 					newLines[lineIndex] ?? "",

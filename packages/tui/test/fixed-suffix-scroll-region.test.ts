@@ -196,8 +196,33 @@ describe("TUI fixed suffix scroll region", () => {
 				"line-6",
 				"line-7",
 				"line-8",
-				"line-9",
-				"line-10 revised",
+				"line-9 revised",
+				"line-10",
+				"line-11",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const outgoingRewriteOutput = term.getWriteLog().join("");
+			expect(outgoingRewriteOutput).toContain("\x1b[1;1H\x1b[2Kline-9 revised");
+			expect(outgoingRewriteOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-11");
+			expect(outgoingRewriteOutput).not.toContain("ITERM_ERASE");
+			await term.flush();
+			const outgoingRewriteScrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(outgoingRewriteScrollback.filter(line => line === "line-9 revised")).toHaveLength(1);
+			expect(outgoingRewriteScrollback).not.toContain("line-9");
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9 revised",
+				"line-10",
+				"line-11 revised",
 			]);
 			term.clearWriteLog();
 			tui.requestRender();
@@ -298,14 +323,28 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
-	it("does not acquire or arm a fixed suffix owner after stop", async () => {
-		const { term, tui } = createPinnedTui();
+	it("resets an active fixed scroll plane before stop", async () => {
+		const { term, transcript, tui } = createPinnedTui();
 		tui.start();
 		await term.waitForRender();
+		const lease = await tui.acquireRasterLease({
+			ownerId: "test-owner",
+			rect: { column: 36, row: 2, width: 3, height: 3 },
+			erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+			nativeScrollbackEligible: true,
+		});
+		expect(lease.status).toBe("acquired");
+		if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
 		const token = tui.acquireFixedSuffixScrollRegion("test-owner");
 		expect(token).toBeDefined();
 		if (token === undefined) throw new Error("Expected fixed suffix token");
+		transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+		term.clearWriteLog();
+		expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+		await term.waitForRender();
+		term.clearWriteLog();
 		tui.stop();
+		expect(term.getWriteLog().join("")).toContain("\x1b[r\x1b[?6l");
 		expect(tui.acquireFixedSuffixScrollRegion("new-owner")).toBeUndefined();
 		expect(tui.armFixedSuffixScrollRegion(token)).toBeUndefined();
 	});
