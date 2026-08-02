@@ -1004,6 +1004,7 @@ export class TUI extends Container {
 			erase: Uint8Array;
 			callback?: (n: RasterLeaseInvalidatedNotification) => void;
 			nativeScrollbackEligible: boolean;
+			nativeScrollbackArmed: boolean;
 			revoked: boolean;
 		}
 	>();
@@ -1324,6 +1325,9 @@ export class TUI extends Container {
 			(rasterLease !== undefined && this.#rasterLeases.get(token.ownerId)?.token !== rasterLease)
 		)
 			return undefined;
+		const lease = rasterLease === undefined ? undefined : this.#rasterLeases.get(token.ownerId);
+		if (rasterLease !== undefined && (!lease || lease.token !== rasterLease)) return undefined;
+		if (lease?.nativeScrollbackEligible) lease.nativeScrollbackArmed = true;
 		this.#armedFixedSuffixScrollRegionToken = token;
 		this.#armedFixedSuffixScrollRegionRasterLease = rasterLease;
 		return this.requestRenderWithGeneration(false, "fixed-suffix-scroll-region");
@@ -1844,6 +1848,7 @@ export class TUI extends Container {
 				erase: new Uint8Array(request.erase.bytes),
 				callback: request.onInvalidated,
 				nativeScrollbackEligible: request.nativeScrollbackEligible === true,
+				nativeScrollbackArmed: false,
 				revoked: false,
 			});
 			return { status: "acquired", token };
@@ -4824,7 +4829,7 @@ export class TUI extends Container {
 					fixedSuffixScrollRegionToken !== undefined &&
 					fixedSuffixScrollRegionRasterLease !== undefined &&
 					fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
-					fixedSuffixRasterLease.nativeScrollbackEligible &&
+					fixedSuffixRasterLease.nativeScrollbackArmed &&
 					fixedSuffixRasterLease.token.rect.row > 0));
 		const soleRasterLease = this.#rasterLeases.size === 1 ? this.#rasterLeases.values().next().value : undefined;
 		const fixedPlaneUpperBottom =
@@ -4842,7 +4847,7 @@ export class TUI extends Container {
 				fixedSuffixScrollRegionToken &&
 			fixedSuffixScrollRegionRasterLease !== undefined &&
 			fixedSuffixRasterLease?.token === fixedSuffixScrollRegionRasterLease &&
-			fixedSuffixRasterLease.nativeScrollbackEligible &&
+			fixedSuffixRasterLease.nativeScrollbackArmed &&
 			this.#rasterLeases.size === 1 &&
 			this.#rasterCleanup.size === 0 &&
 			this.#rasterPending === 0 &&
@@ -4948,17 +4953,16 @@ export class TUI extends Container {
 			this.#transcriptIdentityReplaced = false;
 			return;
 		}
-		// A verified iTerm lease must yield before an overflow can overwrite a row
-		// that native history has not received. The fixed token covers an armed
-		// owner; the explicit capability covers the pre-arm upload window.
+		// Only an armed iTerm lease yields for native admission. Before the GIF
+		// upload commits and arms the lease, preserve its raster rather than
+		// repeatedly erasing and re-uploading it under streaming output.
 		const rasterMustYieldForNativeAdmission =
 			appendedLines &&
 			nextLiveViewportTop > prevViewportTop &&
 			!fixedSuffixNativeAppendPreservesRasterLease &&
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
-			(fixedSuffixRasterLease?.nativeScrollbackEligible === true ||
-				soleRasterLease?.nativeScrollbackEligible === true);
+			(fixedSuffixRasterLease?.nativeScrollbackArmed === true || soleRasterLease?.nativeScrollbackArmed === true);
 		if (
 			!fixedSuffixNativeAppendPreservesRasterLease &&
 			!rasterMustYieldForNativeAdmission &&

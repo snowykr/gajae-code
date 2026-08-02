@@ -486,7 +486,7 @@ describe("TUI raster lease public boundary", () => {
 		expect(calls).toBe(0);
 		tui.stop();
 	});
-	it("yields an eligible pre-arm lease before repeated native overflow admission", async () => {
+	it("preserves an eligible pre-arm lease until its fixed suffix owner arms native admission", async () => {
 		const { tui, terminal } = await setup();
 		let lines = ["one", "two", "three", "four"];
 		let calls = 0;
@@ -494,6 +494,7 @@ describe("TUI raster lease public boundary", () => {
 		tui.addChild(component);
 		tui.start();
 		await terminal.waitForRender();
+		const initialScrollbackLength = terminal.getScrollBuffer().length;
 
 		const lease = await tui.acquireRasterLease({
 			...request("iterm-pre-arm", rect(8, 3, 2, 1), "ERASE", () => calls++),
@@ -506,25 +507,18 @@ describe("TUI raster lease public boundary", () => {
 		await terminal.waitForRender();
 
 		const output = terminal.getWriteLog().join("");
-		expect(output).toContain("ERASE");
-		expect(output).toContain("\r\n");
-		expect(calls).toBe(1);
+		expect(output).not.toContain("ERASE");
+		expect(output).not.toContain("\r\n");
+		expect(calls).toBe(0);
 		await terminal.flush();
-		expect(
-			terminal
-				.getScrollBuffer()
-				.map(line => line.trimEnd())
-				.filter(line => line === "one"),
-		).toHaveLength(1);
+		expect(terminal.getScrollBuffer()).toHaveLength(initialScrollbackLength);
 
 		lines = [...lines, "six"];
 		terminal.clearWriteLog();
 		tui.requestRender();
 		await terminal.waitForRender();
-		await terminal.flush();
-		const scrollback = terminal.getScrollBuffer().map(line => line.trimEnd());
-		expect(scrollback.filter(line => line === "one")).toHaveLength(1);
-		expect(scrollback.filter(line => line === "two")).toHaveLength(1);
+		expect(terminal.getWriteLog().join("")).not.toContain("ERASE");
+		expect(calls).toBe(0);
 		tui.stop();
 	});
 	it("repaints rewritten streaming output without scrolling an active raster", async () => {
