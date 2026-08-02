@@ -2559,6 +2559,8 @@ export class TUI extends Container {
 
 	stop(): void {
 		this.#resetFixedSuffixScrollRegions();
+		if (this.#fixedSuffixScrollRegionResetPending && this.#writeTerminal("\x1b[r\x1b[?6l"))
+			this.#fixedSuffixScrollRegionResetPending = false;
 		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		this.flushTerminalCleanup();
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
@@ -4742,7 +4744,7 @@ export class TUI extends Container {
 		// A multipart raster prefix owns the terminal cursor until its records and
 		// restore suffix are delivered; queue a no-op cursor update behind it rather
 		// than moving the GIF placement between prefix and records.
-		if (firstChanged === -1 && fixedSuffixScrollRegionToken === undefined) {
+		if (firstChanged === -1) {
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
 			if (this.#rasterPending > 0) {
 				void this.#enqueueRaster(() => {
@@ -4799,6 +4801,7 @@ export class TUI extends Container {
 		const fixedSuffixNativeAppendPreservesRasterLease =
 			fixedSuffixNativeAppend &&
 			this.#rasterCleanup.size === 0 &&
+			!this.#fixedSuffixScrollRegionResetPending &&
 			(this.#rasterLeases.size === 0 ||
 				(this.#rasterLeases.size === 1 &&
 					fixedSuffixScrollRegionToken !== undefined &&
@@ -4822,6 +4825,7 @@ export class TUI extends Container {
 			this.#rasterCleanup.size === 0 &&
 			this.#rasterPending === 0 &&
 			fixedPlaneUpperBottom > 0 &&
+			appendedLines &&
 			hasStickySuffix &&
 			!widthChanged &&
 			!heightChanged &&
@@ -4840,6 +4844,10 @@ export class TUI extends Container {
 			!this.#nativeScrollbackAdmissionPending &&
 			previousSuffixLineCount === nextSuffixLineCount &&
 			nextSuffixLineCount < height;
+		if (!fixedPlaneEligible && this.#fixedSuffixScrollPlane !== undefined) {
+			this.#fixedSuffixScrollPlane = undefined;
+			this.#fixedSuffixScrollRegionResetPending = true;
+		}
 		if (fixedPlaneEligible) {
 			const plane = this.#fixedSuffixScrollPlane;
 			const physicalTop =
@@ -4911,7 +4919,7 @@ export class TUI extends Container {
 			this.#latestRenderedLines = newLines;
 			if (this.#virtualViewport) this.#latestRaw = rawLines;
 			this.#durableLineCount = Math.max(this.#durableLineCount, newLines.length);
-			this.#recordDurableLines(newLines, rawLines, desiredTop, newLines.length - 1);
+			this.#recordDurableLines(newLines, rawLines, physicalTop, newLines.length - 1);
 			this.#nativeScrollbackAdmissionPending = false;
 			this.#transcriptIdentityReplaced = false;
 			return;

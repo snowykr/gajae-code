@@ -187,11 +187,30 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(batchedScrollback.filter(line => line === "line-5 revised")).toHaveLength(1);
 			expect(batchedScrollback.filter(line => line === "line-6")).toHaveLength(1);
 			expect(batchedScrollback.filter(line => line === "line-7")).toHaveLength(1);
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9",
+				"line-10 revised",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const reflowOutput = term.getWriteLog().join("");
+			expect(reflowOutput).toContain("\x1b[r\x1b[?6l");
+			expect(reflowOutput).not.toContain("\x1b[1;2r");
+			expect(reflowOutput).not.toContain("ITERM_ERASE");
 			tui.releaseFixedSuffixScrollRegion(token);
 			term.clearWriteLog();
 			tui.requestRender();
 			await term.waitForRender();
-			expect(term.getWriteLog().join("")).toContain("\x1b[r\x1b[?6l");
+			expect(term.getWriteLog().join("")).not.toContain("\x1b[r\x1b[?6l");
 		} finally {
 			tui.stop();
 		}
