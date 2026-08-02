@@ -4876,7 +4876,11 @@ export class TUI extends Container {
 			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#scrollbackResumeViewportTop === undefined &&
 			!this.#nativeScrollbackAdmissionPending &&
-			newLines.slice(0, fixedPlanePhysicalTop).every((line, index) => line === previousLogicalFrame[index]) &&
+			// Rows above the physical plane already belong to host scrollback. A
+			// historical Markdown rewrite cannot update that immutable history, but
+			// it must not force a generic raster erase. The departing plane row is
+			// repaired immediately before its IND below, so native admission stays
+			// correct for every newly displaced live row.
 			nextTranscriptLineCount >= previousTranscriptLineCount &&
 			nextSuffixLineCount < height;
 		if (!fixedPlaneEligible && this.#fixedSuffixScrollPlane !== undefined) {

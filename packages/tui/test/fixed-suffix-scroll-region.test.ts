@@ -126,6 +126,48 @@ describe("TUI fixed suffix scroll region", () => {
 		}
 	});
 
+	it("keeps an armed iTerm lease across an append with an immutable historical rewrite", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5", "line-6"]);
+			await term.waitForRender();
+
+			transcript.setLines(["line-1 revised", "line-2", "line-3", "line-4", "line-5", "line-6", "line-7"]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+
+			const output = term.getWriteLog().join("");
+			expect(output).toContain("\x1b[1;2r");
+			expect(output).toContain("\x1bD\r\x1b[2Kline-7");
+			expect(output).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			const scrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(scrollback.filter(line => line === "line-6")).toHaveLength(1);
+		} finally {
+			tui.stop();
+		}
+	});
 	it("preserves a bound raster lease while advancing native scrollback", async () => {
 		const { term, transcript, suffix, tui } = createPinnedTui();
 		let invalidated = 0;
