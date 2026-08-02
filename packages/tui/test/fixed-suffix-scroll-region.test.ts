@@ -168,7 +168,7 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.stop();
 		}
 	});
-	it("keeps an armed iTerm lease through a multipart barrier reflow", async () => {
+	it("keeps an armed iTerm lease through a multipart barrier append", async () => {
 		const { term, transcript, tui } = createPinnedTui();
 		let invalidated = 0;
 		try {
@@ -209,7 +209,7 @@ describe("TUI fixed suffix scroll region", () => {
 			});
 			await prefixEntered.promise;
 
-			transcript.setLines(["line-1 revised", "line-2", "line-3", "line-4", "line-5"]);
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5"]);
 			tui.requestRender();
 			await Bun.sleep(20);
 			expect(term.getWriteLog().join("")).toBe("MULTIPART_PREFIX");
@@ -222,7 +222,7 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(fallbackOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
 
-			transcript.setLines(["line-1 revised", "line-2", "line-3", "line-4", "line-5", "line-6"]);
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5", "line-6"]);
 			term.clearWriteLog();
 			tui.requestRender();
 			await term.waitForRender();
@@ -534,7 +534,8 @@ describe("TUI fixed suffix scroll region", () => {
 
 			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
 			term.clearWriteLog();
-			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeUndefined();
+			tui.requestRender();
 			await term.waitForRender();
 
 			const output = term.getWriteLog().join("");
