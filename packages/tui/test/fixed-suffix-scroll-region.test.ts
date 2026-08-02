@@ -91,6 +91,7 @@ describe("TUI fixed suffix scroll region", () => {
 				rect: { column: 36, row: 2, width: 3, height: 3 },
 				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
 				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
 			});
 			expect(lease.status).toBe("acquired");
 			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
@@ -124,8 +125,8 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const streamingOutput = term.getWriteLog().join("");
-			expect(streamingOutput).toContain("\x1b[1;2r");
-			expect(streamingOutput).toContain("\x1bD\r\x1b[2Kline-5");
+			expect(streamingOutput).not.toContain("\x1b[1;2r");
+			expect(streamingOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-5");
 			expect(streamingOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
 			expect(streamingOutput).not.toContain("\x1b[4;1H\x1b[2K");
@@ -146,9 +147,9 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const tailRewriteOutput = term.getWriteLog().join("");
-			expect(tailRewriteOutput).toContain("\x1b[1;2r");
-			expect(tailRewriteOutput).toContain("\r\x1b[2Kline-5 revised");
-			expect(tailRewriteOutput).toContain("\x1bD\r\x1b[2Kline-6");
+			expect(tailRewriteOutput).not.toContain("\x1b[1;2r");
+			expect(tailRewriteOutput).toContain("\x1b[1;1H\x1b[2Kline-5 revised");
+			expect(tailRewriteOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-6");
 			expect(tailRewriteOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
 			transcript.setLines(["line-1", "line-2", "line-3", "line-4", "line-5 revised", "line-6", "line-7"]);
@@ -156,10 +157,36 @@ describe("TUI fixed suffix scroll region", () => {
 			tui.requestRender();
 			await term.waitForRender();
 			const postRewriteOutput = term.getWriteLog().join("");
-			expect(postRewriteOutput).toContain("\x1b[1;2r");
-			expect(postRewriteOutput).toContain("\x1bD\r\x1b[2Kline-7");
+			expect(postRewriteOutput).not.toContain("\x1b[1;2r");
+			expect(postRewriteOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-7");
 			expect(postRewriteOutput).not.toContain("ITERM_ERASE");
 			expect(invalidated).toBe(0);
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9",
+				"line-10",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const batchedOutput = term.getWriteLog().join("");
+			expect(batchedOutput).not.toContain("\x1b[1;2r");
+			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-8");
+			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-9");
+			expect(batchedOutput).toContain("\x1b[2;1H\x1bD\r\x1b[2Kline-10");
+			expect(batchedOutput).not.toContain("ITERM_ERASE");
+			await term.flush();
+			const batchedScrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(batchedScrollback.filter(line => line === "line-5 revised")).toHaveLength(1);
+			expect(batchedScrollback.filter(line => line === "line-6")).toHaveLength(1);
+			expect(batchedScrollback.filter(line => line === "line-7")).toHaveLength(1);
 		} finally {
 			tui.stop();
 		}
