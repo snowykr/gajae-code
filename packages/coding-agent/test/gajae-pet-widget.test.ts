@@ -4,6 +4,7 @@ import {
 	Container,
 	getCellDimensions,
 	getGajaePetGifCached,
+	idleTimeline,
 	setCellDimensions,
 	type TUI,
 	workingTimeline,
@@ -1500,7 +1501,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("keeps the iTerm GIF on its idle timeline while inactive", async () => {
+	it("uploads an idle iTerm GIF while inactive", async () => {
 		vi.useFakeTimers();
 		const stubs = makeWidget(80, 30, { protocol: null, autoFlexGapMs: [500, 500] });
 		try {
@@ -1512,12 +1513,24 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(700);
 			await flushAsyncChain();
 			expect(stubs.widget.isFlexing).toBe(false);
+			const request = stubs.getRasterLeaseRequests()[0];
+			expect(request).toBeDefined();
+			if (request === undefined) throw new Error("Expected iTerm raster lease request");
+			const cell = getCellDimensions();
+			const expectedGif = getGajaePetGifCached({
+				skin: "blue",
+				timeline: [...idleTimeline(), { name: "base", delayMs: 700 }],
+				targetRows: 2,
+				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: request.rect.width, height: request.rect.height },
+			});
 			expect(
 				stubs
 					.getRasterOutputs()
-					.map(record => new TextDecoder().decode(record))
-					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(1);
+					.slice(1, -1)
+					.map(record => new TextDecoder().decode(record)),
+			).toEqual([...expectedGif.multipart]);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1555,7 +1568,7 @@ describe("GajaePetWidget", () => {
 					.getRasterOutputs()
 					.map(record => new TextDecoder().decode(record))
 					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(1);
+			).toHaveLength(2);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1681,7 +1694,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("keeps one iTerm GIF across idle-working-idle transitions", async () => {
+	it("changes the resident iTerm GIF once per idle-working-idle boundary", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1705,20 +1718,26 @@ describe("GajaePetWidget", () => {
 					.getRasterOutputs()
 					.map(record => new TextDecoder().decode(record))
 					.filter(record => record.includes("MultipartFile=")),
-			).toHaveLength(1);
-			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true]);
+			).toHaveLength(2);
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true]);
 
 			working = false;
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true]);
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true, true]);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(3);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("keeps the managed iTerm GIF across a working transition", async () => {
+	it("replaces the managed iTerm GIF once when work starts", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1738,14 +1757,14 @@ describe("GajaePetWidget", () => {
 					.getRasterOutputs()
 					.map(record => new TextDecoder().decode(record))
 					.filter(record => record === expectedPrefix),
-			).toHaveLength(1);
+			).toHaveLength(2);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("keeps the initial iTerm raster settled while work starts", async () => {
+	it("replaces an idle iTerm GIF when work starts without invalidating its lease", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1765,7 +1784,7 @@ describe("GajaePetWidget", () => {
 				.getRasterOutputs()
 				.map(record => new TextDecoder().decode(record))
 				.filter(record => record.includes("MultipartFile="));
-			expect(headers).toHaveLength(1);
+			expect(headers).toHaveLength(2);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);

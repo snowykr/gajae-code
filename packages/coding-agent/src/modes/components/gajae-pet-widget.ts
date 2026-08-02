@@ -9,6 +9,7 @@ import {
 	type GajaePixelFrames,
 	getCellDimensions,
 	getGajaePetGifCached,
+	idleTimeline,
 	PARA_PARA_STEPS,
 	PET_SKINS,
 	type PetMode,
@@ -496,7 +497,7 @@ export class GajaePetWidget {
 		return "base";
 	}
 
-	#tickIterm(_now: number): void {
+	#tickIterm(_now: number, working: boolean): void {
 		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) {
 			this.#releaseFixedSuffixScrollRegion();
 			return;
@@ -567,11 +568,11 @@ export class GajaePetWidget {
 			this.#releaseFixedSuffixScrollRegion();
 			return;
 		}
-		// OSC 1337 has no image-frame replacement primitive. Re-uploading a GIF
-		// for ordinary working/idle or auto-flex transitions visibly flashes its
-		// transparent canvas. Keep one loop resident; its final base frame remains
-		// safe when iTerm ignores the GIF loop extension.
-		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		// iTerm replaces a resident GIF only through another MultipartFile transfer.
+		// Include the activity phase so it changes exactly once per work boundary;
+		// steady ticks retain the existing lease and image.
+		const animationPhase = working ? "working" : "idle";
+		const semantic = `${this.#mode}:${animationPhase}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
 		if (this.#itermSubmitPending) return;
 		if (semantic === this.#itermLastSemantic && this.#itermLease) {
 			this.#armFixedSuffixScrollRegion(this.#itermLease);
@@ -586,6 +587,7 @@ export class GajaePetWidget {
 			availability.epoch,
 			availability.mode,
 			semantic,
+			animationPhase,
 			{
 				columns: this.#ui.terminal.columns,
 				rows: terminalRows,
@@ -604,10 +606,11 @@ export class GajaePetWidget {
 		epoch: number,
 		mode: "direct" | "managed",
 		semantic: string,
+		animationPhase: "idle" | "working",
 		geometry: Readonly<{ columns: number; rows: number; cellWidthPx: number; cellHeightPx: number }>,
 		composerBottomOffset: number,
 	): Promise<void> {
-		const current = () => {
+		const currentGeometry = () => {
 			const availability = getVerifiedItermPetAvailability();
 			const terminal = this.#ui.terminal;
 			const cell = getCellDimensions();
@@ -653,7 +656,7 @@ export class GajaePetWidget {
 			}
 			token = undefined;
 		}
-		if (!current()) return;
+		if (!currentGeometry()) return;
 		if (!token) {
 			const acquired = await this.#ui.acquireRasterLease({
 				ownerId: this.#itermOwner,
@@ -676,7 +679,7 @@ export class GajaePetWidget {
 					}
 				},
 			});
-			if (!current() || acquired.status !== "acquired") {
+			if (!currentGeometry() || acquired.status !== "acquired") {
 				this.#releaseFixedSuffixScrollRegion();
 				if (acquired.status === "acquired")
 					await this.#ui.invalidateRasterLease({
@@ -689,7 +692,10 @@ export class GajaePetWidget {
 			this.#itermLease = token;
 		}
 		this.#itermLastSemantic = semantic;
-		const frames = [...workingTimeline(), { name: "base" as const, delayMs: 700 }];
+		const frames =
+			animationPhase === "working"
+				? [...workingTimeline(), { name: "base" as const, delayMs: 700 }]
+				: [...idleTimeline(), { name: "base" as const, delayMs: 700 }];
 		const cell = getCellDimensions();
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
@@ -725,17 +731,17 @@ export class GajaePetWidget {
 				),
 				afterPrefix:
 					mode === "managed"
-						? async () => (current() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
+						? async () => (currentGeometry() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
 						: undefined,
 				replayPrefix: mode === "managed" ? new TextEncoder().encode(cursorPosition) : undefined,
 				records: encodedRecords,
 				suffix: new TextEncoder().encode(cursorRestore),
 				abortSuffix: mode === "managed" ? new TextEncoder().encode(cursorRestore) : undefined,
 				restoreCursorVisibility: true,
-				shouldWrite: current,
+				shouldWrite: currentGeometry,
 			},
 		});
-		if (!current() || submit.status !== "written") {
+		if (!currentGeometry() || submit.status !== "written") {
 			this.#releaseFixedSuffixScrollRegion();
 			await this.#ui.invalidateRasterLease({ token, cause: "capability-loss" });
 			if (this.#itermLease === token) {
@@ -785,7 +791,7 @@ export class GajaePetWidget {
 			}
 		}
 		if (this.#itermProtocol) {
-			this.#tickIterm(now);
+			this.#tickIterm(now, working);
 			return;
 		}
 		if (this.#mode === "off" || !this.#pixel) return;
