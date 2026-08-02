@@ -284,6 +284,36 @@ describe("TUI fixed suffix scroll region", () => {
 			const postSuffixGrowthScrollback = term.getScrollBuffer().map(line => line.trimEnd());
 			expect(postSuffixGrowthScrollback.filter(line => line === "line-11 revised")).toHaveLength(1);
 			expect(postSuffixGrowthScrollback.filter(line => line === "line-12")).toHaveLength(1);
+			suffix.setLines(["status", "progress", "hint", "composer"]);
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"line-5 revised",
+				"line-6",
+				"line-7",
+				"line-8",
+				"line-9 revised",
+				"line-10",
+				"line-11 revised",
+				"line-12",
+				"line-13",
+				"line-14",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const shrinkingPlaneOutput = term.getWriteLog().join("");
+			expect(shrinkingPlaneOutput).toContain("\x1b[1;2r");
+			expect(shrinkingPlaneOutput).toContain("\x1b[1;1r");
+			expect(shrinkingPlaneOutput).toContain("\x1bD\r\x1b[2Kline-14");
+			expect(shrinkingPlaneOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+			await term.flush();
+			const shrinkingPlaneScrollback = term.getScrollBuffer().map(line => line.trimEnd());
+			expect(shrinkingPlaneScrollback.filter(line => line === "line-12")).toHaveLength(1);
+			expect(shrinkingPlaneScrollback.filter(line => line === "line-13")).toHaveLength(1);
 			tui.releaseFixedSuffixScrollRegion(token);
 			term.clearWriteLog();
 			tui.requestRender();
