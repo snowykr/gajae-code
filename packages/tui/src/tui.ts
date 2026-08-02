@@ -5065,7 +5065,12 @@ export class TUI extends Container {
 			this.#latestRenderedLines = newLines;
 			if (this.#virtualViewport) this.#latestRaw = rawLines;
 			this.#durableLineCount = Math.max(this.#durableLineCount, newLines.length);
-			this.#recordDurableLines(newLines, rawLines, previousTranscriptLineCount, newLines.length - 1);
+			this.#recordDurableLines(
+				newLines,
+				rawLines,
+				previousTranscriptLineCount - (fixedSuffixTailRewrite ? 1 : 0),
+				newLines.length - 1,
+			);
 			this.#nativeScrollbackAdmissionPending = false;
 			this.#transcriptIdentityReplaced = false;
 			return;
