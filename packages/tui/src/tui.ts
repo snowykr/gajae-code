@@ -1919,6 +1919,12 @@ export class TUI extends Container {
 				!op.shouldWrite()
 			)
 				return { queueId: id, operation: op.type, status: "stale-token" };
+			if (
+				this.#fixedSuffixScrollRegionResetPending &&
+				!this.#guardTerminalOperation(() => this.terminal.write("\x1b[r\x1b[?6l"))
+			)
+				return failed();
+			this.#fixedSuffixScrollRegionResetPending = false;
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
