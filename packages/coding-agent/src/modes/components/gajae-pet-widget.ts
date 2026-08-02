@@ -560,7 +560,11 @@ export class GajaePetWidget {
 		}
 		const working = this.#isWorking();
 		const flexing = this.#flexUntil > now;
-		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		// OSC 1337 has no image-frame replacement primitive. Re-uploading a GIF
+		// for ordinary working/idle or auto-flex transitions visibly flashes its
+		// transparent canvas, so an armed iTerm lease keeps its initial timeline
+		// until a real placement or geometry change requires a new submission.
+		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
 		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
 		this.#itermLastSemantic = semantic;
 		this.#itermSubmitPending = true;

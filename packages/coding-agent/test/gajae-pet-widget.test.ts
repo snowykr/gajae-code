@@ -1421,7 +1421,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("runs scheduled auto-flex bursts on the iTerm raster path", async () => {
+	it("keeps the initial iTerm GIF during scheduled auto-flex bursts", async () => {
 		vi.useFakeTimers();
 		const stubs = makeWidget(80, 30, {
 			protocol: null,
@@ -1443,9 +1443,7 @@ describe("GajaePetWidget", () => {
 				.getRasterOutputs()
 				.map(record => new TextDecoder().decode(record))
 				.filter(record => record.includes("MultipartFile="));
-			expect(headers).toHaveLength(2);
-			const sizes = headers.map(header => Number(/;size=(\d+);/u.exec(header)?.[1]));
-			expect(sizes[1]).toBeGreaterThan(sizes[0]);
+			expect(headers).toHaveLength(1);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
@@ -1601,7 +1599,7 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
-	it("reuses one raster lease and applies cursor visibility for idle-working-idle transitions", async () => {
+	it("keeps one iTerm GIF across idle-working-idle transitions", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1620,24 +1618,25 @@ describe("GajaePetWidget", () => {
 			working = true;
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			const replacementPrefix = stubs
-				.getRasterOutputs()
-				.map(record => new TextDecoder().decode(record))
-				.find(record => record === "\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H");
-			expect(replacementPrefix).toBe("\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H");
-			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true]);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(record => new TextDecoder().decode(record))
+					.filter(record => record.includes("MultipartFile=")),
+			).toHaveLength(1);
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true]);
 
 			working = false;
 			vi.advanceTimersByTime(80);
 			await flushAsyncChain();
-			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true, true]);
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true]);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("replaces the managed iTerm GIF without blanking its footprint", async () => {
+	it("keeps the managed iTerm GIF across a working transition", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1657,14 +1656,14 @@ describe("GajaePetWidget", () => {
 					.getRasterOutputs()
 					.map(record => new TextDecoder().decode(record))
 					.filter(record => record === expectedPrefix),
-			).toHaveLength(2);
+			).toHaveLength(1);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
 			stubs.widget.dispose();
 		}
 	});
-	it("settles after replacing the idle raster with the working raster", async () => {
+	it("keeps the initial iTerm raster settled while work starts", async () => {
 		vi.useFakeTimers();
 		let working = false;
 		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
@@ -1684,7 +1683,7 @@ describe("GajaePetWidget", () => {
 				.getRasterOutputs()
 				.map(record => new TextDecoder().decode(record))
 				.filter(record => record.includes("MultipartFile="));
-			expect(headers).toHaveLength(2);
+			expect(headers).toHaveLength(1);
 			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
 		} finally {
 			setVerifiedItermPetAvailability(undefined);
