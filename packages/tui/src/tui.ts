@@ -2153,7 +2153,7 @@ export class TUI extends Container {
 			)
 		)
 			return false;
-		return this.#guardTerminalOperation(() => this.terminal.write(buffer));
+		return this.#writeTerminal(buffer);
 	}
 	#writeProtectedRenderIngress(buffer: string): boolean {
 		const affected = [...this.#rasterLeases.values()];
