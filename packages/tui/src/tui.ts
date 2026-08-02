@@ -4390,6 +4390,7 @@ export class TUI extends Container {
 					});
 					return;
 				}
+				if (newLines.some(line => TERMINAL.isImageLine(line))) return;
 				this.#fixedSuffixScrollPlane = undefined;
 				this.#fixedSuffixScrollRegionResetPending = true;
 				viewportRepaint(`armed fixed suffix lease blocked full render: ${reason}`);
@@ -4868,6 +4869,7 @@ export class TUI extends Container {
 				: this.#rasterLeases.get(fixedSuffixScrollRegionToken.ownerId);
 		const fixedSuffixNativeAppendPreservesRasterLease =
 			fixedSuffixNativeAppend &&
+			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#rasterCleanup.size === 0 &&
 			!this.#fixedSuffixScrollRegionResetPending &&
 			(this.#rasterLeases.size === 0 ||

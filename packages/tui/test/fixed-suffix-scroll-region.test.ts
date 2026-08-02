@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, CURSOR_MARKER, TUI } from "@gajae-code/tui";
+import { type Component, CURSOR_MARKER, ImageProtocol, setTerminalImageProtocol, TERMINAL, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class LinesComponent implements Component {
@@ -577,6 +577,56 @@ describe("TUI fixed suffix scroll region", () => {
 			expect(invalidated).toBe(0);
 		} finally {
 			tui.stop();
+		}
+	});
+	it("preserves an armed iTerm lease when the frame contains an image", async () => {
+		const { term, transcript, tui } = createPinnedTui();
+		let invalidated = 0;
+		const previousImageProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Iterm2);
+		try {
+			tui.start();
+			await term.waitForRender();
+			const lease = await tui.acquireRasterLease({
+				ownerId: "iterm-owner",
+				rect: { column: 36, row: 2, width: 3, height: 3 },
+				erase: { type: "raster-erase", bytes: new TextEncoder().encode("ITERM_ERASE") },
+				onInvalidated: () => invalidated++,
+				nativeScrollbackEligible: true,
+			});
+			expect(lease.status).toBe("acquired");
+			if (lease.status !== "acquired") throw new Error("Expected iTerm lease");
+			const token = tui.acquireFixedSuffixScrollRegion("iterm-owner");
+			expect(token).toBeDefined();
+			if (token === undefined) throw new Error("Expected fixed suffix token");
+
+			transcript.setLines(["line-1", "line-2", "line-3", "line-4"]);
+			expect(tui.armFixedSuffixScrollRegion(token, lease.token)).toBeGreaterThan(0);
+			await term.waitForRender();
+
+			transcript.setLines([
+				"line-1",
+				"line-2",
+				"line-3",
+				"line-4",
+				"\x1b]1337;MultipartFile=;name=test;size=1;width=1;height=1;inline=1:\x07",
+			]);
+			term.clearWriteLog();
+			tui.requestRender();
+			await term.waitForRender();
+			const appendOutput = term.getWriteLog().join("");
+			expect(appendOutput).not.toContain("\x1b[1;2r");
+			expect(appendOutput).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+
+			term.clearWriteLog();
+			tui.requestRender(true, "test armed image render");
+			await term.waitForRender();
+			expect(term.getWriteLog().join("")).not.toContain("ITERM_ERASE");
+			expect(invalidated).toBe(0);
+		} finally {
+			tui.stop();
+			setTerminalImageProtocol(previousImageProtocol);
 		}
 	});
 	it("uses the existing renderer unless a current owner arms the fixed suffix region", async () => {
