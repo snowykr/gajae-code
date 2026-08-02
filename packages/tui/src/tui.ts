@@ -4755,6 +4755,7 @@ export class TUI extends Container {
 			newLines
 				.slice(0, previousTranscriptLineCount - 1)
 				.every((line, index) => line === previousLogicalFrame[index]);
+		const fixedSuffixAppendOnly = firstChanged === previousTranscriptLineCount || fixedSuffixTailRewrite;
 		const fixedSuffixNativeAppend =
 			fixedSuffixScrollRegionToken !== undefined &&
 			this.#fixedSuffixScrollRegionOwners.get(fixedSuffixScrollRegionToken.ownerId) ===
@@ -4773,16 +4774,13 @@ export class TUI extends Container {
 			this.overlayStack.length === 0 &&
 			previousKittyPlacementSpans.length === 0 &&
 			nextKittyPlacementSpans.length === 0 &&
+			!newLines.some(line => TERMINAL.isImageLine(line)) &&
 			this.#scrollbackResumeViewportTop === undefined &&
 			previousSuffixLineCount > 0 &&
 			previousSuffixLineCount === nextSuffixLineCount &&
 			nextSuffixLineCount < height &&
 			previousLogicalFrame.length === previousTranscriptLineCount + previousSuffixLineCount &&
-			nextTranscriptLineCount > previousTranscriptLineCount &&
-			(firstChanged === previousTranscriptLineCount || fixedSuffixTailRewrite) &&
-			newLines
-				.slice(0, fixedSuffixTailRewrite ? previousTranscriptLineCount - 1 : previousTranscriptLineCount)
-				.every((line, index) => line === previousLogicalFrame[index]);
+			nextTranscriptLineCount > previousTranscriptLineCount;
 		const fixedSuffixRasterLease =
 			fixedSuffixScrollRegionToken === undefined
 				? undefined
@@ -5026,10 +5024,22 @@ export class TUI extends Container {
 					? Math.min(suffixRegionBottom, fixedSuffixRasterLease.token.rect.row)
 					: suffixRegionBottom;
 			let fixedSuffixBuffer = `\x1b[?2026h\x1b7\x1b[?6l\x1b[1;${regionBottom}r\x1b[${regionBottom};1H`;
-			if (fixedSuffixTailRewrite)
-				fixedSuffixBuffer += `\r\x1b[2K${this.#padLineToWidth(newLines[previousTranscriptLineCount - 1]!, width)}`;
-			for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
-				fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
+			const fixedSuffixFullRepaint = !fixedSuffixAppendOnly;
+			if (fixedSuffixFullRepaint) {
+				const scrollCount = nextTranscriptLineCount - previousTranscriptLineCount;
+				for (let scrollIndex = 0; scrollIndex < scrollCount; scrollIndex += 1)
+					fixedSuffixBuffer += `\x1b[${regionBottom};1H\x1bD`;
+				const visibleTranscriptStart = Math.max(0, nextTranscriptLineCount - regionBottom);
+				for (let row = 0; row < regionBottom; row += 1) {
+					const line = newLines[visibleTranscriptStart + row] ?? "";
+					fixedSuffixBuffer += `\x1b[${row + 1};1H\x1b[2K${this.#padLineToWidth(line, width)}`;
+				}
+			} else {
+				if (fixedSuffixTailRewrite)
+					fixedSuffixBuffer += `\r\x1b[2K${this.#padLineToWidth(newLines[previousTranscriptLineCount - 1]!, width)}`;
+				for (let lineIndex = previousTranscriptLineCount; lineIndex < nextTranscriptLineCount; lineIndex += 1) {
+					fixedSuffixBuffer += `\x1bD\r\x1b[2K${this.#padLineToWidth(newLines[lineIndex]!, width)}`;
+				}
 			}
 			fixedSuffixBuffer += "\x1b[r\x1b[?6l";
 			const preserveFixedSuffixRaster =
@@ -5080,7 +5090,9 @@ export class TUI extends Container {
 			this.#recordDurableLines(
 				newLines,
 				rawLines,
-				previousTranscriptLineCount - (fixedSuffixTailRewrite ? 1 : 0),
+				fixedSuffixFullRepaint
+					? Math.max(0, nextTranscriptLineCount - regionBottom)
+					: previousTranscriptLineCount - (fixedSuffixTailRewrite ? 1 : 0),
 				newLines.length - 1,
 			);
 			this.#nativeScrollbackAdmissionPending = false;
