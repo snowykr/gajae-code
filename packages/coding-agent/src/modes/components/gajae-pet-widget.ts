@@ -700,6 +700,7 @@ export class GajaePetWidget {
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
 			timeline: frames,
+			disposal: animationPhase === "working" ? "restore-previous" : "restore-background",
 			targetRows: PET_ART_ROWS,
 			rectangle: { width: rect.width * cell.widthPx, height: rect.height * cell.heightPx },
 			// Reserve a three-cell canvas but keep the two-cell sprite vertically centered:

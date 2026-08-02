@@ -1485,6 +1485,7 @@ describe("GajaePetWidget", () => {
 			const expectedGif = getGajaePetGifCached({
 				skin: "red",
 				timeline: [...workingTimeline(), { name: "base", delayMs: 700 }],
+				disposal: "restore-previous",
 				targetRows: 2,
 				rectangle: { width: request.rect.width * cell.widthPx, height: request.rect.height * cell.heightPx },
 				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },

@@ -205,6 +205,21 @@ describe("GIF artifacts and helpers", () => {
 		expect(red.multipart.slice(1, -1).every(record => record.length <= 220)).toBe(true);
 		expect(red.tmuxDcs.every(record => Buffer.byteLength(record, "utf8") <= 256)).toBe(true);
 	});
+	it("uses restore-previous disposal for transparent animated frame compatibility", () => {
+		const artifact = encodeGajaePetGif({
+			timeline: [
+				{ name: "danceL", delayMs: 300 },
+				{ name: "danceR", delayMs: 300 },
+			],
+			disposal: "restore-previous",
+		});
+		const graphicsControlPacked = Array.from(artifact.bytes).flatMap((value, index) =>
+			value === 0x21 && artifact.bytes[index + 1] === 0xf9 && artifact.bytes[index + 2] === 0x04
+				? [artifact.bytes[index + 3]!]
+				: [],
+		);
+		expect(graphicsControlPacked).toEqual([0x0d, 0x0d]);
+	});
 
 	it("supports rectangle geometry and all public timeline helpers", () => {
 		const rectangle = encodeGajaePetGif({ rectangle: { width: 7, height: 5 }, timeline: idleTimeline() });
