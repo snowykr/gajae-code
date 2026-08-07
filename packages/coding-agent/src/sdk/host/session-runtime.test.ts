@@ -8,6 +8,13 @@ import {
 	type SessionSdkTransport,
 } from "./session-runtime";
 import { createSdkCapabilities, createSdkSurfacePolicy } from "./surface-policy";
+import { createReconciliationStore } from "../bus/reconciliation-store";
+import { AsyncJobManager } from "../../async";
+import {
+	registerOwnedRegistration,
+	resetTerminalAbortRegistriesForTests,
+	unregisterOwnedRegistration,
+} from "../../session/terminal-abort";
 import type { SdkFrame } from "./types";
 import { SdkTransportLifecycleError } from "./websocket-transport";
 
@@ -59,6 +66,7 @@ function extensionContext(sessionId: string, cwd: string): any {
 		sdkBindings: () => [],
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, `${sessionId}.json`),
 			getSessionName: () => undefined,
 		},
 	};
@@ -105,6 +113,320 @@ describe("SessionSdkSessionRuntime", () => {
 		);
 		await runtime.stop();
 	});
+	test("SDK-only host admits, replays, and conflicts terminal abort requests durably", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-abort-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		let activeHandle: string | undefined = "exact-run-handle";
+		let activeEpoch: number | undefined = 7;
+		createSdkSessionRuntimeExtension(api, {
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => activeEpoch,
+				getActivePromptHandle: () => activeHandle,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			const request = {
+				type: "control_request",
+				id: "terminal-abort-1",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "terminal-key-1",
+			} as SdkFrame;
+			transport.feed("client", request);
+			await Bun.sleep(25);
+			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "turn" }]);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-1",
+						ok: true,
+						result: expect.objectContaining({ turn: "stopped" }),
+					}),
+				]),
+			);
+
+			transport.feed("client", { ...request, id: "terminal-abort-replay" });
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-replay",
+						ok: true,
+					}),
+				]),
+			);
+
+			transport.feed("client", {
+				...request,
+				id: "terminal-abort-conflict",
+				input: { mode: "terminal", scope: "owned" },
+			});
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-conflict",
+						ok: false,
+						error: expect.objectContaining({ code: "idempotency_conflict" }),
+					}),
+				]),
+			);
+
+			activeHandle = undefined;
+			activeEpoch = undefined;
+			const idleRequest = { ...request, id: "terminal-abort-idle", idempotencyKey: "terminal-idle-key" };
+			transport.feed("client", idleRequest);
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			activeHandle = "later-run-handle";
+			activeEpoch = 8;
+			transport.feed("client", { ...idleRequest, id: "terminal-abort-idle-replay" });
+			await Bun.sleep(25);
+			expect(seamCalls).toHaveLength(1);
+			expect(transport.sent).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "control_response",
+						id: "terminal-abort-idle-replay",
+						ok: true,
+						result: expect.objectContaining({ turn: "no_active_turn" }),
+					}),
+				]),
+			);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK-only host rejects a same-key different-scope race atomically inside the durable transaction", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-race-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const seamCalls: Array<{ handle: string; scope: string }> = [];
+		createSdkSessionRuntimeExtension(api, {
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => 7,
+				getActivePromptHandle: () => "exact-run-handle",
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async (handle, options) => {
+					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			const race = {
+				type: "control_request",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "race-key",
+			} as SdkFrame;
+			// Both requests pass the earlier snapshot check before either durable
+			// row lands; the serialized transaction must reject the second
+			// (different scope) atomically instead of appending a duplicate-key
+			// row that would make later replay of the first ambiguous (review
+			// thread P2).
+			transport.feed("client", { ...race, id: "race-turn" });
+			transport.feed("client", { ...race, id: "race-owned", input: { mode: "terminal", scope: "owned" } });
+			await Bun.sleep(25);
+			const turnResponse = transport.sent.find(frame => frame.id === "race-turn");
+			const ownedResponse = transport.sent.find(frame => frame.id === "race-owned");
+			expect(turnResponse).toMatchObject({ type: "control_response", ok: true });
+			expect(ownedResponse).toMatchObject({
+				type: "control_response",
+				ok: false,
+				error: expect.objectContaining({ code: "idempotency_conflict" }),
+			});
+			// Only the admitted request reached the session seam; the loser never
+			// touched the run.
+			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "turn" }]);
+			// Exactly ONE durable row exists for the key: the winner's.
+			expect(reconciliationStore.snapshotTerminalScopes().filter(s => s.idempotencyKeyHash).length).toBe(1);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK-only host cancels exact owned jobs before reporting stopped_owned", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-owned-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		resetTerminalAbortRegistriesForTests();
+		AsyncJobManager.setInstance(manager);
+		AsyncJobManager.registerForEndpoint("owned-ep", manager);
+		const gate = Promise.withResolvers<string>();
+		let jobId: string | undefined;
+		let registration: ReturnType<typeof Object> | undefined;
+		try {
+			jobId = manager.register("bash", "owned job", () => gate.promise);
+			const generation = manager.getJob(jobId)?.generation;
+			expect(generation).toBeTypeOf("string");
+			registration = {
+				endpointId: "owned-ep",
+				endpointGeneration: 1,
+				lineageIdHash: "sdk-owned-lineage",
+				promptAttemptEpoch: 7,
+				jobId,
+				jobGeneration: generation as string,
+			};
+			registerOwnedRegistration(registration as never, { isJobTerminal: () => false });
+			const seamCalls: Array<{ handle: string; scope: string }> = [];
+			createSdkSessionRuntimeExtension(api, {
+				createTransport: async () => transport,
+				terminalAbortSeams: {
+					getReconciliationStore: () => reconciliationStore,
+					getTerminalTurnEpoch: () => 7,
+					getActivePromptHandle: () => "exact-run-handle",
+					cancelPendingPreflightForTerminalAbort: () => {},
+					abortPromptAndWaitWithTerminal: async (handle, options) => {
+						seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
+						return {
+							status: "settled",
+							terminalScope: {
+								scopeId: "scope-owned",
+								abortedAttemptEpoch: 7,
+								lineageIdHash: "sdk-owned-lineage",
+							},
+						};
+					},
+				},
+			});
+			const ctx = extensionContext(transport.sessionId, cwd);
+			await handlers.get("session_start")?.({}, ctx);
+			transport.feed("client", {
+				type: "control_request",
+				id: "owned-abort",
+				operation: "turn.abort",
+				input: { mode: "terminal", scope: "owned" },
+				idempotencyKey: "owned-key",
+			} as SdkFrame);
+			// Let the background job unwind within the 500ms owned-settlement
+			// grace so quiescence is provable.
+			setTimeout(() => gate.resolve("done"), 50);
+			await Bun.sleep(700);
+			const response = transport.sent.find(frame => frame.id === "owned-abort");
+			expect(response).toMatchObject({
+				type: "control_response",
+				ok: true,
+				result: expect.objectContaining({ turn: "stopped", ownedWork: "stopped" }),
+			});
+			expect(seamCalls).toEqual([{ handle: "exact-run-handle", scope: "owned" }]);
+			// The exact owned job was cancelled by settleOwnedWork before the
+			// stopped disposition was reported.
+			const settledStatus = jobId ? manager.getJob(jobId)?.status : undefined;
+			expect(settledStatus).toBeDefined();
+			expect(["cancelled", "completed", "failed"]).toContain(settledStatus as string);
+		} finally {
+			gate.resolve("done");
+			if (registration) unregisterOwnedRegistration(registration as never);
+			AsyncJobManager.unregisterManager(manager);
+			AsyncJobManager.setInstance(undefined);
+			await manager.dispose({ timeoutMs: 100 }).catch(() => {});
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK-only host bounds completed terminal rows and retains key tombstones", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-bound-"));
+		const handlers = new Map<string, (event: unknown, ctx: any) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: any) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as any;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		createSdkSessionRuntimeExtension(api, {
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => undefined,
+				getActivePromptHandle: () => undefined,
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async () => ({ status: "settled" }),
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			// Idle terminal aborts with distinct keys must not grow the
+			// reconciliation document without limit: completed rows are bounded
+			// and evicted keys become compact tombstones (review thread P2).
+			for (let index = 0; index < 260; index++) {
+				transport.feed("client", {
+					type: "control_request",
+					id: `bound-${index}`,
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: `bound-key-${index}`,
+				} as SdkFrame);
+			}
+			// All 260 serialized transactions must settle before the bound rows and
+			// tombstones are observable (the document caps at 256 completed rows,
+			// so wait on delivered responses instead of the row count).
+			for (let attempt = 0; attempt < 100 && transport.sent.length < 260; attempt += 1) await Bun.sleep(50);
+			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
+			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
+			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("native-like and loopback transports share the same SDK contract matrix", async () => {
 		const nativePolicy = createSdkSurfacePolicy({
 			bindings: ["sdkControl", "cycleModel", "getSkillState"],

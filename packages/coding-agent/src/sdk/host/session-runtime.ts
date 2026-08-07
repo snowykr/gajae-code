@@ -1,14 +1,22 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { logger } from "@gajae-code/utils";
+import { AsyncJobManager } from "../../async";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import {
+	boundCompletedTerminalScopeRows,
+	collectEvictedTerminalKeys,
+	findOwnedRegistrationsForTurn,
+	isOwnedAttemptRegistrationIncomplete,
+	settleOwnedWork,
+} from "../../session/terminal-abort";
 import { type ControlSurface, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
@@ -23,6 +31,29 @@ import {
 import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
+const sdkControlRequesterContext = new AsyncLocalStorage<string>();
+
+/**
+ * Thrown from a serialized durable terminal-scope transaction when the
+ * idempotency key is already owned by a DIFFERENT input (scope). After the
+ * dispatch cache evicts an in-flight entry, two concurrent requests can both
+ * pass the earlier snapshot check; the atomic recheck inside the transaction
+ * must reject the second instead of appending a duplicate-key row (review
+ * thread P2).
+ */
+class SdkOnlyIdempotencyConflictError extends Error {
+	constructor() {
+		super("Idempotency key was reused with different input.");
+	}
+}
+
+/** Bounded completed-row retention for the SDK-only terminal reconciliation
+ *  document, mirroring the bus terminal-abort implementation (review thread
+ *  P2): no-active/idle aborts with unique keys and repeated active-turn
+ *  markers must not grow the document without limit. */
+const SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
+const SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
+
 class DiffQueryError extends Error {
 	constructor(
 		readonly code: "not_git_repository" | "diff_too_large",
@@ -37,7 +68,10 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
-	sendFrame(connectionId: string, frame: SdkFrame): void | Promise<void>;
+	sendFrame(
+		connectionId: string,
+		frame: SdkFrame,
+	): void | "written" | "dropped" | Promise<void> | Promise<"written" | "dropped">;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;
@@ -52,6 +86,75 @@ export interface SessionSdkTransport {
 export interface SessionSdkRuntimeOptions
 	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
 	transport: SessionSdkTransport;
+}
+
+export interface SdkOnlyInvocationRecord extends InvocationCorrelation {
+	kind: InvocationKind | "terminal";
+	clientRef?: string;
+	status: InvocationStatus;
+	acceptedAt: number;
+	startedAt?: number;
+	terminalAt?: number;
+	error?: { code: string; message: string };
+	outcome?: unknown;
+	pendingOutcome?: unknown;
+	skillName?: string;
+}
+
+export interface SdkOnlyTerminalScopeRecord {
+	selection: "turn" | "owned";
+	idempotencyKeyHash?: string;
+	idempotencyInputHash?: string;
+	turnDisposition: "pending" | "stopped" | "uncertain" | "no_effect";
+	terminalPublished?: boolean;
+	ownedWorkDisposition: "not_requested" | "left_running" | "stopped" | "uncertain";
+	automaticDeliveryDisposition: "enabled" | "none";
+	resumeOnOwnedCompletion: boolean;
+	turnContinuationFence: {
+		state: "retained" | "released";
+		abortedAttemptEpoch: number;
+		blockedContinuationIds: string[];
+		predecessorTombstones: string[];
+		ownedCompletionPolicy: "enabled" | "disabled";
+	};
+	responseState: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash: string;
+	acceptedAt: number;
+	terminalAt?: number;
+}
+
+export interface SdkOnlyEvictedTerminalKeyEntry {
+	keyHash: string;
+	inputHash: string;
+	turnDisposition?: "stopped" | "uncertain" | "no_effect";
+	ownedWorkDisposition?: "not_requested" | "left_running" | "stopped" | "uncertain";
+	responseState?: "pending" | "sent" | "delivered" | "failed";
+	responsePayloadHash?: string;
+	terminalPublished?: boolean;
+}
+
+export interface SdkOnlyReconciliationStore {
+	readonly path: string | null;
+	load(): Promise<unknown[]>;
+	transact(mutator: (records: SdkOnlyInvocationRecord[]) => SdkOnlyInvocationRecord[]): Promise<void>;
+	snapshotTerminalScopes(): SdkOnlyTerminalScopeRecord[];
+	snapshotTerminalKeys(): SdkOnlyEvictedTerminalKeyEntry[];
+	transactTerminalScopes(mutator: (scopes: SdkOnlyTerminalScopeRecord[]) => SdkOnlyTerminalScopeRecord[]): Promise<void>;
+	transactTerminalState(mutator: (state: {
+		scopes: SdkOnlyTerminalScopeRecord[];
+		keys: SdkOnlyEvictedTerminalKeyEntry[];
+	}) => { scopes: SdkOnlyTerminalScopeRecord[]; keys: SdkOnlyEvictedTerminalKeyEntry[] }): Promise<void>;
+}
+
+export interface SdkOnlyTerminalAbortSeams {
+	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
+	getTerminalTurnEpoch: () => number | undefined;
+	getActivePromptHandle: () => string | undefined;
+	cancelPendingPreflightForTerminalAbort: () => void;
+	abortPromptAndWaitWithTerminal: (
+		handle: string,
+		options: { graceMs: number; terminal?: { scope: "turn" | "owned" } },
+	) => Promise<{ status: string; terminalScope?: unknown }>;
 }
 
 /**
@@ -80,7 +183,11 @@ export class SessionSdkSessionRuntime {
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
-			sendFrame: options.transport.sendFrame,
+			sendFrame: (connectionId, frame) => {
+				const result = options.transport.sendFrame(connectionId, frame);
+				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
+				return result ?? "written";
+			},
 			onFrame: options.transport.onFrame,
 		});
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
@@ -204,6 +311,8 @@ export interface CreateSdkSessionRuntimeOptions {
 		token: string;
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
+	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
+	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 }
 
 function unavailable(operation: string): () => never {
@@ -231,6 +340,8 @@ interface InvocationRecord extends InvocationCorrelation {
 	error?: { code: string; message: string };
 }
 export interface InvocationReconciliation {
+	/** Shared v2 reconciliation owner; present for durable terminal admission. */
+	readonly store?: SdkOnlyReconciliationStore;
 	admit(kind: InvocationKind, clientRef?: string): void;
 	release(kind: InvocationKind, clientRef?: string): void;
 	noteAccepted(kind: InvocationKind, correlation: InvocationCorrelation, clientRef?: string): Promise<void>;
@@ -244,7 +355,7 @@ export interface InvocationReconciliation {
 }
 
 function createInvocationReconciliation(
-	options: { stateRoot?: string; sessionId?: string } = {},
+	options: { stateRoot?: string; sessionId?: string; store?: SdkOnlyReconciliationStore } = {},
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
 	const TERMINAL_CAPACITY = 512;
@@ -260,31 +371,10 @@ function createInvocationReconciliation(
 	const ref = (kind: InvocationKind, clientRef: string) => `${kind}\\0${clientRef}`;
 	if (options.sessionId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(options.sessionId))
 		throw Object.assign(new Error("Unsafe SDK reconciliation session id."), { code: "invalid_input" });
-	const reconciliationFile =
-		options.stateRoot && options.sessionId
-			? path.join(options.stateRoot, ".sdk-reconciliation", `${options.sessionId}.json`)
-			: undefined;
-	let persistenceChain: Promise<void> = Promise.resolve();
+	const store = options.store;
 	const persist = async (): Promise<void> => {
-		if (!reconciliationFile) return;
-		const run = async (): Promise<void> => {
-			const directory = path.dirname(reconciliationFile);
-			const temporary = `${reconciliationFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
-			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-			await fs.writeFile(
-				temporary,
-				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...records.values()] }),
-				{ encoding: "utf8", mode: 0o600 },
-			);
-			await fs.chmod(temporary, 0o600);
-			await fs.rename(temporary, reconciliationFile);
-		};
-		const pending = persistenceChain.then(run, run);
-		persistenceChain = pending.then(
-			() => undefined,
-			() => undefined,
-		);
-		await pending;
+		if (!store) return;
+		await store.transact(() => [...records.values()]);
 	};
 	const cleanup = (): void => {
 		const now = Date.now();
@@ -310,41 +400,18 @@ function createInvocationReconciliation(
 		return records.get(key(kind, { commandId: selector.commandId, turnId: selector.turnId }));
 	};
 	const hydrate = async (): Promise<void> => {
-		if (!reconciliationFile) return;
-		let raw: string;
-		try {
-			raw = await fs.readFile(reconciliationFile, "utf8");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-			throw error;
-		}
-		const parsed = JSON.parse(raw) as { version?: unknown; sessionId?: unknown; records?: unknown };
-		if (parsed.version !== 1 || parsed.sessionId !== options.sessionId || !Array.isArray(parsed.records))
-			throw new Error("Invalid SDK reconciliation store.");
-		for (const candidate of parsed.records) {
-			if (!candidate || typeof candidate !== "object") continue;
-			const record = candidate as InvocationRecord;
-			if (
-				(record.kind === "prompt" || record.kind === "skill") &&
-				typeof record.commandId === "string" &&
-				typeof record.turnId === "string" &&
-				typeof record.acceptedAt === "number" &&
-				(record.status === "accepted" ||
-					record.status === "in_flight" ||
-					record.status === "terminal_ok" ||
-					record.status === "failed")
-			) {
-				if (record.terminalAt === undefined && (record.status === "accepted" || record.status === "in_flight")) {
-					record.status = "failed";
-					record.terminalAt = Date.now();
-					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
-				}
-				records.set(key(record.kind, record), { ...record });
-			}
+		if (!store) return;
+		const loaded = (await store.load()) as SdkOnlyInvocationRecord[];
+		for (const candidate of loaded) {
+			if (candidate.kind !== "prompt" && candidate.kind !== "skill") continue;
+			if (!candidate.commandId || !candidate.turnId || typeof candidate.acceptedAt !== "number") continue;
+			const kind = candidate.kind as InvocationKind;
+			records.set(key(kind, candidate), { ...candidate, kind });
 		}
 		cleanup();
 	};
 	return {
+		store,
 		admit(kind, clientRef) {
 			cleanup();
 			const active = [...records.values()].filter(
@@ -636,6 +703,7 @@ function createControlSurface(
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	policy?: SdkSurfacePolicy,
+	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -651,6 +719,16 @@ function createControlSurface(
 		return model;
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
+	const pendingPreflights = new Map<string, Set<() => void>>();
+	const currentRequesterPreflights = (): Set<() => void> => {
+		const key = sdkControlRequesterContext.getStore() ?? "";
+		let pending = pendingPreflights.get(key);
+		if (!pending) {
+			pending = new Set();
+			pendingPreflights.set(key, pending);
+		}
+		return pending;
+	};
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
 		if (clientRef === undefined) return undefined;
 		const trimmed = clientRef.trim();
@@ -676,6 +754,15 @@ function createControlSurface(
 		const preflight = Promise.withResolvers<void>();
 		let accepted = false;
 		let settled = false;
+		const cancelPreflight = () => {
+			if (settled) return;
+			settled = true;
+			preflight.reject(
+				Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
+			);
+		};
+		const requesterPreflights = currentRequesterPreflights();
+		requesterPreflights.add(cancelPreflight);
 		const accept = async (): Promise<void> => {
 			if (settled) return;
 			try {
@@ -734,7 +821,414 @@ function createControlSurface(
 		} catch (error) {
 			if (!accepted) reconciliation.release(kind, retainedClientRef);
 			throw error;
+		} finally {
+			requesterPreflights.delete(cancelPreflight);
+			if (requesterPreflights.size === 0) pendingPreflights.delete(sdkControlRequesterContext.getStore() ?? "");
 		}
+	};
+	const terminalAbort = async (
+		input: { mode: "terminal"; scope?: "turn" | "owned" },
+		idempotencyKey?: string,
+	): Promise<unknown> => {
+		const scope = input.scope === "owned" ? "owned" : "turn";
+		const store = reconciliation.store;
+		if (!store?.path || !terminalAbortSeams) {
+			return {
+				ok: true,
+				selection: scope,
+				turn: "no_store",
+				terminal: "terminal_no_effect",
+			};
+		}
+		const keyHash =
+			typeof idempotencyKey === "string"
+				? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
+				: undefined;
+		const inputHash = crypto
+			.createHash("sha256")
+			.update(JSON.stringify({ mode: "terminal", scope }))
+			.digest("hex");
+		const stored = (record: SdkOnlyTerminalScopeRecord | SdkOnlyEvictedTerminalKeyEntry) => ({
+			responseState: record.responseState ?? "pending",
+			responsePayloadHash: record.responsePayloadHash ?? inputHash,
+			terminalPublished: record.terminalPublished === true,
+		});
+		const replay = (): unknown => {
+			const scopes = store.snapshotTerminalScopes();
+			const existing = keyHash
+				? scopes.find(record => record.idempotencyKeyHash === keyHash)
+				: undefined;
+			if (existing) {
+				if (existing.idempotencyInputHash !== inputHash)
+					throw Object.assign(new Error("Idempotency key was reused with different input."), {
+						code: "idempotency_conflict",
+					});
+				const persisted = stored(existing);
+				if (existing.turnDisposition === "stopped")
+					return {
+						ok: true,
+						selection: scope,
+						turn: "stopped",
+						...(scope === "owned"
+							? {
+									ownedWork: existing.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+									automaticDelivery: "none",
+									resumeOnOwnedCompletion: false,
+								}
+							: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+						replay: persisted,
+					};
+				if (existing.turnDisposition === "no_effect")
+					return {
+						ok: true,
+						selection: scope,
+						turn: "no_active_turn",
+						terminal: "terminal_no_effect",
+						replay: persisted,
+					};
+				return {
+						ok: true,
+						selection: scope,
+						turn: "uncertain",
+						ownedWork: scope === "turn" ? "left_running" : "uncertain",
+						automaticDelivery: scope === "turn" ? "enabled" : "none",
+						resumeOnOwnedCompletion: scope === "turn",
+						reason: existing.turnDisposition === "pending" ? "replay_pending" : "replay_uncertain",
+						replay: persisted,
+					};
+			}
+			if (keyHash) {
+				const tombstone = store.snapshotTerminalKeys().find(record => record.keyHash === keyHash);
+				if (tombstone) {
+					if (tombstone.inputHash !== inputHash)
+						throw Object.assign(new Error("Idempotency key was reused with different input."), {
+							code: "idempotency_conflict",
+						});
+					return tombstone.turnDisposition === "stopped"
+						? {
+								ok: true,
+								selection: scope,
+								turn: "stopped",
+								...(scope === "owned"
+									? {
+											ownedWork: tombstone.ownedWorkDisposition === "stopped" ? "stopped" : "uncertain",
+											automaticDelivery: "none",
+											resumeOnOwnedCompletion: false,
+										}
+									: { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }),
+								replay: stored(tombstone),
+							}
+						: {
+									ok: true,
+									selection: scope,
+									turn: "uncertain",
+									ownedWork: scope === "turn" ? "left_running" : "uncertain",
+									automaticDelivery: scope === "turn" ? "enabled" : "none",
+									resumeOnOwnedCompletion: scope === "turn",
+									replay: stored(tombstone),
+								};
+				}
+			}
+			return undefined;
+		};
+		const prior = replay();
+		if (prior !== undefined) return prior;
+		const writeNoEffect = async (): Promise<"ok" | "conflict"> => {
+			try {
+				await store.transactTerminalState(state => {
+					// Atomic recheck: a concurrent request may have committed a
+					// DIFFERENT input under this key after the earlier snapshot
+					// check; appending a second same-key row would make later
+					// replay's .find() by key hash ambiguous (review thread P2).
+					const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
+					if (conflicting && conflicting.idempotencyInputHash !== inputHash)
+						throw new SdkOnlyIdempotencyConflictError();
+					const preBound: SdkOnlyTerminalScopeRecord[] = [
+						...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
+						{
+							selection: scope,
+							...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
+							turnDisposition: "no_effect",
+							ownedWorkDisposition: "not_requested",
+							automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+							resumeOnOwnedCompletion: scope === "turn",
+							turnContinuationFence: {
+								state: "retained",
+								abortedAttemptEpoch: 0,
+								blockedContinuationIds: [],
+								predecessorTombstones: [],
+								ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+							},
+							responseState: "pending",
+							responsePayloadHash: inputHash,
+							acceptedAt: Date.now(),
+						},
+					];
+					const bounded = boundCompletedTerminalScopeRows(
+						preBound,
+						SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS,
+					);
+					const evicted = collectEvictedTerminalKeys(preBound, bounded);
+					const combined = [...state.keys, ...evicted];
+					if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
+						throw new Error("terminal key tombstone capacity reached");
+					}
+					return { scopes: bounded, keys: combined };
+				});
+				return "ok";
+			} catch (error) {
+				if (error instanceof SdkOnlyIdempotencyConflictError) return "conflict";
+				throw error;
+			}
+		};
+		const handle = terminalAbortSeams.getActivePromptHandle();
+		const epoch = terminalAbortSeams.getTerminalTurnEpoch();
+		const requesterPreflights = currentRequesterPreflights();
+		const cancelRequesterPreflights = () => {
+			if (requesterPreflights.size === 0) return;
+			for (const cancel of [...requesterPreflights]) cancel();
+			terminalAbortSeams.cancelPendingPreflightForTerminalAbort();
+		};
+		if (!handle || epoch === undefined) {
+			if ((await writeNoEffect()) === "conflict") {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
+			cancelRequesterPreflights();
+			return {
+				ok: true,
+				selection: scope,
+				turn: "no_active_turn",
+				terminal: "terminal_no_effect",
+			};
+		}
+		let pendingReplay: SdkOnlyTerminalScopeRecord | undefined;
+		try {
+			await store.transactTerminalState(state => {
+				// Atomic recheck (same rationale as writeNoEffect): never wipe a
+				// row a concurrent request committed under this key (review thread
+				// P2). A same-input PENDING row is an in-flight duplicate admitted
+				// past the snapshot (dispatch-cache eviction): replay it instead of
+				// replacing the marker, so the duplicate cannot race terminalization
+				// and flip the row to uncertain while the original returns stopped
+				// (or execute the abort twice).
+				const conflicting = state.scopes.find(record => keyHash && record.idempotencyKeyHash === keyHash);
+				if (conflicting) {
+					if (conflicting.idempotencyInputHash !== inputHash)
+						throw new SdkOnlyIdempotencyConflictError();
+					if (conflicting.turnDisposition === "pending") {
+						pendingReplay = conflicting;
+						return { scopes: state.scopes, keys: state.keys };
+					}
+				}
+				const preBound: SdkOnlyTerminalScopeRecord[] = [
+					...state.scopes.filter(record => !(keyHash && record.idempotencyKeyHash === keyHash)),
+					{
+						selection: scope,
+						...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
+						turnDisposition: "pending",
+						terminalPublished: false,
+						ownedWorkDisposition: "not_requested",
+						automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
+						resumeOnOwnedCompletion: scope === "turn",
+						turnContinuationFence: {
+							state: "retained",
+							abortedAttemptEpoch: epoch,
+							blockedContinuationIds: [],
+							predecessorTombstones: [],
+							ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
+						},
+						responseState: "pending",
+						responsePayloadHash: inputHash,
+						acceptedAt: Date.now(),
+					},
+				];
+				const bounded = boundCompletedTerminalScopeRows(
+					preBound,
+					SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS,
+				);
+				const evicted = collectEvictedTerminalKeys(preBound, bounded);
+				const combined = [...state.keys, ...evicted];
+				if (combined.length > SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES) {
+					throw new Error("terminal key tombstone capacity reached");
+				}
+				return { scopes: bounded, keys: combined };
+			});
+		} catch (error) {
+			if (error instanceof SdkOnlyIdempotencyConflictError) {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
+			if ((await writeNoEffect()) === "conflict") {
+				throw Object.assign(new Error("Idempotency key was reused with different input."), {
+					code: "idempotency_conflict",
+				});
+			}
+			return {
+				ok: true,
+				selection: scope,
+				turn: "no_effect",
+				terminal: "terminal_no_effect",
+			};
+		}
+		if (pendingReplay) {
+			// An in-flight duplicate of this exact key+input was already admitted;
+			// replay its pending row WITHOUT touching the seam, so the duplicate
+			// cannot abort the run a second time or race the terminalization.
+			return {
+				ok: true,
+				selection: scope,
+				turn: "uncertain",
+				ownedWork: scope === "turn" ? "left_running" : "uncertain",
+				automaticDelivery: scope === "turn" ? "enabled" : "none",
+				resumeOnOwnedCompletion: scope === "turn",
+				reason: "replay_pending",
+				replay: {
+					responseState: pendingReplay.responseState,
+					responsePayloadHash: pendingReplay.responsePayloadHash,
+					terminalPublished: pendingReplay.terminalPublished === true,
+				},
+			};
+		}
+		// A new prompt won the race while the marker was being persisted. Never
+		// apply this request to that later handle; replay remains a safe uncertainty.
+		if (
+			terminalAbortSeams.getActivePromptHandle() !== handle ||
+			terminalAbortSeams.getTerminalTurnEpoch() !== epoch
+		) {
+			await store.transactTerminalScopes(scopes =>
+				scopes.map(record =>
+					(keyHash ? record.idempotencyKeyHash === keyHash : record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+					record.turnDisposition === "pending"
+						? { ...record, turnDisposition: "uncertain", terminalAt: Date.now() }
+						: record,
+				),
+			);
+			return {
+				ok: true,
+				selection: scope,
+				turn: "uncertain",
+				ownedWork: scope === "turn" ? "left_running" : "uncertain",
+				automaticDelivery: scope === "turn" ? "enabled" : "none",
+				resumeOnOwnedCompletion: scope === "turn",
+				reason: "active_turn_changed",
+			};
+		}
+		cancelRequesterPreflights();
+		let proof: { status: string; terminalScope?: unknown };
+		try {
+			proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(handle, {
+				graceMs: 10_000,
+				terminal: { scope },
+			});
+		} catch {
+			proof = { status: "unfenced" };
+		}
+		if (proof.status !== "settled" || proof.terminalScope === undefined) {
+			await store.transactTerminalScopes(scopes =>
+				scopes.map(record =>
+					(keyHash ? record.idempotencyKeyHash === keyHash : record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+					record.turnDisposition === "pending"
+						? { ...record, turnDisposition: "uncertain", ownedWorkDisposition: "uncertain", terminalAt: Date.now() }
+						: record,
+				),
+			);
+			return {
+				ok: true,
+				selection: scope,
+				turn: "uncertain",
+				ownedWork: scope === "turn" ? "left_running" : "uncertain",
+				automaticDelivery: scope === "turn" ? "enabled" : "none",
+				resumeOnOwnedCompletion: scope === "turn",
+				reason: "worker_unsettled",
+			};
+		}
+		// scope:"owned" must generation-verify and CANCEL the exact owned work
+		// before reporting it stopped: abortPromptAndWaitWithTerminal only aborts
+		// the foreground run and registers the disabled-delivery scope — a
+		// background Bash/task/detached subagent would otherwise keep running
+		// while the client receives stopped_owned (review thread P1).
+		let ownedStopped = true;
+		if (scope === "owned") {
+			const terminalScope = proof.terminalScope as
+				| { abortedAttemptEpoch?: number; lineageIdHash?: string }
+				| undefined;
+			const failOwnedUncertain = async (): Promise<unknown> => {
+				await store.transactTerminalScopes(scopes =>
+					scopes.map(record =>
+						(keyHash ? record.idempotencyKeyHash === keyHash : record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+						record.turnDisposition === "pending"
+							? { ...record, turnDisposition: "uncertain", ownedWorkDisposition: "uncertain", terminalAt: Date.now() }
+							: record,
+					),
+				);
+				return {
+					ok: true,
+					selection: scope,
+					turn: "uncertain",
+					ownedWork: "uncertain",
+					automaticDelivery: "none",
+					resumeOnOwnedCompletion: false,
+					reason: "owned_unsettled",
+				};
+			};
+			if (
+				!terminalScope ||
+				terminalScope.abortedAttemptEpoch === undefined ||
+				!terminalScope.lineageIdHash ||
+				isOwnedAttemptRegistrationIncomplete(
+					terminalScope.lineageIdHash,
+					terminalScope.abortedAttemptEpoch,
+				)
+			) {
+				// The attempt's registration set may be KNOWN incomplete (registry
+				// saturation or an evicted in-flight binding): never claim
+				// stopped_owned over an incomplete causal set.
+				return await failOwnedUncertain();
+			}
+			const exactJobs = findOwnedRegistrationsForTurn(
+				terminalScope.lineageIdHash,
+				terminalScope.abortedAttemptEpoch,
+			);
+			if (exactJobs.length > 0) {
+				// Resolve the manager from the ABORTING ENDPOINT captured on the
+				// registrations — never the process-global last-created session,
+				// which could cancel a foreign same-id job and report stopped_owned
+				// while the aborting session's job keeps running (review thread P1).
+				const endpointId = exactJobs[0]?.endpointId;
+				const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+				if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") {
+					return await failOwnedUncertain();
+				}
+			}
+		}
+		const result = {
+			ok: true,
+			selection: scope,
+			turn: "stopped",
+			...(scope === "turn"
+				? { ownedWork: "left_running", automaticDelivery: "enabled", resumeOnOwnedCompletion: true }
+				: { ownedWork: ownedStopped ? "stopped" : "uncertain", automaticDelivery: "none", resumeOnOwnedCompletion: false }),
+		};
+		const payloadHash = crypto.createHash("sha256").update(JSON.stringify(result)).digest("hex");
+		await store.transactTerminalScopes(scopes =>
+			scopes.map(record =>
+				(keyHash ? record.idempotencyKeyHash === keyHash : record.turnContinuationFence.abortedAttemptEpoch === epoch) &&
+					record.turnDisposition === "pending"
+					? {
+							...record,
+							turnDisposition: "stopped",
+							terminalPublished: true,
+							ownedWorkDisposition: scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain",
+							responsePayloadHash: payloadHash,
+							terminalAt: Date.now(),
+						}
+						: record,
+				),
+		);
+		return result;
 	};
 	return {
 		prompt: async (text, images, clientRef) =>
@@ -754,6 +1248,7 @@ function createControlSurface(
 			ctx.abort();
 			return { aborted: true };
 		},
+		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
 			ctx.abort();
 			return await submit("prompt", undefined, options => api.sendUserMessage(text, options));
@@ -932,7 +1427,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry(token, revisions);
-		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
+		const reconciliationStore = options.terminalAbortSeams?.getReconciliationStore?.();
+		const reconciliation = createInvocationReconciliation({ store: reconciliationStore });
 		await reconciliation.hydrate();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		const surfaceFactory = createSdkSurfaceFactory({
@@ -952,6 +1448,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				pending.push({ kind, correlation });
 			},
 			surfaceFactory.policy,
+			options.terminalAbortSeams,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
@@ -1049,6 +1546,38 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 			},
 			onRequest: options.onSdkRequest,
+			onControlResponseDelivery: async (_connectionId, request, _response, outcome) => {
+				if (
+					!reconciliationStore ||
+					request.operation !== "turn.abort" ||
+					!request.idempotencyKey ||
+					typeof request.input !== "object" ||
+					request.input === null ||
+					(request.input as { mode?: unknown }).mode !== "terminal"
+				)
+					return;
+				const input = request.input as { mode?: unknown; scope?: unknown };
+				if (input.scope !== undefined && input.scope !== "turn" && input.scope !== "owned") return;
+				const keyHash = crypto.createHash("sha256").update(String(request.idempotencyKey)).digest("hex");
+				const inputHash = crypto
+					.createHash("sha256")
+					.update(JSON.stringify({ mode: "terminal", scope: input.scope === "owned" ? "owned" : "turn" }))
+					.digest("hex");
+				await reconciliationStore.transactTerminalState(state => ({
+					scopes: state.scopes.map(record =>
+						record.idempotencyKeyHash === keyHash &&
+						record.idempotencyInputHash === inputHash &&
+						record.responseState === "pending"
+							? { ...record, responseState: outcome === "written" ? "sent" : "failed" }
+							: record,
+					),
+					keys: state.keys.map(record =>
+						record.keyHash === keyHash && record.inputHash === inputHash && record.responseState === "pending"
+							? { ...record, responseState: outcome === "written" ? "sent" : "failed" }
+							: record,
+					),
+				}));
+			},
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			afterControlResponse: async (_connectionId, request, response) => {
