@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
+import { isCompiledBinary } from "@gajae-code/utils/env";
 import { YAML } from "bun";
+import type { AtomicYamlNativeWorkerRequest, AtomicYamlNativeWorkerResponse } from "./atomic-yaml-patch-worker";
 import { withFileLock } from "./file-lock";
 
 export interface AtomicYamlExpectedPrecondition {
@@ -49,7 +52,8 @@ export interface AtomicYamlPatchRevision {
 export type CasRestoreResult =
 	| { status: "restored"; receipt: CasReceipt }
 	| { status: "conflict"; paths: readonly string[] }
-	| { status: "discarded" };
+	| { status: "discarded" }
+	| { status: "not-restorable" };
 
 /**
  * A receipt intentionally exposes only path-level hashes and opaque revisions.
@@ -70,6 +74,15 @@ export interface AtomicYamlUpdate<T> {
 export interface AtomicYamlPatchOptions {
 	/** Test seam for deterministic pre-rename and Windows sharing-violation failures. */
 	rename?: (from: string, to: string) => Promise<void>;
+	/** Test seam for an identity-checked atomic replacement. */
+	exactReplace?: (
+		sourcePath: string,
+		destinationPath: string,
+		expectedSource: NativeExactFileIdentity,
+		expectedDestination: NativeExactFileIdentity,
+	) => NativeExactUnlinkResult | Promise<NativeExactUnlinkResult>;
+	/** Test seam for an atomic no-replace publication. */
+	noReplace?: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult | Promise<NativeNoReplaceResult>;
 	/** Test seam for bounded retry timing. */
 	sleep?: (ms: number) => Promise<void>;
 	/** Test seam for Windows rename retry behavior. */
@@ -88,6 +101,7 @@ export class AtomicYamlReplaceError extends Error {
 		readonly configPath: string,
 		readonly attempts: number,
 		readonly cause: unknown,
+		readonly preserveTempPath = false,
 	) {
 		super(`Failed to atomically replace ${configPath} after ${attempts} rename attempts.`);
 		this.name = "AtomicYamlReplaceError";
@@ -211,19 +225,29 @@ export function atomicYamlPathHash(value: Record<string, unknown>, path: string)
 	return stateHash(stateAtPath(value, path.split(".")));
 }
 
-type YamlReadResult = {
+type YamlFileState = {
+	exists: boolean;
+	raw: string;
+};
+
+type YamlReadResult = YamlFileState & {
 	current: Record<string, unknown>;
 	root: unknown;
 };
 
-async function readYaml(configPath: string): Promise<YamlReadResult> {
+async function readYamlFileState(configPath: string): Promise<YamlFileState> {
 	try {
-		const root = YAML.parse(await fs.readFile(configPath, "utf8"));
-		return { current: record(root) ?? {}, root };
+		return { exists: true, raw: await Bun.file(configPath).text() };
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { current: {}, root: undefined };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false, raw: "" };
 		throw error;
 	}
+}
+
+async function readYaml(configPath: string): Promise<YamlReadResult> {
+	const file = await readYamlFileState(configPath);
+	const root = file.exists ? YAML.parse(file.raw) : undefined;
+	return { ...file, current: record(root) ?? {}, root };
 }
 
 async function syncParentDirectory(directory: string): Promise<void> {
@@ -240,12 +264,227 @@ async function syncParentDirectory(directory: string): Promise<void> {
 	}
 }
 
-async function replaceWithRetry(tempPath: string, configPath: string, options: AtomicYamlPatchOptions): Promise<void> {
+async function captureExactFileIdentity(file: string): Promise<NativeExactFileIdentity | null> {
+	try {
+		const [bytes, stat, parent] = await Promise.all([
+			Bun.file(file).arrayBuffer(),
+			fs.stat(file, { bigint: true }),
+			fs.stat(path.dirname(file), { bigint: true }),
+		]);
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(Buffer.from(bytes)).digest("hex"),
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+async function currentYamlFileState(configPath: string): Promise<YamlFileState> {
+	return await readYamlFileState(configPath);
+}
+
+async function runNativeAtomicYamlWorker(
+	request: AtomicYamlNativeWorkerRequest,
+): Promise<NativeExactUnlinkResult | NativeNoReplaceResult> {
+	const worker = isCompiledBinary()
+		? new Worker("./packages/coding-agent/src/config/atomic-yaml-patch-worker.ts", { type: "module" })
+		: new Worker(new URL("./atomic-yaml-patch-worker.ts", import.meta.url).href, { type: "module" });
+	const { promise, resolve, reject } = Promise.withResolvers<NativeExactUnlinkResult | NativeNoReplaceResult>();
+	let settled = false;
+	let cleanedUp = false;
+	const cleanup = (): void => {
+		if (cleanedUp) return;
+		cleanedUp = true;
+		worker.removeEventListener("message", onMessage);
+		worker.removeEventListener("error", onError);
+		worker.removeEventListener("messageerror", onMessageError);
+		worker.removeEventListener("close", onClose);
+		worker.removeEventListener("exit", onExit);
+	};
+	const succeed = (result: NativeExactUnlinkResult | NativeNoReplaceResult): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		resolve(result);
+	};
+	const fail = (error: Error): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		reject(error);
+	};
+	const onMessage: EventListener = event => {
+		const response = (event as MessageEvent<AtomicYamlNativeWorkerResponse>).data;
+		if (response?.type === "result") {
+			succeed(response.result);
+			return;
+		}
+		if (response?.type === "error") {
+			const failure = new Error(response.message);
+			if (response.name) failure.name = response.name;
+			if (response.stack) failure.stack = response.stack;
+			fail(failure);
+			return;
+		}
+		fail(new Error("Atomic YAML native worker returned an invalid response."));
+	};
+	const onError: EventListener = () => fail(new Error("Atomic YAML native worker failed."));
+	const onMessageError: EventListener = () => fail(new Error("Atomic YAML native worker message failed."));
+	// Bun emits `close`; Node-compatible worker hosts may emit `exit` instead.
+	const onClose: EventListener = () => fail(new Error("Atomic YAML native worker closed before responding."));
+	const onExit: EventListener = () => fail(new Error("Atomic YAML native worker exited before responding."));
+	try {
+		worker.addEventListener("message", onMessage);
+		worker.addEventListener("error", onError);
+		worker.addEventListener("messageerror", onMessageError);
+		worker.addEventListener("close", onClose);
+		worker.addEventListener("exit", onExit);
+		worker.postMessage(request);
+		return await promise;
+	} catch (error) {
+		// The native op was already dispatched; a termination without a response
+		// leaves the exchange outcome unknown (it may have committed), so the
+		// staged path must be retained for recovery instead of unlinked.
+		throw new AtomicYamlReplaceError(request.destinationPath, 1, error, true);
+	} finally {
+		cleanup();
+		worker.terminate();
+	}
+}
+
+async function replaceWithExpectedIdentity(
+	tempPath: string,
+	configPath: string,
+	expectedState: YamlFileState,
+	options: AtomicYamlPatchOptions,
+): Promise<void> {
+	const { exists: expectedExists, raw: expectedRaw } = expectedState;
+	const expectedHash = createHash("sha256").update(expectedRaw).digest("hex");
+	const [source, destination] = await Promise.all([
+		captureExactFileIdentity(tempPath),
+		captureExactFileIdentity(configPath),
+	]);
+	if (!source)
+		throw new AtomicYamlReplaceError(configPath, 1, new Error("staged YAML disappeared before replacement"));
+	if (!destination) {
+		if (expectedExists)
+			throw new AtomicYamlConflictError(configPath, expectedHash, createHash("sha256").update("").digest("hex"));
+		const publishOnce = async (): Promise<NativeNoReplaceResult> =>
+			options.noReplace
+				? await options.noReplace(tempPath, configPath)
+				: ((await runNativeAtomicYamlWorker({
+						operation: "no-replace",
+						sourcePath: tempPath,
+						destinationPath: configPath,
+					})) as NativeNoReplaceResult);
+		const publishOnceWithLink = async (): Promise<NativeNoReplaceResult> =>
+			options.noReplace
+				? await options.noReplace(tempPath, configPath)
+				: ((await runNativeAtomicYamlWorker({
+						operation: "no-replace-link",
+						sourcePath: tempPath,
+						destinationPath: configPath,
+					})) as NativeNoReplaceResult);
+		let published = await publishOnce();
+		if (
+			!published.ok &&
+			(published.reason === "invalid_request" || published.reason === "atomic_unavailable") &&
+			published.mutationState === "not_committed" &&
+			published.durabilityState === "not_attempted"
+		) {
+			// RENAME_NOREPLACE is unsupported (NFS, kernels before 3.15): the native
+			// linkat fallback keeps the no-overwrite guarantee (EEXIST on an
+			// occupied destination) and is safe because the rename reported a
+			// pre-mutation refusal. The staged name survives a link, so the caller
+			// still unlinks it after publication.
+			published = await publishOnceWithLink();
+		}
+		if (published.ok) return;
+		if (published.reason === "destination_exists") {
+			const actual = await currentYamlFileState(configPath);
+			throw new AtomicYamlConflictError(
+				configPath,
+				expectedHash,
+				createHash("sha256").update(actual.raw).digest("hex"),
+			);
+		}
+		throw new AtomicYamlReplaceError(
+			configPath,
+			1,
+			new Error(`native no-replace publish failed: ${published.code ?? "unknown"}`),
+			published.mutationState === "unknown",
+		);
+	}
+	if (!expectedExists || destination.sha256 !== expectedHash) {
+		throw new AtomicYamlConflictError(configPath, expectedHash, destination.sha256 ?? expectedHash);
+	}
+	// `exactReplacePath` validates both identities inside one native atomic
+	// namespace exchange. A save after the snapshots therefore rejects the
+	// exchange without replacing the editor's newer destination.
+	const replaced: NativeExactUnlinkResult = options.exactReplace
+		? await options.exactReplace(tempPath, configPath, source, destination)
+		: ((await runNativeAtomicYamlWorker({
+				operation: "exact-replace",
+				sourcePath: tempPath,
+				destinationPath: configPath,
+				expectedSource: source,
+				expectedDestination: destination,
+			})) as NativeExactUnlinkResult);
+	if (replaced.ok) return;
+	// A retained successor proves the namespace exchange published the staged
+	// document. It may still report a post-exchange verification or durability
+	// failure, so this is not a CAS rejection and the detached temp-path object
+	// must be retained for native recovery rather than unlinked by the caller.
+	if (
+		replaced.detachedPath ||
+		replaced.retainedSuccessorPath ||
+		replaced.retainedPlaceholderPath ||
+		replaced.retainedUnknownPath
+	) {
+		throw new AtomicYamlReplaceError(
+			configPath,
+			1,
+			new Error(`native exact replacement completed with retained recovery paths: ${replaced.code ?? "unknown"}`),
+			true,
+		);
+	}
+	if (replaced.code === "identity_mismatch") {
+		const actual = await currentYamlFileState(configPath);
+		throw new AtomicYamlConflictError(
+			configPath,
+			expectedHash,
+			createHash("sha256").update(actual.raw).digest("hex"),
+		);
+	}
+	throw new AtomicYamlReplaceError(
+		configPath,
+		1,
+		new Error(`native exact replacement failed: ${replaced.code ?? "unknown"}`),
+	);
+}
+async function replaceWithRetry(
+	tempPath: string,
+	configPath: string,
+	options: AtomicYamlPatchOptions,
+	/** Expected current file state; native exact replacement validates it with the destination identity. */
+	expectedState?: YamlFileState,
+): Promise<void> {
+	if (expectedState !== undefined) {
+		await replaceWithExpectedIdentity(tempPath, configPath, expectedState, options);
+		return;
+	}
 	const rename = options.rename ?? fs.rename;
 	const sleep = options.sleep ?? (async (delay: number): Promise<void> => await Bun.sleep(delay));
 	const isWindows = (options.platform ?? process.platform) === "win32";
 	let attempts = 0;
-
 	for (;;) {
 		attempts++;
 		try {
@@ -269,22 +508,45 @@ async function writeAtomicYaml(
 	configPath: string,
 	value: Record<string, unknown>,
 	options: AtomicYamlPatchOptions,
-): Promise<void> {
+	/** Expected current file state; re-verified immediately before the rename. */
+	expectedState?: YamlFileState,
+): Promise<YamlFileState> {
 	const directory = path.dirname(configPath);
 	const tempPath = path.join(directory, `.${path.basename(configPath)}.${process.pid}.${randomUUID()}.tmp`);
+	const nextRaw = YAML.stringify(value, null, 2);
+	let preserveTempPath = false;
 	try {
 		const tempHandle = await fs.open(tempPath, "wx", 0o600);
 		try {
-			await tempHandle.writeFile(YAML.stringify(value, null, 2), "utf8");
+			await tempHandle.writeFile(nextRaw, "utf8");
 			await tempHandle.sync();
 		} finally {
 			await tempHandle.close();
 		}
-		await replaceWithRetry(tempPath, configPath, options);
+		if (expectedState !== undefined) {
+			// The transaction's CAS guard ran before this write; re-verify right
+			// before the rename so an external save during the temp write cannot be
+			// silently overwritten by the replacement.
+			const currentState = await currentYamlFileState(configPath);
+			if (currentState.exists !== expectedState.exists || currentState.raw !== expectedState.raw) {
+				throw new AtomicYamlConflictError(
+					configPath,
+					createHash("sha256").update(expectedState.raw).digest("hex"),
+					createHash("sha256").update(currentState.raw).digest("hex"),
+				);
+			}
+		}
+		try {
+			await replaceWithRetry(tempPath, configPath, options, expectedState);
+		} catch (error) {
+			preserveTempPath = error instanceof AtomicYamlReplaceError && error.preserveTempPath;
+			throw error;
+		}
 		await syncParentDirectory(directory);
 	} finally {
-		await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		if (!preserveTempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
+	return { exists: true, raw: nextRaw };
 }
 
 function createReceipt(
@@ -334,6 +596,8 @@ async function applyPatchesUnderLock(
 	current: Record<string, unknown>,
 	patches: readonly AtomicYamlPatch[],
 	options: AtomicYamlPatchOptions,
+	skipWrite = false,
+	expectedState?: YamlFileState,
 ): Promise<CasReceipt> {
 	if (patches.length === 0) return createReceipt(configPath, [], options);
 
@@ -373,7 +637,7 @@ async function applyPatchesUnderLock(
 	}
 	const changes = [...changesByPath.values()];
 
-	await writeAtomicYaml(configPath, current, options);
+	if (!skipWrite) await writeAtomicYaml(configPath, current, options, expectedState);
 	return createReceipt(configPath, changes, options);
 }
 
@@ -393,6 +657,160 @@ export function applyAtomicYamlPatchesWithCurrent(
 			for (const patch of patches) assertPatch(patch);
 			await options.validateRoot?.(root, patches);
 			return await applyPatchesUnderLock(canonicalPath, current, patches, options);
+		});
+	});
+}
+export interface AtomicYamlConfigTransaction {
+	configPath: string;
+	root: unknown;
+	current: Readonly<Record<string, unknown>>;
+	/** True once any write op has durably committed (a later CAS rejection then
+	 * leaves the target with partial writes, so recovery artifacts must stay). */
+	written: boolean;
+	applyPatches(patches: readonly AtomicYamlPatch[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+	/**
+	 * Delete top-level keys verbatim, including dotted key names (e.g. a flat
+	 * `"gjc.ralplan.maxIterations"` key that the patch grammar would otherwise
+	 * interpret as a nested path). Writes atomically under the same lock.
+	 */
+	removeTopLevelKeys(keys: readonly string[], options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+	/**
+	 * Apply patches AND delete top-level keys verbatim in a SINGLE atomic
+	 * write, so an external editor's change cannot land between the two
+	 * operations (external editors do not participate in the file lock). The
+	 * returned receipt is not restorable (the deletions are not journaled).
+	 */
+	applyPatchesAndRemoveTopLevelKeys(
+		patches: readonly AtomicYamlPatch[],
+		topLevelKeys: readonly string[],
+		options?: AtomicYamlPatchOptions,
+	): Promise<CasReceipt>;
+	/**
+	 * Replace the whole document (used to revert the target when a later
+	 * verification fails). Writes atomically under the same lock; the returned
+	 * receipt is not restorable.
+	 */
+	replaceCurrent(next: Readonly<Record<string, unknown>>, options?: AtomicYamlPatchOptions): Promise<CasReceipt>;
+}
+
+/**
+ * Run a caller-owned multi-step mutation under the config file's per-file queue
+ * and cross-process lock. The current YAML is read once and exposed as
+ * `root`/`current`; the callback may inspect it, decide patches, and apply them
+ * (or perform adjacent durable actions such as marker/source transitions)
+ * without re-acquiring the lock. A YAML parse failure surfaces before the
+ * callback runs, so no migration action can execute against a malformed target.
+ */
+export function withAtomicYamlConfigTransaction<T>(
+	configPath: string,
+	operation: (transaction: AtomicYamlConfigTransaction) => Promise<T>,
+): Promise<T> {
+	return enqueueAtomicYamlOperation(configPath, async canonicalPath => {
+		await fs.mkdir(path.dirname(canonicalPath), { recursive: true, mode: 0o700 });
+		return await withFileLock(canonicalPath, async () => {
+			const { current, root, raw, exists } = await readYaml(canonicalPath);
+			// External editors do not participate in the file lock, so a save
+			// between the initial read and a write would be silently overwritten.
+			// Guard every write with a compare-and-swap against the last file state
+			// this transaction read/wrote; on mismatch, fail closed.
+			const initialState: YamlFileState = { exists, raw };
+			let lastKnownState: YamlFileState | null = null;
+			const casGuard = async (): Promise<void> => {
+				const expected = lastKnownState ?? initialState;
+				const currentState = await currentYamlFileState(canonicalPath);
+				if (currentState.exists !== expected.exists || currentState.raw !== expected.raw) {
+					throw new AtomicYamlConflictError(
+						canonicalPath,
+						createHash("sha256").update(expected.raw).digest("hex"),
+						createHash("sha256").update(currentState.raw).digest("hex"),
+					);
+				}
+			};
+			let written = false;
+			const markWritten = (): void => {
+				written = true;
+			};
+			return await operation({
+				configPath: canonicalPath,
+				root,
+				current,
+				get written(): boolean {
+					return written;
+				},
+				applyPatches: async (patches, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					const receipt = await applyPatchesUnderLock(
+						canonicalPath,
+						current,
+						patches,
+						options,
+						false,
+						lastKnownState ?? initialState,
+					);
+					if (patches.length > 0) {
+						lastKnownState = { exists: true, raw: YAML.stringify(current, null, 2) };
+						markWritten();
+					}
+					return receipt;
+				},
+				removeTopLevelKeys: async (keys, options = {}) => {
+					for (const key of keys) delete current[key];
+					await casGuard();
+					lastKnownState = await writeAtomicYaml(canonicalPath, current, options, lastKnownState ?? initialState);
+					markWritten();
+					// The deleted top-level key values are not journaled, so a
+					// restore() would vacuously claim success; report honestly that
+					// the receipt is not restorable.
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				applyPatchesAndRemoveTopLevelKeys: async (patches, topLevelKeys, options = {}) => {
+					for (const patch of patches) assertPatch(patch);
+					await options.validateRoot?.(root, patches);
+					await casGuard();
+					await applyPatchesUnderLock(canonicalPath, current, patches, options, true);
+					for (const key of topLevelKeys) delete current[key];
+					lastKnownState = await writeAtomicYaml(canonicalPath, current, options, lastKnownState ?? initialState);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+				replaceCurrent: async (next, options = {}) => {
+					for (const key of Object.keys(current)) delete current[key];
+					Object.assign(current, next);
+					await casGuard();
+					lastKnownState = await writeAtomicYaml(canonicalPath, current, options, lastKnownState ?? initialState);
+					markWritten();
+					let discarded = false;
+					return {
+						revisions: [],
+						discard(): void {
+							discarded = true;
+						},
+						async restore(): Promise<CasRestoreResult> {
+							return discarded ? { status: "discarded" } : { status: "not-restorable" };
+						},
+					};
+				},
+			});
 		});
 	});
 }
