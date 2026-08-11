@@ -171,6 +171,10 @@ export const SettingsMigrationTestHooks: {
 	/** Fires after a quarantined backup is verified as this run's file,
 	 * immediately before the quarantined entry is unlinked. */
 	beforeQuarantineRemoval?: (backupPath: string) => void | Promise<void>;
+	/** Fires immediately before the project migration's POST-publication marker
+	 * re-read, after the migrated values already committed: test seams use it
+	 * to make the marker unreadable so the rollback path is exercised. */
+	beforeProjectMarkerMerge?: () => void | Promise<void>;
 } = {};
 
 type SettingsPatch = {
@@ -264,6 +268,45 @@ function isAtomicSettingsPath(path: string): boolean {
 // ═══════════════════════════════════════════════════════════════════════════
 // Path Utilities
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Value at a dotted path, accepting both the flat legacy key form and the
+ * nested form (used for the interrupted-retirement source republication).
+ */
+function valueAtPath(obj: Record<string, unknown>, dottedPath: string): unknown {
+	if (dottedPath in obj) return obj[dottedPath];
+	return getByPath(obj, dottedPath.split("."));
+}
+
+/**
+ * Flatten an object to its leaf dotted paths (nested and dotted keys alike),
+ * used to verify publication proof before retiring a legacy source.
+ */
+function flattenObjectPaths(node: unknown, prefix: string[] = []): string[] {
+	if (node === null || typeof node !== "object" || Array.isArray(node)) {
+		return [prefix.join(".")];
+	}
+	const paths: string[] = [];
+	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+		paths.push(...flattenObjectPaths(value, [...prefix, key]));
+	}
+	return paths;
+}
+
+/**
+ * Whether a dotted path has a value present in an object (used to verify
+ * publication proof before retiring a legacy source).
+ */
+function hasPathValue(obj: Record<string, unknown>, dottedPath: string): boolean {
+	let node: unknown = obj;
+	for (const segment of dottedPath.split(".")) {
+		if (node === null || typeof node !== "object" || !(segment in node)) {
+			return false;
+		}
+		node = (node as Record<string, unknown>)[segment];
+	}
+	return true;
+}
 
 /**
  * Get a nested value from an object by path segments.
@@ -1428,7 +1471,20 @@ export class Settings implements NotificationSettingsReader {
 				merged = this.#deepMerge(merged, settings);
 			}
 			return this.#migrateRawSettings(merged);
-		} catch {
+		} catch (error) {
+			// A malformed project file is tolerated (its layer is skipped), but a
+			// marker-read failure (EACCES/EISDIR/transient I/O - an fs error with
+			// a code, not a parse error) must PROPAGATE: silently returning {}
+			// would drop the entire project layer, including valid config.yml
+			// values, on a transient failure.
+			if (
+				error !== null &&
+				typeof error === "object" &&
+				"code" in error &&
+				(error as { code?: unknown }).code !== "ENOENT"
+			) {
+				throw error;
+			}
 			return {};
 		}
 	}
@@ -1722,19 +1778,67 @@ export class Settings implements NotificationSettingsReader {
 
 		let settings: RawSettings = {};
 		let migrated = false;
+		// The source-only migrated values (tracked for the interrupted-retirement
+		// recovery: their CURRENT values must be REPUBLISHED, not absent-only, so
+		// a concurrent edit after the interrupted run is never silently lost).
+		let settingsJsonMigrated: RawSettings | null = null;
 
 		// 1. Migrate from settings.json (one-time via the .bak rename; runs only
-		// when config.yml is absent so it never overwrites a completed surface).
+		// when config.yml is absent so it never overwrites a completed surface,
+		// EXCEPT when a pending-retirement marker exists: a source edited after
+		// an interrupted retirement must be RE-MIGRATED (absent-only) instead of
+		// staying permanently ignored by the configExists guard).
 		const configExists = await this.#pathExists(this.#configPath);
 		const settingsJsonPath = path.join(this.#agentDir, "settings.json");
-		if (!configExists) {
+		const pendingRetirementPath = `${settingsJsonPath}.pending-retirement`;
+		const settingsJsonRetirementMarkerExists = await this.#pathExists(pendingRetirementPath);
+		let settingsJsonRetirementPending = false;
+		let settingsJsonMarkerPersisted = false;
+		let settingsJsonRaw: string | null = null;
+		if (!configExists || settingsJsonRetirementMarkerExists) {
 			try {
-				const parsed = JSON.parse(await Bun.file(settingsJsonPath).text());
+				settingsJsonRaw = await Bun.file(settingsJsonPath).text();
+				const parsed = JSON.parse(settingsJsonRaw);
 				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-					settings = this.#deepMerge(settings, this.#migrateRawSettings(parsed));
+					settingsJsonMigrated = this.#migrateRawSettings(parsed);
+					settings = this.#deepMerge(settings, settingsJsonMigrated);
 					migrated = true;
+					// The .bak retirement is DEFERRED until the combined migration
+					// commits: a later failure (e.g. a malformed agent.db row that
+					// aborts the load) must leave the source discoverable for the
+					// next load instead of stranding its only copy as a .bak.
+					settingsJsonRetirementPending = true;
+					// Persist the pending retirement BEFORE the publication: if the
+					// process exits after the values commit but before the rename,
+					// the next load recognizes the marker and completes the
+					// retirement instead of stranding an active-looking legacy file
+					// whose edits are silently ignored. The marker stores the
+					// source's SHA-256 so a later edit is never retired. The payload
+					// and parent directory are FSYNCED (like the YAML publication
+					// it recovers) so a power loss cannot strand the source with a
+					// lost marker while config.yml already exists. A replaced marker
+					// (a previous interrupted run) is overwritten.
 					try {
-						fs.renameSync(settingsJsonPath, `${settingsJsonPath}.bak`);
+						const markerHandle = await fs.promises.open(pendingRetirementPath, "w", 0o600);
+						try {
+							await markerHandle.writeFile(
+								nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex"),
+							);
+							await markerHandle.sync();
+						} finally {
+							await markerHandle.close();
+						}
+						await fs.promises
+							.open(path.dirname(pendingRetirementPath), "r")
+							.then(async dirHandle => {
+								try {
+									await dirHandle.sync();
+								} finally {
+									await dirHandle.close();
+								}
+							})
+							.catch(() => undefined);
+						settingsJsonMarkerPersisted = true;
 					} catch {}
 				}
 			} catch {}
@@ -1784,7 +1888,11 @@ export class Settings implements NotificationSettingsReader {
 		// or a drained-then-reopened database), merge ABSENT-ONLY so the existing
 		// values - including the workflow values the config-root migration wrote -
 		// are never clobbered.
-		if (migrated && Object.keys(settings).length > 0) {
+		if (
+			migrated &&
+			(settingsJsonRetirementPending === false || settingsJsonMarkerPersisted) &&
+			Object.keys(settings).length > 0
+		) {
 			// Publication is best-effort: a write failure (e.g. a CAS conflict with
 			// an external config.yml edit) keeps the legacy rows for the next load
 			// to retry and must never fail the settings load.
@@ -1818,8 +1926,22 @@ export class Settings implements NotificationSettingsReader {
 						return false;
 					}
 					const patches = this.#collectAbsentLegacyPatches(tx.current, settings);
-					if (patches.length > 0) {
-						await tx.applyPatches(patches);
+					// The interrupted-retirement recovery (a pending marker): the
+					// source's CURRENT values are republished as SET patches (not
+					// absent-only) so a concurrent edit after the interrupted run is
+					// preserved instead of staying permanently ignored under the
+					// target's older value.
+					const sourceSetPatches =
+						settingsJsonRetirementMarkerExists && settingsJsonMigrated !== null
+							? flattenObjectPaths(settingsJsonMigrated).map(sourcePath => ({
+									path: sourcePath,
+									op: "set" as const,
+									value: structuredClone(valueAtPath(settingsJsonMigrated as RawSettings, sourcePath)),
+								}))
+							: [];
+					const allPatches = [...sourceSetPatches, ...patches];
+					if (allPatches.length > 0) {
+						await tx.applyPatches(allPatches);
 					}
 					return true;
 				});
@@ -1843,6 +1965,93 @@ export class Settings implements NotificationSettingsReader {
 			// and the next load retries the drain.
 			await this.#storage?.clearSettings();
 			logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
+		}
+		// The combined migration committed (database validated and the merged
+		// values published): retire the settings.json source now. Any earlier
+		// failure path (malformed database row, unreadable marker, drain
+		// failure) returns above with the source still in place for the next
+		// load.
+		if (settingsJsonRetirementPending || (await this.#pathExists(`${settingsJsonPath}.pending-retirement`))) {
+			// Revalidate the source BEFORE retiring it: an edit or replacement
+			// after the bytes were read but while this method awaited database
+			// retries, the config transaction, or the drain must NOT be moved to
+			// the inactive .bak - the user's newer settings would be stranded
+			// while config.yml holds the earlier bytes. A changed source stays
+			// active for the next load to re-read.
+			const expectedSha =
+				settingsJsonRaw !== null
+					? nodeCrypto.createHash("sha256").update(settingsJsonRaw).digest("hex")
+					: await Bun.file(`${settingsJsonPath}.pending-retirement`)
+							.text()
+							.catch(() => null);
+			const currentRaw = await Bun.file(settingsJsonPath)
+				.text()
+				.catch(() => null);
+			// PUBLICATION PROOF: the marker alone is not proof that the merged
+			// values were ever written - the publication may have been skipped or
+			// conflicted (e.g. another writer created a future-schema config.yml)
+			// after the marker was persisted. Every workflow key present in the
+			// source must exist in the target config.yml before the source is
+			// retired.
+			let publicationProof = false;
+			if (currentRaw !== null) {
+				try {
+					const targetRaw = await Bun.file(this.#configPath)
+						.text()
+						.catch(() => "");
+					const targetRoot = (YAML.parse(targetRaw) ?? {}) as Record<string, unknown> | null;
+					// Verify EVERY migrated path, not just the workflow keys: the
+					// agent-dir migration merges the entire #migrateRawSettings
+					// result (non-workflow settings included) through
+					// #collectAbsentLegacyPatches, so recovery must prove every
+					// post-migration path (including renamed paths) exists in the
+					// target before retiring the source. The merged `settings`
+					// holds the same paths the publication wrote.
+					const migratedPaths = flattenObjectPaths(settings);
+					publicationProof =
+						targetRoot !== null &&
+						typeof targetRoot === "object" &&
+						migratedPaths.length > 0 &&
+						migratedPaths.every(path => hasPathValue(targetRoot, path));
+				} catch {
+					publicationProof = false;
+				}
+			}
+			let retired = false;
+			if (
+				expectedSha !== null &&
+				currentRaw !== null &&
+				nodeCrypto.createHash("sha256").update(currentRaw).digest("hex") === expectedSha &&
+				publicationProof
+			) {
+				// Identity-guard the rename: only move the exact inode whose bytes
+				// were validated. A replacement between the validation read and the
+				// rename must stay active (its newer settings are re-migrated by
+				// the next load via the marker gate).
+				const validatedIno = await fs.promises
+					.lstat(settingsJsonPath)
+					.then(stat => stat.ino)
+					.catch(() => null);
+				const currentIno = await fs.promises
+					.lstat(settingsJsonPath)
+					.then(stat => stat.ino)
+					.catch(() => null);
+				if (validatedIno !== null && validatedIno === currentIno) {
+					try {
+						fs.renameSync(settingsJsonPath, `${settingsJsonPath}.bak`);
+						retired = true;
+					} catch {}
+				}
+			}
+			// The pending-retirement marker is consumed ONLY after a successful
+			// retirement: a failed rename (Windows sharing violation, permissions)
+			// must leave the marker so the next load retries instead of stranding
+			// an active-looking legacy file with no retry prompt.
+			if (retired) {
+				try {
+					await fs.promises.rm(`${settingsJsonPath}.pending-retirement`, { force: true });
+				} catch {}
+			}
 		}
 	}
 
@@ -3384,9 +3593,12 @@ export class Settings implements NotificationSettingsReader {
 				// never survive in config.yml; the next load retries with the fresh
 				// source. The evidence is cleared too (it was derived from the same
 				// stale bytes).
-				if (await sourceChanged()) {
+				const rollbackMarkerlessPublication = async (
+					reason: string,
+					clearStrictEvidence: boolean,
+				): Promise<void> => {
 					this.#warnLegacyFallbackMigration(
-						`Settings: project workflow migration rolled back ${absent.length} published key(s): ${source} changed during publication`,
+						`Settings: project workflow migration rolled back ${absent.length} written key(s): ${reason}`,
 					);
 					try {
 						await tx.applyPatches(restorePublished(absent));
@@ -3401,9 +3613,23 @@ export class Settings implements NotificationSettingsReader {
 					if (targetWasAbsent && !rollbackRequired) {
 						await this.#removeProjectMigrationCreatedTarget(tx.configPath, source);
 					}
-					await fs.promises
-						.rm(this.#projectStrictInvalidEvidencePath(source), { force: true })
-						.catch(() => undefined);
+					// The strict-invalid evidence is cleared ONLY when the SOURCE
+					// changed (it was derived from the stale bytes): an ownership-
+					// marker failure leaves the source unchanged, so its evidence
+					// stays valid and must keep making the exit-2 observable.
+					if (clearStrictEvidence) {
+						await fs.promises
+							.rm(this.#projectStrictInvalidEvidencePath(source), { force: true })
+							.catch(() => undefined);
+					}
+				};
+				if (await sourceChanged()) {
+					await rollbackMarkerlessPublication(`${source} changed during publication`, true);
+					// The source changed while publishing: the rolled-back keys must
+					// NOT be recorded as owned, or the newer legacy values would be
+					// skipped forever. Stop the transaction callback here; the
+					// post-transaction CAS recovery still runs for a conflicted
+					// in-transaction rollback.
 					return;
 				}
 				// Record EVERY config-owned key: the valid source keys copied by
@@ -3416,7 +3642,23 @@ export class Settings implements NotificationSettingsReader {
 				// concurrent migration of the same project may have published its own
 				// marker between our initial read and this transaction, so re-read the
 				// CURRENT marker and merge instead of last-writer-wins replacement.
-				const mergedMarker = await this.#mergeProjectMigratedKeys(source, newlyOwned);
+				let mergedMarker: readonly WorkflowSettingKey[];
+				try {
+					await SettingsMigrationTestHooks.beforeProjectMarkerMerge?.();
+					mergedMarker = await this.#mergeProjectMigratedKeys(source, newlyOwned);
+				} catch (error) {
+					// The marker became unreadable between the initial read and this
+					// re-read (AFTER the values already committed): ownership cannot
+					// be durably recorded, so roll back the just-published keys
+					// exactly like a failed marker write - a removed key would
+					// otherwise be re-imported once the marker becomes readable
+					// again.
+					await rollbackMarkerlessPublication(
+						`the migrated-keys marker could not be re-read: ${error instanceof Error ? error.message : String(error)}`,
+						false,
+					);
+					return;
+				}
 				const markerOk = await this.#writeProjectMigratedKeys(source, mergedMarker);
 				if (!markerOk) {
 					// Ownership could not be durably recorded: without the marker, a
@@ -3424,19 +3666,8 @@ export class Settings implements NotificationSettingsReader {
 					// Undo only the keys THIS RUN wrote - restored repaired keys keep
 					// their pre-existing value, newly copied keys are unset (a
 					// markerless publication is never complete).
-					this.#warnLegacyFallbackMigration(
-						`Settings: project workflow migration rolled back ${absent.length} written key(s): the migrated-keys marker could not be written`,
-					);
-					await tx.applyPatches(restorePublished(absent));
-					// The rollback just wrote an EMPTY config.yml when the target did
-					// not exist before this run: remove the created file so the
-					// retained settings.json fallback stays active (an existing
-					// non-future target is authoritative to the resolver). The marker
-					// stays unwritable, so every retry follows the same path and the
-					// fallback keeps resolving instead of silently defaulting.
-					if (targetWasAbsent) {
-						await this.#removeProjectMigrationCreatedTarget(tx.configPath, source);
-					}
+					await rollbackMarkerlessPublication("the migrated-keys marker could not be written", false);
+					return;
 				}
 			});
 			// A CAS-conflicted in-transaction rollback left the published stale
@@ -4055,8 +4286,13 @@ export class Settings implements NotificationSettingsReader {
 		let raw: string;
 		try {
 			raw = await Bun.file(markerPath).text();
-		} catch {
-			return new Set();
+		} catch (error) {
+			// Only a MISSING marker reads as empty. A non-ENOENT read failure
+			// (EACCES, transient I/O) must ABORT the migration: treating it as
+			// empty would reimport a stale retained value and overwrite the
+			// marker once the failure clears.
+			if (isEnoent(error)) return new Set();
+			throw error;
 		}
 		try {
 			const parsed = JSON.parse(raw) as unknown;
